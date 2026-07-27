@@ -1,10 +1,19 @@
 /**
  * The preview HTTP server.
  *
- * Serves three things:
- *   - `POST /api/invoke`  — the browser's stand-in for Electron IPC
- *   - the built renderer  — the real UI from `src/renderer`, with SPA fallback
- *   - `GET /download`     — the macOS download page
+ * Route table:
+ *   GET  /healthz                  liveness, and a real SQLite round trip
+ *   POST /api/invoke               the browser's stand-in for Electron IPC
+ *   GET  /                         the marketing landing page, preview/landing
+ *   GET  /landing/assets/<file>    landing page images (not fingerprinted)
+ *   GET  /app, /app/, /app/<any>   the built renderer, preview/dist/index.html
+ *   GET  /assets/<file>, …         fingerprinted bundle files from preview/dist
+ *   GET  /download[/index.html]    the macOS download page
+ *   anything else                  a JSON 404 envelope
+ *
+ * There is no site-wide SPA fallback: only `/app*` falls back to the renderer's
+ * index.html, so an unmatched path is a 404 rather than a page that looks like
+ * the app. Renderer routing is hash-based, so `/app` alone is enough for it.
  *
  * The database lives at `PREVIEW_DB_PATH` (default `./preview-data/preview.db`)
  * and is created and migrated on boot. It never goes near the desktop app's own
@@ -25,6 +34,11 @@ import { seedOnBoot } from './seed';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(HERE, 'dist');
 const DOWNLOAD_PAGE = path.resolve(HERE, 'download/index.html');
+const LANDING_PAGE = path.resolve(HERE, 'landing/index.html');
+const LANDING_ASSETS_DIR = path.resolve(HERE, 'landing/assets');
+
+/** URL prefix the landing page uses for its own (unfingerprinted) images. */
+const LANDING_ASSETS_PREFIX = '/landing/assets/';
 
 /** Requests bigger than this are refused before anything is parsed. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -116,7 +130,20 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function sendFile(res: ServerResponse, filePath: string, status = 200): boolean {
+/**
+ * Stream a file, or return false if it is not there.
+ *
+ * `cacheControl` overrides the default policy, which marks anything under an
+ * `assets/` directory immutable. That default is right for the fingerprinted
+ * Vite bundle and wrong for `preview/landing/assets`, whose filenames are
+ * hand-written and get edited in place — those pass 'no-cache' explicitly.
+ */
+function sendFile(
+  res: ServerResponse,
+  filePath: string,
+  status = 200,
+  cacheControl?: string,
+): boolean {
   let stats;
   try {
     stats = statSync(filePath);
@@ -130,9 +157,11 @@ function sendFile(res: ServerResponse, filePath: string, status = 200): boolean 
     'content-type': MIME_TYPES[extension] ?? 'application/octet-stream',
     'content-length': stats.size,
     // Fingerprinted bundle assets are immutable; HTML must not be.
-    'cache-control': filePath.includes(`${path.sep}assets${path.sep}`)
-      ? 'public, max-age=31536000, immutable'
-      : 'no-cache',
+    'cache-control':
+      cacheControl ??
+      (filePath.includes(`${path.sep}assets${path.sep}`)
+        ? 'public, max-age=31536000, immutable'
+        : 'no-cache'),
   });
   createReadStream(filePath).pipe(res);
   return true;
@@ -140,10 +169,20 @@ function sendFile(res: ServerResponse, filePath: string, status = 200): boolean 
 
 /**
  * Map a URL path to a file inside `root`, refusing anything that escapes it.
- * Returns null for a traversal attempt rather than reading the file.
+ * Returns null for a traversal attempt rather than reading the file, and also
+ * for a path that cannot be percent-decoded at all (`/%`, `/%zz`, a truncated
+ * `%E0%A4`) — those fail closed here rather than throwing out of the handler.
  */
 export function resolveStaticPath(root: string, urlPath: string): string | null {
-  const decoded = decodeURIComponent(urlPath);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(urlPath);
+  } catch (error: unknown) {
+    // Only a malformed escape sequence is refused; anything else is a bug and
+    // belongs on the unhandled-failure path.
+    if (error instanceof URIError) return null;
+    throw error;
+  }
   if (decoded.includes('\0')) return null;
   const candidate = path.resolve(root, `.${path.posix.normalize(decoded)}`);
   const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
@@ -205,24 +244,61 @@ async function handle(db: Db, req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
+  if (pathname === '/') {
+    if (sendFile(res, LANDING_PAGE)) return;
+    sendJson(res, 404, {
+      ok: false,
+      error: { code: 'NO_LANDING_PAGE', message: 'preview/landing/index.html is missing' },
+    });
+    return;
+  }
+
+  if (pathname.startsWith(LANDING_ASSETS_PREFIX)) {
+    // Same traversal guard the bundle uses — rooted at the landing assets
+    // directory, so `%2e%2e%2f` and friends resolve to null rather than a file.
+    const assetPath = resolveStaticPath(
+      LANDING_ASSETS_DIR,
+      pathname.slice(LANDING_ASSETS_PREFIX.length - 1),
+    );
+    if (assetPath === null) {
+      sendJson(res, 400, { ok: false, error: { code: 'BAD_PATH', message: 'invalid path' } });
+      return;
+    }
+    if (sendFile(res, assetPath, 200, 'no-cache')) return;
+    sendJson(res, 404, {
+      ok: false,
+      error: { code: 'NOT_FOUND', message: `no such landing asset: ${pathname}` },
+    });
+    return;
+  }
+
+  // The renderer. Its own routing is hash-based, so every `/app/...` deep link
+  // resolves to the same document — but only paths under `/app` do. There is
+  // deliberately no site-wide fallback: `/nope` is a 404, not the app.
+  if (pathname === '/app' || pathname === '/app/' || pathname.startsWith('/app/')) {
+    if (sendFile(res, path.join(DIST_DIR, 'index.html'))) return;
+    sendJson(res, 404, {
+      ok: false,
+      error: {
+        code: 'NOT_BUILT',
+        message: 'The renderer bundle is missing. Run `npm run preview:build` first.',
+      },
+    });
+    return;
+  }
+
+  // Fingerprinted bundle files (`/assets/...`) and anything else real that Vite
+  // emitted at the dist root — the built index.html references these absolutely.
   const staticPath = resolveStaticPath(DIST_DIR, pathname);
   if (staticPath === null) {
     sendJson(res, 400, { ok: false, error: { code: 'BAD_PATH', message: 'invalid path' } });
     return;
   }
-  if (pathname !== '/' && sendFile(res, staticPath)) return;
-
-  // SPA fallback. Routing is hash-based, so in practice everything lands here
-  // on `/`, but a stray deep link should still boot the app rather than 404.
-  const indexHtml = path.join(DIST_DIR, 'index.html');
-  if (sendFile(res, indexHtml)) return;
+  if (sendFile(res, staticPath)) return;
 
   sendJson(res, 404, {
     ok: false,
-    error: {
-      code: 'NOT_BUILT',
-      message: 'The renderer bundle is missing. Run `npm run preview:build` first.',
-    },
+    error: { code: 'NOT_FOUND', message: `no route for ${pathname}` },
   });
 }
 

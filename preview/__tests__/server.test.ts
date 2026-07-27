@@ -4,8 +4,11 @@
  * surface, so that is what these assert.
  */
 
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect, type AddressInfo } from 'node:net';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -14,6 +17,15 @@ import { migrate } from '../../src/db/migrate';
 import { IPC_CONTRACT } from '../../src/shared/ipc-contract';
 import { DESKTOP_ONLY_CHANNELS, REAL_CHANNELS } from '../handlers';
 import { createPreviewServer } from '../server';
+
+const DIST_INDEX = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../dist/index.html',
+);
+
+/** Stand-in for the built renderer, carrying the mount point the real one has. */
+const SPA_MARKER_DOCUMENT =
+  '<!doctype html><html><body><div id="root" class="app-root"></div></body></html>\n';
 
 let db: Db;
 let server: Server;
@@ -49,6 +61,23 @@ async function invoke(
     body: JSON.stringify({ channel, payload }),
   });
   return { status: response.status, body: (await response.json()) as Envelope };
+}
+
+/**
+ * Send a request line verbatim, with no URL parsing in between. `fetch` cannot
+ * do this: it normalises `../` and `%2e` away before the bytes leave the process.
+ */
+function rawGet(rawPath: string): Promise<string> {
+  const { port } = server.address() as AddressInfo;
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(`GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+    const chunks: Buffer[] = [];
+    socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+    socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
+  });
 }
 
 describe('channel allow-list', () => {
@@ -241,5 +270,172 @@ describe('other routes', () => {
     const response = await fetch(`${origin}/%2e%2e%2f%2e%2e%2fpackage.json`);
     expect(await response.text()).not.toContain('"better-sqlite3"');
     expect(response.status).not.toBe(500);
+  });
+});
+
+describe('the page routes: landing at /, renderer at /app', () => {
+  // `/app` must serve the built renderer, and the assertion has to be the same
+  // one whether or not `npm run preview:build` has run in this checkout. So if
+  // the bundle is absent, stand a minimal index.html in its place for the
+  // duration of this block and take it away again afterwards. The marker below
+  // is in preview/index.html, so a real build satisfies it too.
+  let fixtureWritten = false;
+
+  beforeAll(() => {
+    if (existsSync(DIST_INDEX)) return;
+    mkdirSync(path.dirname(DIST_INDEX), { recursive: true });
+    writeFileSync(DIST_INDEX, SPA_MARKER_DOCUMENT, 'utf8');
+    fixtureWritten = true;
+  });
+
+  afterAll(() => {
+    if (fixtureWritten) rmSync(DIST_INDEX, { force: true });
+  });
+
+  it('serves the landing page at /', async () => {
+    const response = await fetch(`${origin}/`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    const html = await response.text();
+    expect(html).toContain('Invoicing that never');
+    expect(html).toContain('<title>InvoiceApp — offline-first invoicing for macOS</title>');
+    // The landing page is not the app.
+    expect(html).not.toContain('id="root"');
+  });
+
+  it('serves the renderer document at /app', async () => {
+    const response = await fetch(`${origin}/app`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(await response.text()).toContain('id="root"');
+  });
+
+  it('serves the same renderer document for an /app deep link', async () => {
+    const shallow = await fetch(`${origin}/app`);
+    const deep = await fetch(`${origin}/app/some/deep/link`);
+
+    expect(deep.status).toBe(shallow.status);
+    expect(deep.status).toBe(200);
+    expect(await deep.text()).toBe(await shallow.text());
+  });
+
+  it('still serves the download page at /download', async () => {
+    const response = await fetch(`${origin}/download`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(await response.text()).toContain(
+      'xattr -dr com.apple.quarantine /Applications/InvoiceApp.app',
+    );
+  });
+
+  it('serves the landing page image, and does not mark it immutable', async () => {
+    const response = await fetch(`${origin}/landing/assets/invoices-hero.png`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    // Hand-written filename, edited in place — caching it forever would strand
+    // every visitor on the old picture.
+    expect(response.headers.get('cache-control')).toBe('no-cache');
+    expect((await response.arrayBuffer()).byteLength).toBeGreaterThan(0);
+  });
+
+  it('refuses a plain ../ escape from the landing assets directory', async () => {
+    const response = await fetch(`${origin}/landing/assets/../../../etc/passwd`);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8');
+    const text = await response.text();
+    expect(text).not.toContain('root:x:');
+    const body = JSON.parse(text) as Envelope;
+    expect(body.ok).toBe(false);
+    expect(body.error?.code).toBe('NOT_FOUND');
+  });
+
+  it('refuses a percent-encoded escape from the landing assets directory', async () => {
+    const response = await fetch(`${origin}/landing/assets/%2e%2e%2f%2e%2e%2f%2e%2e%2fetc/passwd`);
+
+    expect(response.status).toBe(404);
+    const text = await response.text();
+    expect(text).not.toContain('root:x:');
+    expect((JSON.parse(text) as Envelope).error?.code).toBe('NOT_FOUND');
+  });
+
+  it('refuses an escape that never passes through a URL parser at all', async () => {
+    // Both cases above are normalised by the client before they hit the wire —
+    // WHATWG URL parsing collapses `../` and treats `%2e` as a dot. So neither
+    // actually reaches `resolveStaticPath` with the traversal intact. This one
+    // is written straight to the socket so it does, which is the only version
+    // that exercises the guard itself.
+    for (const rawPath of [
+      '/landing/assets/../../../etc/passwd',
+      '/landing/assets/%2e%2e%2f%2e%2e%2f%2e%2e%2fetc/passwd',
+      '/landing/assets/..%2f..%2f..%2fetc%2fpasswd',
+    ]) {
+      const raw = await rawGet(rawPath);
+
+      expect(raw, rawPath).not.toContain('root:x:');
+      // `resolveStaticPath` clamps the traversal against the assets root rather
+      // than escaping it, so the file is simply not there.
+      expect(raw.split('\r\n')[0], rawPath).toBe('HTTP/1.1 404 Not Found');
+      expect(raw, rawPath).toContain('"code":"NOT_FOUND"');
+    }
+  });
+
+  it('400s an undecodable landing-asset path instead of throwing a 500', async () => {
+    for (const rawPath of ['/landing/assets/%', '/landing/assets/%zz', '/landing/assets/%E0%A4']) {
+      const raw = await rawGet(rawPath);
+
+      // The decisive part: `decodeURIComponent` throws URIError on all three, and
+      // that must land on the existing BAD_PATH branch, not the 500 catch-all.
+      expect(raw.split('\r\n')[0], rawPath).toBe('HTTP/1.1 400 Bad Request');
+      expect(raw.split('\r\n')[0], rawPath).not.toContain('500');
+      expect(raw, rawPath).toContain('application/json; charset=utf-8');
+
+      const body = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')) as Envelope;
+      expect(body.ok, rawPath).toBe(false);
+      expect(body.error?.code, rawPath).toBe('BAD_PATH');
+      expect(body.error?.message, rawPath).toBe('invalid path');
+    }
+  });
+
+  it('400s an undecodable path on the dist static branch too', async () => {
+    // No `/landing/assets/` prefix, no `/app` prefix — this one falls through to
+    // the second `resolveStaticPath` call site, rooted at preview/dist.
+    for (const rawPath of ['/%', '/%zz', '/assets/%E0%A4']) {
+      const raw = await rawGet(rawPath);
+
+      expect(raw.split('\r\n')[0], rawPath).toBe('HTTP/1.1 400 Bad Request');
+      expect(raw.split('\r\n')[0], rawPath).not.toContain('500');
+
+      const body = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')) as Envelope;
+      expect(body.ok, rawPath).toBe(false);
+      expect(body.error?.code, rawPath).toBe('BAD_PATH');
+    }
+  });
+
+  it('404s an unmatched path instead of falling back to the renderer', async () => {
+    const response = await fetch(`${origin}/nope`);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get('content-type')).toBe('application/json; charset=utf-8');
+    const text = await response.text();
+    // The decisive part: not the app, and not the landing page either.
+    expect(text).not.toContain('id="root"');
+    expect(text).not.toContain('Invoicing that never');
+    const body = JSON.parse(text) as Envelope;
+    expect(body.ok).toBe(false);
+    expect(body.error?.code).toBe('NOT_FOUND');
+  });
+
+  it('refuses a non-GET method on a static route with an allow header', async () => {
+    const response = await fetch(`${origin}/`, { method: 'POST' });
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get('allow')).toBe('GET, HEAD');
+    const body = (await response.json()) as Envelope;
+    expect(body.error?.code).toBe('METHOD_NOT_ALLOWED');
   });
 });

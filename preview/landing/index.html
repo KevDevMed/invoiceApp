@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InvoiceApp — offline-first invoicing for macOS</title>
+    <meta
+      name="description"
+      content="InvoiceApp is an offline-first invoicing app for macOS: clients, invoices, PDF export and reports in one local SQLite file, plus an AI assistant that runs on your own machine. Free and MIT-licensed."
+    />
+    <meta property="og:title" content="InvoiceApp — offline-first invoicing for macOS" />
+    <meta
+      property="og:description"
+      content="Clients, invoices, PDF export and reports in one local SQLite file, plus an on-device AI assistant. No account, no server, no telemetry."
+    />
+    <meta property="og:type" content="website" />
+    <!--
+      Deliberately self-contained: one file, no bundler, no React, no network
+      font, no CDN. Same house style as preview/download/index.html — the
+      colours, radii and spacing tokens below are that page's set, extended
+      with the few extras this layout needs (page wash, dark pill, icon tile).
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+
+        --font-body: Figtree, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica,
+          Arial, sans-serif;
+
+        --color-background-body: light-dark(#f1f1f1, #1b1b1b);
+        --color-background-surface: light-dark(#ffffff, #242424);
+        --color-text-primary: light-dark(#171717, #fafafa);
+        --color-text-secondary: light-dark(#737373, #a3a3a3);
+        --color-border: light-dark(#ebebeb, #ffffff1a);
+        --color-border-emphasized: light-dark(#d4d4d4, #525252);
+        --color-border-yellow: light-dark(#e4c279, #c0990e);
+        --color-background-yellow: light-dark(#fdf6e3, #3a2f10);
+        --color-border-green: light-dark(#b2d1ac, #69ad67);
+
+        /* Landing-page extras. */
+        --color-wash-1: light-dark(#9fd0cd, #16302f);
+        --color-wash-2: light-dark(#e7e2dc, #201f1e);
+        --color-wash-3: light-dark(#e6cfc9, #2a1f1f);
+        --color-background-muted: light-dark(#fafafa, #1f1f1f);
+        --color-pill-background: light-dark(#171717, #fafafa);
+        --color-pill-text: light-dark(#fafafa, #171717);
+        --color-focus-ring: light-dark(#0f766e, #5eead4);
+        --color-shadow: light-dark(#17171714, #00000059);
+
+        --radius-inner: 0.375rem;
+        --radius-element: 0.625rem;
+        --radius-container: 0.75rem;
+        --radius-page: 1.75rem;
+        --radius-pill: 999px;
+
+        --spacing-2: 8px;
+        --spacing-3: 12px;
+        --spacing-4: 16px;
+        --spacing-6: 24px;
+        --spacing-8: 32px;
+        --spacing-12: 48px;
+        --spacing-16: 64px;
+        --spacing-24: 96px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+      }
+
+      body {
+        margin: 0;
+        padding: var(--spacing-8) var(--spacing-6);
+        font-family: var(--font-body);
+        font-size: 1rem;
+        line-height: 1.5;
+        color: var(--color-text-primary);
+        background-color: var(--color-background-body);
+        background-image:
+          radial-gradient(50rem 45rem at 0% 0%, var(--color-wash-1), transparent 70%),
+          radial-gradient(45rem 45rem at 0% 100%, var(--color-wash-3), transparent 70%),
+          radial-gradient(45rem 45rem at 100% 100%, var(--color-wash-1), transparent 70%),
+          linear-gradient(180deg, var(--color-wash-2), var(--color-wash-3));
+        background-attachment: fixed;
+      }
+
+      /* The single white card the whole page sits on, inset from the edges. */
+      .page {
+        max-width: 78rem;
+        margin: 0 auto;
+        background: var(--color-background-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-page);
+        padding: var(--spacing-6) var(--spacing-6) 0;
+        overflow: hidden;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      a:focus-visible,
+      button:focus-visible {
+        outline: 2px solid var(--color-focus-ring);
+        outline-offset: 3px;
+        border-radius: var(--radius-inner);
+      }
+
+      /* ---------- nav ---------- */
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--spacing-4);
+        padding: var(--spacing-2) 0 var(--spacing-8);
+      }
+
+      .wordmark {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--spacing-2);
+        font-weight: 700;
+        font-size: 1.0625rem;
+        text-decoration: none;
+        letter-spacing: -0.01em;
+      }
+
+      .navlinks {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-8);
+      }
+
+      .navlinks a {
+        font-size: 0.875rem;
+        color: var(--color-text-secondary);
+        text-decoration: none;
+      }
+
+      .navlinks a:hover {
+        color: var(--color-text-primary);
+      }
+
+      /* ---------- buttons ---------- */
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: var(--spacing-2);
+        padding: 0.75rem 1.5rem;
+        border-radius: var(--radius-pill);
+        border: 1px solid transparent;
+        font-size: 1rem;
+        font-weight: 600;
+        text-decoration: none;
+        background: var(--color-pill-background);
+        color: var(--color-pill-text);
+      }
+
+      .button:hover {
+        opacity: 0.9;
+      }
+
+      .button--small {
+        padding: 0.5rem 1rem;
+        font-size: 0.875rem;
+      }
+
+      .button--secondary {
+        background: transparent;
+        color: var(--color-text-primary);
+        border-color: var(--color-border-emphasized);
+      }
+
+      /* ---------- hero ---------- */
+
+      .hero {
+        text-align: center;
+        max-width: 46rem;
+        margin: 0 auto;
+        padding-bottom: var(--spacing-16);
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--spacing-2);
+        padding: 0.375rem 0.875rem;
+        border: 1px solid var(--color-border-emphasized);
+        border-radius: var(--radius-pill);
+        background: var(--color-background-muted);
+        font-size: 0.8125rem;
+        color: var(--color-text-secondary);
+        white-space: nowrap;
+      }
+
+      h1 {
+        font-size: clamp(2.125rem, 7.5vw, 4rem);
+        font-weight: 700;
+        line-height: 1.05;
+        letter-spacing: -0.03em;
+        margin: var(--spacing-6) 0 0;
+      }
+
+      .hero-sub {
+        margin: var(--spacing-6) auto 0;
+        max-width: 34rem;
+        color: var(--color-text-secondary);
+      }
+
+      .hero-actions {
+        margin-top: var(--spacing-8);
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: var(--spacing-3);
+      }
+
+      .hero-note {
+        margin: var(--spacing-4) auto 0;
+        max-width: 32rem;
+        font-size: 0.8125rem;
+        color: var(--color-text-secondary);
+      }
+
+      /* ---------- divider with a label sitting on it ---------- */
+
+      .rule {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-4);
+        max-width: 52rem;
+        margin: 0 auto;
+        color: var(--color-text-secondary);
+        font-size: 0.8125rem;
+        text-align: center;
+      }
+
+      .rule::before,
+      .rule::after {
+        content: '';
+        flex: 1;
+        height: 1px;
+        background: var(--color-border);
+      }
+
+      /* ---------- logo strip ---------- */
+
+      .marks {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: var(--spacing-8);
+        margin: var(--spacing-8) auto var(--spacing-16);
+        padding: 0;
+        list-style: none;
+      }
+
+      .mark {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--spacing-2);
+        font-weight: 600;
+        font-size: 1.0625rem;
+        letter-spacing: -0.01em;
+        color: var(--color-text-secondary);
+        opacity: 0.85;
+      }
+
+      /* ---------- browser-chrome mock ---------- */
+
+      .window {
+        max-width: 62rem;
+        margin: 0 auto;
+        border: 1px solid var(--color-border-emphasized);
+        border-radius: var(--radius-container);
+        background: var(--color-background-muted);
+        box-shadow: 0 24px 60px var(--color-shadow);
+        overflow: hidden;
+      }
+
+      .window-bar {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-3);
+        padding: var(--spacing-3);
+        border-bottom: 1px solid var(--color-border);
+        background: var(--color-background-muted);
+      }
+
+      .dots {
+        display: inline-flex;
+        gap: 6px;
+        flex: none;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: var(--radius-pill);
+        background: var(--color-border-emphasized);
+      }
+
+      .urlbar {
+        flex: 1;
+        max-width: 22rem;
+        margin: 0 auto;
+        padding: 4px var(--spacing-3);
+        border-radius: var(--radius-pill);
+        background: var(--color-background-surface);
+        border: 1px solid var(--color-border);
+        font-size: 0.75rem;
+        color: var(--color-text-secondary);
+        text-align: center;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+
+      .window-body {
+        min-height: 12rem;
+        background: var(--color-background-surface);
+      }
+
+      .window-body img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      /* ---------- features ---------- */
+
+      /* Keeps a heading in the outline for screen readers without drawing it. */
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .features {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: var(--spacing-8);
+        max-width: 62rem;
+        margin: var(--spacing-24) auto 0;
+        text-align: center;
+      }
+
+      .feature h3 {
+        font-size: 1.0625rem;
+        font-weight: 700;
+        margin: var(--spacing-4) 0 var(--spacing-2);
+      }
+
+      .feature p {
+        margin: 0 auto;
+        max-width: 20rem;
+        font-size: 0.875rem;
+        color: var(--color-text-secondary);
+      }
+
+      .tile {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        border-radius: var(--radius-element);
+        background: var(--color-pill-background);
+        color: var(--color-pill-text);
+      }
+
+      /* ---------- privacy section ---------- */
+
+      .privacy {
+        text-align: center;
+        margin: var(--spacing-24) auto 0;
+        max-width: 62rem;
+      }
+
+      h2 {
+        font-size: clamp(1.75rem, 5.5vw, 3rem);
+        font-weight: 700;
+        line-height: 1.1;
+        letter-spacing: -0.03em;
+        margin: var(--spacing-6) 0 0;
+      }
+
+      .facts {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--spacing-4);
+        margin: var(--spacing-12) 0 0;
+        text-align: left;
+      }
+
+      .fact {
+        background: var(--color-background-muted);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-container);
+        padding: var(--spacing-6);
+      }
+
+      .fact dt {
+        font-weight: 700;
+        font-size: 0.9375rem;
+      }
+
+      .fact dd {
+        margin: var(--spacing-2) 0 0;
+        font-size: 0.875rem;
+        color: var(--color-text-secondary);
+      }
+
+      .fact code {
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+        font-size: 0.8125rem;
+      }
+
+      /* ---------- download band + footer ---------- */
+
+      .download {
+        margin: var(--spacing-24) auto 0;
+        max-width: 62rem;
+        text-align: center;
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-container);
+        background: var(--color-background-muted);
+        padding: var(--spacing-12) var(--spacing-6);
+      }
+
+      .download h2 {
+        margin-top: 0;
+      }
+
+      footer {
+        margin-top: var(--spacing-16);
+        padding: var(--spacing-6) 0;
+        border-top: 1px solid var(--color-border);
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--spacing-3);
+        font-size: 0.8125rem;
+        color: var(--color-text-secondary);
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--spacing-6);
+      }
+
+      /* ---------- responsive ---------- */
+
+      @media (max-width: 60rem) {
+        .features {
+          grid-template-columns: 1fr;
+          gap: var(--spacing-12);
+        }
+
+        .facts {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 48rem) {
+        .navlinks {
+          display: none;
+        }
+
+        .page {
+          padding: var(--spacing-4) var(--spacing-4) 0;
+          border-radius: var(--radius-container);
+        }
+
+        .marks {
+          gap: var(--spacing-6);
+        }
+
+        .privacy,
+        .download,
+        .features {
+          margin-top: var(--spacing-16);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <a class="wordmark" href="#top">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect
+              x="3"
+              y="1.5"
+              width="14"
+              height="17"
+              rx="3"
+              stroke="currentColor"
+              stroke-width="1.6"
+            />
+            <path
+              d="M6.5 6.5h7M6.5 10h7M6.5 13.5h4"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+          InvoiceApp
+        </a>
+
+        <nav class="navlinks" aria-label="Primary">
+          <a href="#features">Features</a>
+          <a href="#privacy">Privacy</a>
+          <a href="#requirements">Requirements</a>
+          <a href="https://github.com/KevDevMed/invoiceApp">Source</a>
+        </nav>
+
+        <a class="button button--small" href="#download">Download</a>
+      </header>
+
+      <main id="top">
+        <section class="hero">
+          <p class="pill">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M8 1.5 13.5 4v4c0 3.2-2.3 5.6-5.5 6.5C4.8 13.6 2.5 11.2 2.5 8V4L8 1.5Z"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+            </svg>
+            Offline-first · Runs entirely on your Mac
+          </p>
+
+          <h1>Invoicing that never<br />leaves your Mac.</h1>
+
+          <p class="hero-sub">
+            Clients, invoices, PDF export and reports in one local SQLite file — plus an AI
+            assistant that runs on-device. No account, no server, no telemetry.
+          </p>
+
+          <div class="hero-actions">
+            <a
+              class="button"
+              id="download-mac"
+              href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-arm64.dmg"
+            >
+              Download for Mac
+            </a>
+            <a class="button button--secondary" href="/app">Try it in your browser first</a>
+          </div>
+
+          <p class="hero-note">
+            Apple Silicon build. Intel Mac?
+            <a
+              href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg"
+              >Download the Intel build</a
+            >. First launch on macOS needs one extra step —
+            <a href="/download">see install notes</a>.
+          </p>
+        </section>
+
+        <p class="rule">Built on open source you already trust</p>
+
+        <ul class="marks">
+          <li class="mark">
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <ellipse cx="10" cy="10" rx="9" ry="4" stroke="currentColor" stroke-width="1.4" />
+              <ellipse
+                cx="10"
+                cy="10"
+                rx="9"
+                ry="4"
+                stroke="currentColor"
+                stroke-width="1.4"
+                transform="rotate(60 10 10)"
+              />
+              <circle cx="10" cy="10" r="2" fill="currentColor" />
+            </svg>
+            Electron
+          </li>
+          <li class="mark">
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <circle cx="10" cy="10" r="1.8" fill="currentColor" />
+              <ellipse cx="10" cy="10" rx="9" ry="3.6" stroke="currentColor" stroke-width="1.4" />
+              <ellipse
+                cx="10"
+                cy="10"
+                rx="9"
+                ry="3.6"
+                stroke="currentColor"
+                stroke-width="1.4"
+                transform="rotate(60 10 10)"
+              />
+              <ellipse
+                cx="10"
+                cy="10"
+                rx="9"
+                ry="3.6"
+                stroke="currentColor"
+                stroke-width="1.4"
+                transform="rotate(120 10 10)"
+              />
+            </svg>
+            React
+          </li>
+          <li class="mark">
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <rect
+                x="1.5"
+                y="1.5"
+                width="17"
+                height="17"
+                rx="3"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <path
+                d="M5 8h6M8 8v7"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <path
+                d="M15.5 8.5a2 2 0 0 0-3 1.6c0 2 3 1.6 3 3.4a2 2 0 0 1-3 1.5"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+            </svg>
+            TypeScript
+          </li>
+          <li class="mark">
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <ellipse cx="10" cy="4.5" rx="7" ry="3" stroke="currentColor" stroke-width="1.4" />
+              <path
+                d="M3 4.5v11c0 1.7 3.1 3 7 3s7-1.3 7-3v-11"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <path d="M3 10c0 1.7 3.1 3 7 3s7-1.3 7-3" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            SQLite
+          </li>
+          <li class="mark">
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path
+                d="M2 14c1.6 0 1.6-8 3.2-8S6.8 16 8.4 16 10 4 11.6 4s1.6 10 3.2 10 1.6-6 3.2-6"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            llama.cpp
+          </li>
+        </ul>
+
+        <div class="window">
+          <div class="window-bar">
+            <span class="dots" aria-hidden="true">
+              <span class="dot"></span>
+              <span class="dot"></span>
+              <span class="dot"></span>
+            </span>
+            <span class="urlbar" aria-hidden="true">InvoiceApp — Invoices</span>
+            <span class="dots" aria-hidden="true"></span>
+          </div>
+          <div class="window-body">
+            <img
+              src="/landing/assets/invoices-hero.png"
+              width="1440"
+              height="960"
+              alt="The InvoiceApp invoice list: a sidebar with Invoices and Clients under Billing, Reports under Insights, Models and Assistant under Local AI, and Settings at the bottom, next to a table of invoices showing client, invoice number, issue and due dates, status and total."
+            />
+          </div>
+        </div>
+
+        <section class="features" id="features" aria-labelledby="features-heading">
+          <h2 class="visually-hidden" id="features-heading">Features</h2>
+          <div class="feature">
+            <span class="tile" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M3 12a9 9 0 0 1 9-9m9 9a9 9 0 0 1-9 9"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+                <path
+                  d="M4 4l16 16"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <h3>Fully offline</h3>
+            <p>
+              Everything is stored in one SQLite file on your Mac. No account to create, no server
+              to talk to, no sync and no telemetry.
+            </p>
+          </div>
+
+          <div class="feature">
+            <span class="tile" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                <rect
+                  x="4"
+                  y="4"
+                  width="16"
+                  height="16"
+                  rx="4"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                />
+                <circle cx="9.5" cy="10.5" r="1.2" fill="currentColor" />
+                <circle cx="14.5" cy="10.5" r="1.2" fill="currentColor" />
+                <path
+                  d="M9 15h6"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <h3>On-device assistant</h3>
+            <p>
+              A bundled llama.cpp runtime answers questions about your books. Weights download once,
+              then every prompt is processed locally.
+            </p>
+          </div>
+
+          <div class="feature">
+            <span class="tile" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M6 3h7l5 5v13H6z"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linejoin="round"
+                />
+                <path d="M13 3v5h5" stroke="currentColor" stroke-width="1.8" />
+                <path
+                  d="M9 13h6M9 16.5h4"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <h3>PDF invoices &amp; reports</h3>
+            <p>
+              Build invoices from your client list, export them to PDF, and read back revenue and
+              status reports without leaving the app.
+            </p>
+          </div>
+        </section>
+
+        <section class="privacy" id="privacy" aria-labelledby="privacy-heading">
+          <p class="pill">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect
+                x="3"
+                y="7"
+                width="10"
+                height="7"
+                rx="2"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            Privacy by construction
+          </p>
+
+          <h2 id="privacy-heading">Your data never<br />leaves the machine.</h2>
+
+          <dl class="facts" id="requirements">
+            <div class="fact">
+              <dt>One local file</dt>
+              <dd>
+                Clients, invoices and settings live in a single SQLite database in your macOS user
+                data folder. To back it up, quit the app first, then copy the
+                <code>.db</code> file along with its <code>-wal</code> and <code>-shm</code>
+                siblings.
+              </dd>
+            </div>
+            <div class="fact">
+              <dt>No account, no server, no telemetry</dt>
+              <dd>
+                Nothing to sign up for and nothing phoning home. The app works with the network
+                turned off.
+              </dd>
+            </div>
+            <div class="fact">
+              <dt>Assistant runs on-device</dt>
+              <dd>
+                Model weights are downloaded once, then llama.cpp runs them locally. Nothing you
+                type is sent anywhere.
+              </dd>
+            </div>
+            <div class="fact">
+              <dt>Requirements</dt>
+              <dd>
+                macOS 12 Monterey or later, Apple Silicon or Intel. Around 8 GB free disk space if
+                you want the assistant.
+              </dd>
+            </div>
+            <div class="fact">
+              <dt>Free and MIT-licensed</dt>
+              <dd>
+                No price, no tiers, no upsell. Read or fork the source at
+                <a href="https://github.com/KevDevMed/invoiceApp">github.com/KevDevMed/invoiceApp</a
+                >.
+              </dd>
+            </div>
+            <div class="fact">
+              <dt>Built with</dt>
+              <dd>
+                Electron, React, TypeScript and SQLite, with <code>node-llama-cpp</code> for the
+                assistant.
+              </dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="download" id="download" aria-labelledby="download-heading">
+          <h2 id="download-heading">Download InvoiceApp</h2>
+          <p class="hero-sub">
+            Free, MIT-licensed, and yours to keep. macOS 12 Monterey or later.
+          </p>
+          <div class="hero-actions">
+            <a
+              class="button"
+              href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-arm64.dmg"
+            >
+              Download for Mac
+            </a>
+            <a
+              class="button button--secondary"
+              href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg"
+            >
+              Intel build
+            </a>
+          </div>
+          <p class="hero-note">
+            First launch on macOS needs one extra step —
+            <a href="/download">see install notes</a>. Prefer to look before installing?
+            <a href="/app">Open the browser preview</a>.
+          </p>
+        </section>
+      </main>
+
+      <footer>
+        <p>InvoiceApp — offline-first invoicing for macOS. MIT licence.</p>
+        <p class="footer-links">
+          <a href="https://github.com/KevDevMed/invoiceApp">Source on GitHub</a>
+          <a href="/download">Install notes</a>
+          <a href="/app">Browser preview</a>
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>
