@@ -17,7 +17,13 @@ import { Button } from '@astryxdesign/core/Button';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
 import { Icon } from '@astryxdesign/core/Icon';
 import { PowerSearch } from '@astryxdesign/core/PowerSearch';
-import type { PowerSearchConfig, PowerSearchFilter } from '@astryxdesign/core/PowerSearch';
+import type {
+  PowerSearchComponents,
+  PowerSearchConfig,
+  PowerSearchFilter,
+  PowerSearchTokenProps,
+} from '@astryxdesign/core/PowerSearch';
+import { Token } from '@astryxdesign/core/Token';
 import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
@@ -85,6 +91,106 @@ const FIELD_ICONS: Record<string, React.JSX.Element> = {
   [FIELD_ISSUED]: <Icon icon="calendar" size="sm" />,
   [FIELD_AMOUNT]: <Icon icon={MoneyIcon} size="sm" />,
   [FIELD_NUMBER]: <Icon icon={HashIcon} size="sm" />,
+};
+
+/**
+ * Token pill for our filters: `[field icon] Field · operator · value · ×`.
+ *
+ * PowerSearch's own token (node_modules/@astryxdesign/core/src/PowerSearch/
+ * PowerSearch.tsx:798-844) renders one flat `Field: operator` string and only
+ * ever passes an `icon` for single-entity filters — a configured `field.icon`
+ * reaches the typeahead list (PowerSearch.tsx:869-885) and nothing else. The
+ * sanctioned way past that is the per-type `components.Token` override
+ * (PowerSearch.tsx:778-796; PowerSearchToken.tsx:30-33 documents it), which is
+ * what this is: the shipped `Token` with the icon slot filled and the three
+ * parts kept as separate runs of text.
+ *
+ * `label` stays the `Field: operator` string the default builds, so the remove
+ * button keeps its "Remove Status: is" accessible name; it is hidden visually
+ * and re-rendered in parts.
+ */
+function formatFilterValue(props: PowerSearchTokenProps): string {
+  const { filter, operator, maxLength } = props;
+  const truncate = (text: string): string =>
+    text.length <= maxLength ? text : `${text.slice(0, Math.max(maxLength - 1, 1))}…`;
+
+  switch (filter.value.type) {
+    case 'string':
+      return truncate(filter.value.value);
+    case 'float':
+    case 'integer':
+      return new Intl.NumberFormat().format(filter.value.value);
+    case 'enum': {
+      const raw = filter.value.value;
+      const values = operator.value.type === 'enum' ? operator.value.values : [];
+      const item = values.find((option) => option.value === raw);
+      return truncate(item?.label ?? raw);
+    }
+    case 'enum_list': {
+      const values = operator.value.type === 'enum_list' ? operator.value.values : [];
+      const labels = filter.value.value.map(
+        (raw) => values.find((option) => option.value === raw)?.label ?? raw,
+      );
+      if (labels.length === 0) return '';
+      const joined = labels.join(', ');
+      return joined.length <= maxLength ? joined : `${labels.length} items`;
+    }
+    case 'date_range':
+      return 'Date range';
+    default:
+      return '';
+  }
+}
+
+function InvoiceFilterToken(props: PowerSearchTokenProps): React.JSX.Element {
+  const { field, operator, filter, onClick, onRemove, isDisabled } = props;
+  const operatorLabel = 'label' in operator ? (operator.label ?? '') : '';
+  const value = formatFilterValue(props);
+
+  return (
+    <Token
+      icon={FIELD_ICONS[filter.field]}
+      label={`${field.label}: ${operatorLabel}`.trim()}
+      isLabelHidden
+      endContent={
+        <HStack gap={1} align="center">
+          <Text as="span" type="supporting">
+            {field.label}
+          </Text>
+          {operatorLabel === '' ? null : (
+            <Text as="span" type="supporting" color="secondary">
+              {operatorLabel}
+            </Text>
+          )}
+          {value === '' ? null : (
+            <Text as="span" type="supporting" weight="semibold">
+              {value}
+            </Text>
+          )}
+        </HStack>
+      }
+      onClick={
+        onClick
+          ? (event: React.MouseEvent) => {
+              event.stopPropagation();
+              onClick();
+            }
+          : undefined
+      }
+      onRemove={onRemove}
+      isDisabled={isDisabled}
+    />
+  );
+}
+
+/** Every operator value type this app's config produces gets the same token. */
+const SEARCH_COMPONENTS: PowerSearchComponents = {
+  enum: { Token: InvoiceFilterToken },
+  enum_list: { Token: InvoiceFilterToken },
+  string: { Token: InvoiceFilterToken },
+  float: { Token: InvoiceFilterToken },
+  integer: { Token: InvoiceFilterToken },
+  date_range: { Token: InvoiceFilterToken },
 };
 
 /** Only errors and overdue invoices earn a loud badge; the rest stay quiet. */
@@ -155,17 +261,24 @@ export function InvoiceList(): React.JSX.Element {
   }, [search, filters, load]);
 
   // Any change to what is being looked at sends the reader back to page one.
+  // It also drops the row selection: filters, search and sort all change which
+  // rows exist, so a selection made against the old set would survive unseen
+  // and reappear later. Paging only moves a window over the same set, so it
+  // keeps the selection.
   const changeSearch = useCallback((term: string) => {
     setSearch(term);
     setPage(1);
+    setSelectedKeys(new Set());
   }, []);
   const changeFilters = useCallback((next: readonly PowerSearchFilter[]) => {
     setFilters([...next]);
     setPage(1);
+    setSelectedKeys(new Set());
   }, []);
   const changeSort = useCallback((next: InvoiceSortKey) => {
     setSort(next);
     setPage(1);
+    setSelectedKeys(new Set());
   }, []);
   const changePageSize = useCallback((next: number) => {
     setPageSize(next);
@@ -304,6 +417,7 @@ export function InvoiceList(): React.JSX.Element {
           <PowerSearch
             label="Filter invoices"
             config={config}
+            components={SEARCH_COMPONENTS}
             filters={filters}
             onChange={changeFilters}
             placeholder="Add filter"
