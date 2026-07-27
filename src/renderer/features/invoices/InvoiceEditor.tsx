@@ -253,11 +253,10 @@ export function InvoiceEditor(): React.JSX.Element {
     setNotice(null);
     try {
       const result = await window.api.invoke('invoices:exportPdf', { id });
+      if (result.path === '') return; // user closed the save dialog
       setNotice(`PDF written to ${result.path} (${result.bytes} bytes).`);
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      if (message.includes('cancelled')) return; // user closed the save dialog
-      setActionError(message);
+      setActionError(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
