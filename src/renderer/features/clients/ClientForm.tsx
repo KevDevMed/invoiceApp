@@ -105,8 +105,10 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
         {error ? <Banner status="error" title={error} /> : null}
         <FormLayout>
           <TextInput label="Name" value={draft.name} isRequired onChange={set('name')} />
-          <TextInput label="Email" value={draft.email} isOptional onChange={set('email')} />
-          <TextInput label="Phone" value={draft.phone} isOptional onChange={set('phone')} />
+          <FormLayout direction="horizontal">
+            <TextInput label="Email" value={draft.email} isOptional onChange={set('email')} />
+            <TextInput label="Phone" value={draft.phone} isOptional onChange={set('phone')} />
+          </FormLayout>
           <TextInput
             label="Address line 1"
             value={draft.addressLine1}
@@ -119,7 +121,7 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
             isOptional
             onChange={set('addressLine2')}
           />
-          <HStack gap={2}>
+          <FormLayout direction="horizontal">
             <TextInput label="City" value={draft.city} isOptional onChange={set('city')} />
             <TextInput label="Region" value={draft.region} isOptional onChange={set('region')} />
             <TextInput
@@ -128,12 +130,15 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
               isOptional
               onChange={set('postalCode')}
             />
-          </HStack>
-          <TextInput label="Country" value={draft.country} isOptional onChange={set('country')} />
-          <TextInput label="Tax ID" value={draft.taxId} isOptional onChange={set('taxId')} />
+          </FormLayout>
+          <FormLayout direction="horizontal">
+            <TextInput label="Country" value={draft.country} isOptional onChange={set('country')} />
+            <TextInput label="Tax ID" value={draft.taxId} isOptional onChange={set('taxId')} />
+          </FormLayout>
           <TextArea label="Notes" value={draft.notes} rows={3} isOptional onChange={set('notes')} />
         </FormLayout>
-        <HStack gap={2}>
+        <HStack gap={2} justify="end">
+          <Button label="Cancel" variant="secondary" isDisabled={isSaving} onClick={onClose} />
           <Button
             label={client ? 'Save changes' : 'Create client'}
             variant="primary"
@@ -142,7 +147,6 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
               void save();
             }}
           />
-          <Button label="Cancel" variant="secondary" isDisabled={isSaving} onClick={onClose} />
         </HStack>
       </VStack>
     </Dialog>

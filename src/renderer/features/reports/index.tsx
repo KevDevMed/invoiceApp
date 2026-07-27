@@ -9,16 +9,19 @@ import { Badge } from '@astryxdesign/core/Badge';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Card } from '@astryxdesign/core/Card';
 import { DateRangeInput, type DateRange } from '@astryxdesign/core/DateRangeInput';
+import { Divider } from '@astryxdesign/core/Divider';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
+import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner } from '@astryxdesign/core/Spinner';
-import { HStack, VStack } from '@astryxdesign/core/Stack';
+import { VStack } from '@astryxdesign/core/Stack';
 import { Table, pixel, proportional } from '@astryxdesign/core/Table';
 import { Text } from '@astryxdesign/core/Text';
 
 import type { IpcResponse } from '../../../shared/ipc-contract';
 import { formatMoney } from '../../../shared/money';
+import { Page, PageHeader, PageToolbar } from '../../ui/Page';
 import { RevenueChart } from './RevenueChart';
 
 type Summary = IpcResponse<'reports:summary'>;
@@ -37,7 +40,7 @@ interface ReportData {
 
 function StatTile({ label, value, hint }: { label: string; value: string; hint?: string }): React.JSX.Element {
   return (
-    <Card padding={3}>
+    <Card padding={4}>
       <VStack gap={1}>
         <Text type="supporting">{label}</Text>
         <Heading level={3}>{value}</Heading>
@@ -154,11 +157,14 @@ export function ReportsPage(): React.JSX.Element {
   );
 
   return (
-    <VStack gap={4} padding={4} isScrollable>
-      <Heading level={1}>Reports</Heading>
+    <Page>
+      <PageHeader
+        title="Reports"
+        description="How invoicing is going, across clients and over time."
+      />
 
       {/* One filter row above everything it scopes. */}
-      <HStack gap={2} align="end">
+      <PageToolbar>
         <DateRangeInput label="Issue date range" value={range} onChange={setRange} />
         <Selector
           label="Group by"
@@ -168,7 +174,7 @@ export function ReportsPage(): React.JSX.Element {
             setPeriod(value === 'week' ? 'week' : 'month');
           }}
         />
-      </HStack>
+      </PageToolbar>
 
       {error ? <Banner status="error" title={error} isDismissable /> : null}
 
@@ -177,8 +183,8 @@ export function ReportsPage(): React.JSX.Element {
           <Spinner size="lg" label="Loading reports" />
         </VStack>
       ) : data ? (
-        <VStack gap={4} style={isLoading ? { opacity: 0.6 } : undefined}>
-          <HStack gap={2} wrap="wrap">
+        <VStack gap={5} style={isLoading ? { opacity: 0.6 } : undefined}>
+          <Grid columns={{ minWidth: 180, max: 5 }} gap={3}>
             <StatTile
               label="Total invoiced"
               value={fmt(totalInvoicedCents)}
@@ -188,96 +194,98 @@ export function ReportsPage(): React.JSX.Element {
             <StatTile label="Outstanding" value={fmt(data.summary.outstandingCents)} />
             <StatTile label="Overdue" value={fmt(data.summary.overdueCents)} />
             <StatTile label="Draft" value={fmt(data.summary.draftCents)} />
-          </HStack>
+          </Grid>
 
-          <Card padding={3}>
-            <VStack gap={2}>
-              <Heading level={2}>Revenue by {data.revenue.period}</Heading>
-              {data.revenue.buckets.length === 0 ? (
-                <EmptyState
-                  title="Nothing invoiced in this range"
-                  description="Create or backdate invoices to see revenue here."
-                  headingLevel={3}
-                />
-              ) : (
-                <>
-                  <RevenueChart buckets={data.revenue.buckets} currency={currency} />
-                  {/* table-view twin: every charted value, readable without hover */}
-                  <Table<BucketRow>
-                    data={bucketRows}
-                    idKey="bucket"
-                    density="compact"
-                    columns={[
-                      { key: 'bucket', header: 'Period', width: pixel(130) },
-                      { key: 'invoiceCount', header: 'Invoices', width: pixel(90), align: 'end' },
-                      { key: 'invoiced', header: 'Invoiced', width: proportional(1), align: 'end' },
-                      { key: 'paid', header: 'Paid', width: proportional(1), align: 'end' },
-                    ]}
-                  />
-                </>
-              )}
-            </VStack>
-          </Card>
+          <Divider />
 
-          <Card padding={3}>
-            <VStack gap={2}>
-              <Heading level={2}>Top clients</Heading>
-              {clientRows.length === 0 ? (
-                <EmptyState title="No client activity in this range" headingLevel={3} />
-              ) : (
-                <Table<ClientRow>
-                  data={clientRows}
-                  idKey="clientId"
+          <VStack gap={3}>
+            <Heading level={2}>Revenue by {data.revenue.period}</Heading>
+            {data.revenue.buckets.length === 0 ? (
+              <EmptyState
+                title="Nothing invoiced in this range"
+                description="Create or backdate invoices to see revenue here."
+                headingLevel={3}
+              />
+            ) : (
+              <>
+                <RevenueChart buckets={data.revenue.buckets} currency={currency} />
+                {/* table-view twin: every charted value, readable without hover */}
+                <Table<BucketRow>
+                  data={bucketRows}
+                  idKey="bucket"
                   density="compact"
                   columns={[
-                    { key: 'clientName', header: 'Client', width: proportional(2) },
+                    { key: 'bucket', header: 'Period', width: pixel(130) },
                     { key: 'invoiceCount', header: 'Invoices', width: pixel(90), align: 'end' },
-                    { key: 'total', header: 'Invoiced', width: proportional(1), align: 'end' },
+                    { key: 'invoiced', header: 'Invoiced', width: proportional(1), align: 'end' },
                     { key: 'paid', header: 'Paid', width: proportional(1), align: 'end' },
-                    { key: 'outstanding', header: 'Outstanding', width: proportional(1), align: 'end' },
                   ]}
                 />
-              )}
-            </VStack>
-          </Card>
+              </>
+            )}
+          </VStack>
 
-          <Card padding={3}>
-            <VStack gap={2}>
+          <Divider />
+
+          <VStack gap={3}>
+            <Heading level={2}>Top clients</Heading>
+            {clientRows.length === 0 ? (
+              <EmptyState title="No client activity in this range" headingLevel={3} />
+            ) : (
+              <Table<ClientRow>
+                data={clientRows}
+                idKey="clientId"
+                density="compact"
+                columns={[
+                  { key: 'clientName', header: 'Client', width: proportional(2) },
+                  { key: 'invoiceCount', header: 'Invoices', width: pixel(90), align: 'end' },
+                  { key: 'total', header: 'Invoiced', width: proportional(1), align: 'end' },
+                  { key: 'paid', header: 'Paid', width: proportional(1), align: 'end' },
+                  { key: 'outstanding', header: 'Outstanding', width: proportional(1), align: 'end' },
+                ]}
+              />
+            )}
+          </VStack>
+
+          <Divider />
+
+          <VStack gap={3}>
+            <VStack gap={1}>
               <Heading level={2}>Outstanding invoices</Heading>
-              <Text type="supporting">
+              <Text type="supporting" display="block">
                 As of {data.outstanding.asOf} — {fmt(data.outstanding.totalOutstandingCents)} unpaid.
               </Text>
-              {outstandingRows.length === 0 ? (
-                <EmptyState title="Nothing outstanding" description="Every sent invoice is settled." headingLevel={3} />
-              ) : (
-                <Table<OutstandingTableRow>
-                  data={outstandingRows}
-                  idKey="invoiceId"
-                  density="compact"
-                  columns={[
-                    { key: 'number', header: 'Number', width: pixel(120) },
-                    { key: 'clientName', header: 'Client', width: proportional(2) },
-                    { key: 'dueDate', header: 'Due', width: pixel(110) },
-                    {
-                      key: 'daysOverdue',
-                      header: 'Days overdue',
-                      width: pixel(130),
-                      align: 'end',
-                      renderCell: (row: OutstandingTableRow) =>
-                        row.daysOverdue > 0 ? (
-                          <Badge variant="error" label={String(row.daysOverdue)} />
-                        ) : (
-                          <Text type="supporting">0</Text>
-                        ),
-                    },
-                    { key: 'total', header: 'Total', width: proportional(1), align: 'end' },
-                  ]}
-                />
-              )}
             </VStack>
-          </Card>
+            {outstandingRows.length === 0 ? (
+              <EmptyState title="Nothing outstanding" description="Every sent invoice is settled." headingLevel={3} />
+            ) : (
+              <Table<OutstandingTableRow>
+                data={outstandingRows}
+                idKey="invoiceId"
+                density="compact"
+                columns={[
+                  { key: 'number', header: 'Number', width: pixel(120) },
+                  { key: 'clientName', header: 'Client', width: proportional(2) },
+                  { key: 'dueDate', header: 'Due', width: pixel(110) },
+                  {
+                    key: 'daysOverdue',
+                    header: 'Days overdue',
+                    width: pixel(130),
+                    align: 'end',
+                    renderCell: (row: OutstandingTableRow) =>
+                      row.daysOverdue > 0 ? (
+                        <Badge variant="error" label={String(row.daysOverdue)} />
+                      ) : (
+                        <Text type="supporting">0</Text>
+                      ),
+                  },
+                  { key: 'total', header: 'Total', width: proportional(1), align: 'end' },
+                ]}
+              />
+            )}
+          </VStack>
         </VStack>
       ) : null}
-    </VStack>
+    </Page>
   );
 }

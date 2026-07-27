@@ -5,10 +5,11 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { AlertDialog } from '@astryxdesign/core/AlertDialog';
+import { Avatar } from '@astryxdesign/core/Avatar';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
-import { Heading } from '@astryxdesign/core/Heading';
+import { MoreMenu } from '@astryxdesign/core/MoreMenu';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, VStack } from '@astryxdesign/core/Stack';
 import { Table, proportional, pixel } from '@astryxdesign/core/Table';
@@ -16,37 +17,22 @@ import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
 import type { Client } from '../../../shared/types';
+import { ListFooter } from '../../ui/ListFooter';
+import { Page, PageHeader, PageToolbar } from '../../ui/Page';
+import { pageSlice } from '../../ui/pagination';
 import { ClientForm } from './ClientForm';
-
-interface ClientTableRow extends Record<string, unknown> {
-  id: string;
-  name: string;
-  email: string;
-  phone: string;
-  location: string;
-  client: Client;
-}
-
-function toRow(client: Client): ClientTableRow {
-  return {
-    id: client.id,
-    name: client.name,
-    email: client.email ?? '—',
-    phone: client.phone ?? '—',
-    location: [client.city, client.country].filter(Boolean).join(', ') || '—',
-    client,
-  };
-}
+import { toRow, type ClientTableRow } from './rows';
 
 export function ClientsPage(): React.JSX.Element {
   const [search, setSearch] = useState('');
   const [clients, setClients] = useState<Client[] | null>(null);
-  const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Client | null | 'new'>(null);
   const [deleting, setDeleting] = useState<Client | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   const load = useCallback(async (term: string): Promise<void> => {
     setError(null);
@@ -57,7 +43,6 @@ export function ClientsPage(): React.JSX.Element {
         offset: 0,
       });
       setClients(result.items);
-      setTotal(result.total);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setClients([]);
@@ -70,6 +55,10 @@ export function ClientsPage(): React.JSX.Element {
     }, 200);
     return () => window.clearTimeout(handle);
   }, [search, load]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search]);
 
   const confirmDelete = async (): Promise<void> => {
     if (!deleting) return;
@@ -89,30 +78,33 @@ export function ClientsPage(): React.JSX.Element {
   };
 
   const rows = (clients ?? []).map(toRow);
+  const pagedRows = pageSlice(rows, page, pageSize);
 
   return (
-    <VStack gap={4} padding={4} height="100%" isScrollable>
-      <HStack gap={2} align="center" justify="between">
-        <Heading level={1}>Clients</Heading>
-        <Button
-          label="New client"
-          variant="primary"
-          onClick={() => {
-            setEditing('new');
-          }}
-        />
-      </HStack>
+    <Page>
+      <PageHeader
+        title="Clients"
+        description="The people and companies you invoice."
+        actions={
+          <Button
+            label="New client"
+            variant="primary"
+            onClick={() => {
+              setEditing('new');
+            }}
+          />
+        }
+      />
 
-      <HStack gap={2} align="end">
+      <PageToolbar>
         <TextInput
-          label="Search"
+          label="Search clients"
           isLabelHidden
           placeholder="Search by name or email"
           value={search}
           onChange={setSearch}
         />
-        <Text type="supporting">{total} client(s)</Text>
-      </HStack>
+      </PageToolbar>
 
       {error ? <Banner status="error" title={error} isDismissable /> : null}
       {deleteError ? <Banner status="error" title={deleteError} isDismissable /> : null}
@@ -123,52 +115,77 @@ export function ClientsPage(): React.JSX.Element {
         </VStack>
       ) : rows.length === 0 ? (
         <EmptyState
-          title={search ? 'No clients match your search' : 'No clients yet'}
+          title={search ? 'Nothing matches this search' : 'No clients yet'}
           description={
             search
-              ? 'Try a different name or email.'
+              ? 'No client name or email matches. Try a shorter term.'
               : 'Create your first client to start invoicing.'
           }
           headingLevel={2}
         />
       ) : (
-        <Table<ClientTableRow>
-          data={rows}
-          idKey="id"
-          hasHover
-          columns={[
-            { key: 'name', header: 'Name', width: proportional(2) },
-            { key: 'email', header: 'Email', width: proportional(2) },
-            { key: 'phone', header: 'Phone', width: proportional(1) },
-            { key: 'location', header: 'Location', width: proportional(1) },
-            {
-              key: 'actions',
-              header: '',
-              width: pixel(170),
-              renderCell: (row: ClientTableRow) => (
-                <HStack gap={1}>
-                  <Button
-                    label="Edit"
-                    variant="secondary"
+        <VStack gap={0}>
+          <Table<ClientTableRow>
+            data={pagedRows}
+            idKey="id"
+            hasHover
+            density="compact"
+            columns={[
+              {
+                key: 'name',
+                header: 'Name',
+                width: proportional(2),
+                renderCell: (row: ClientTableRow) => (
+                  <HStack gap={2} align="center">
+                    <Avatar size="sm" name={row.name} />
+                    <Text weight="medium">{row.name}</Text>
+                  </HStack>
+                ),
+              },
+              { key: 'email', header: 'Email', width: proportional(2) },
+              { key: 'phone', header: 'Phone', width: proportional(1) },
+              { key: 'location', header: 'Location', width: proportional(1) },
+              {
+                key: 'actions',
+                header: '',
+                width: pixel(56),
+                align: 'end',
+                renderCell: (row: ClientTableRow) => (
+                  <MoreMenu
+                    label={`Actions for ${row.name}`}
                     size="sm"
-                    onClick={() => {
-                      setEditing(row.client);
-                    }}
+                    items={[
+                      {
+                        label: 'Edit',
+                        onClick: () => {
+                          setEditing(row.client);
+                        },
+                      },
+                      { type: 'divider' },
+                      {
+                        label: 'Delete',
+                        onClick: () => {
+                          setDeleteError(null);
+                          setDeleting(row.client);
+                        },
+                      },
+                    ]}
                   />
-                  <Button
-                    label="Delete"
-                    variant="destructive"
-                    size="sm"
-                    onClick={() => {
-                      setDeleteError(null);
-                      setDeleting(row.client);
-                    }}
-                  />
-                </HStack>
-              ),
-            },
-          ]}
-        />
+                ),
+              },
+            ]}
+          />
+          <ListFooter
+            total={rows.length}
+            page={page}
+            pageSize={pageSize}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
+        </VStack>
       )}
 
       {editing !== null ? (
@@ -199,6 +216,6 @@ export function ClientsPage(): React.JSX.Element {
           }}
         />
       ) : null}
-    </VStack>
+    </Page>
   );
 }
