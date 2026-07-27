@@ -123,4 +123,64 @@ describe.skipIf(!GGUF_PATH)('NodeLlamaCppRuntime against a real GGUF', () => {
 
     await runtime.dispose();
   });
+
+  it(
+    'holds a multi-turn conversation on one loaded model',
+    { timeout: 1_800_000 },
+    async () => {
+      // The `No sequences left` regression, against the real backend: a context
+      // is created with one sequence, so before the runtime owned the sequence
+      // lifecycle the second turn here failed outright.
+      const runtime = new NodeLlamaCppRuntime();
+      await runtime.load({
+        modelId: 'multi-turn',
+        modelPath: GGUF_PATH as string,
+        contextSize: 1024,
+      });
+
+      const turns = [
+        'Reply with exactly three words: hello tier two',
+        'Now reply with exactly two words: still here',
+        'Now reply with exactly one word: done',
+      ];
+      const transcript: { role: 'user' | 'assistant'; content: string }[] = [];
+
+      for (const [index, turn] of turns.entries()) {
+        transcript.push({ role: 'user', content: turn });
+        const reply = await runtime.generate({
+          requestId: `multi-${index}`,
+          messages: [{ role: 'system', content: 'Answer briefly.' }, ...transcript],
+          temperature: 0,
+          maxTokens: 32,
+        });
+        console.log(`[multi] turn ${index + 1} stop=${reply.stopReason} text=${reply.text.trim()}`);
+
+        expect(reply.stopReason).not.toBe('error');
+        expect(reply.text.trim().length).toBeGreaterThan(0);
+        transcript.push({ role: 'assistant', content: reply.text });
+      }
+
+      // And a chat still works after one was cancelled.
+      const controller = new AbortController();
+      const cancelled = await runtime.generate({
+        requestId: 'multi-cancel',
+        messages: [{ role: 'user', content: 'Count to twenty slowly.' }],
+        maxTokens: 64,
+        signal: controller.signal,
+        onToken: () => controller.abort(),
+      });
+      expect(cancelled.stopReason).toBe('cancelled');
+
+      const after = await runtime.generate({
+        requestId: 'multi-after-cancel',
+        messages: [{ role: 'user', content: 'Reply with exactly one word: recovered' }],
+        temperature: 0,
+        maxTokens: 32,
+      });
+      console.log(`[multi] after cancel stop=${after.stopReason} text=${after.text.trim()}`);
+      expect(after.text.trim().length).toBeGreaterThan(0);
+
+      await runtime.dispose();
+    },
+  );
 });

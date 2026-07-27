@@ -58,6 +58,7 @@ import {
   LlmRuntimeError,
   NodeLlamaCppRuntime,
   type ChatTurn,
+  type GenerateStopReason,
   type LlmRuntime,
 } from '../llm/runtime';
 import {
@@ -468,7 +469,8 @@ async function handleChat(payload: ChatRequest): Promise<ChatResponse> {
     }
 
     let text = '';
-    let stopReason: ChatResponse['stopReason'] = 'stop';
+    let stopReason: GenerateStopReason = 'stop';
+    let thoughts: string | undefined;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
       const generated = await getRuntime().generate({
@@ -484,6 +486,7 @@ async function handleChat(payload: ChatRequest): Promise<ChatResponse> {
 
       text = generated.text;
       stopReason = generated.stopReason;
+      thoughts = generated.thoughts;
       if (stopReason !== 'stop') break;
 
       const proposal = parseToolCallProposal(generated.text);
@@ -527,16 +530,30 @@ async function handleChat(payload: ChatRequest): Promise<ChatResponse> {
 
     broadcast('llm:chatToken', { requestId: payload.requestId, token: '', done: true });
 
+    // Never store `content: ""` as if it were a reply — see `resolveAssistantOutcome`.
+    const outcome = resolveAssistantOutcome({
+      text,
+      stopReason,
+      thoughts,
+      hasToolCalls: recorded.length > 0,
+    });
+
     const message = appendMessage(db, {
       threadId: thread.id,
       role: 'assistant',
-      content: text,
+      content: outcome.content,
       toolCalls: recorded.length > 0 ? recorded : undefined,
     });
 
     const updated = requireThread(db, thread.id);
     mirrorHistory(db, thread.id);
-    return { requestId: payload.requestId, threadId: thread.id, message, thread: updated, stopReason };
+    return {
+      requestId: payload.requestId,
+      threadId: thread.id,
+      message,
+      thread: updated,
+      stopReason: outcome.stopReason,
+    };
   } catch (error) {
     broadcast('llm:chatToken', { requestId: payload.requestId, token: '', done: true });
     const message = error instanceof Error ? error.message : String(error);
@@ -557,6 +574,61 @@ async function handleChat(payload: ChatRequest): Promise<ChatResponse> {
   } finally {
     activeChats.delete(payload.requestId);
   }
+}
+
+/**
+ * What the user is told when the model reasoned but never answered.
+ *
+ * Qwen3 — every model in the catalog is one — reasons by default, and
+ * `node-llama-cpp` keeps thought segments out of the response text. The runtime
+ * now reports that case as `reasoning_only` instead of an empty string, and this
+ * is the text that goes into the transcript in its place.
+ */
+export const REASONING_ONLY_NOTICE =
+  'The model produced only reasoning and no answer. Ask again, or try a model that answers directly.';
+
+const EMPTY_NOTICE: Record<GenerateStopReason, string> = {
+  stop: 'The model returned an empty reply.',
+  length: 'The model hit the token limit before it produced an answer.',
+  cancelled: 'Generation was stopped before the model replied.',
+  error: 'The model produced no reply.',
+  reasoning_only: REASONING_ONLY_NOTICE,
+};
+
+/**
+ * Decide what to persist as the assistant turn, and what stop reason to report.
+ *
+ * `chat_messages.content` never gets an empty string: a turn that produced no
+ * text says why in plain words instead. The contract's stop reason has only four
+ * values, so `reasoning_only` travels as `error` — which is also the value the
+ * Assistant page raises a banner for.
+ */
+export function resolveAssistantOutcome(input: {
+  readonly text: string;
+  readonly stopReason: GenerateStopReason;
+  readonly thoughts?: string;
+  readonly hasToolCalls: boolean;
+}): { readonly content: string; readonly stopReason: ChatResponse['stopReason'] } {
+  if (input.text.trim().length > 0) {
+    return {
+      content: input.text,
+      stopReason: input.stopReason === 'reasoning_only' ? 'error' : input.stopReason,
+    };
+  }
+
+  // A mutating tool call awaiting approval is a real turn even with no prose.
+  if (input.hasToolCalls && input.stopReason === 'stop') {
+    return { content: 'Waiting for your decision on the proposed action.', stopReason: 'stop' };
+  }
+
+  const reasoned = input.stopReason === 'reasoning_only' || (input.thoughts ?? '').trim().length > 0;
+  return {
+    content: reasoned ? REASONING_ONLY_NOTICE : EMPTY_NOTICE[input.stopReason],
+    // An empty turn is never a plain success: `cancelled` and `length` already
+    // say what happened, anything else surfaces as an error the UI can show.
+    stopReason:
+      input.stopReason === 'cancelled' || input.stopReason === 'length' ? input.stopReason : 'error',
+  };
 }
 
 /**
