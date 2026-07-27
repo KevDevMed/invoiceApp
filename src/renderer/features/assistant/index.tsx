@@ -23,6 +23,7 @@ import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 
 import type { ChatMessage } from '../../../shared/types';
+import { describeSmokeTest, readSmokeTest } from '../models/llmExtra';
 import { parseToolCalls, useAssistant, type ToolCallRecord } from './useAssistant';
 
 export function AssistantPage(): React.JSX.Element {
@@ -56,6 +57,9 @@ export function AssistantPage(): React.JSX.Element {
   }
 
   const hasModel = assistant.activeModelId !== null;
+  const activeRecord =
+    assistant.readyModels.find((record) => record.id === assistant.activeModelId) ?? null;
+  const activeSmokeTest = activeRecord ? readSmokeTest(activeRecord.error) : null;
 
   return (
     <HStack gap={0} height="100%">
@@ -70,11 +74,19 @@ export function AssistantPage(): React.JSX.Element {
                 Reads your invoices and clients locally. Any change it wants to make needs your approval.
               </Text>
             </VStack>
+            {/*
+              An untested model is still selectable — the smoke test is advice,
+              not a gate — but the label says so, because "it loaded" and "it
+              generates tokens at a usable speed" are different claims.
+            */}
             <Selector
               label="Model"
               isLabelHidden
               placeholder="Choose a model"
-              options={assistant.readyModels.map((record) => record.id)}
+              options={assistant.readyModels.map((record) => ({
+                value: record.id,
+                label: `${record.id} · ${describeSmokeTest(readSmokeTest(record.error))}`,
+              }))}
               value={assistant.activeModelId ?? undefined}
               onChange={(value) => {
                 void assistant.selectModel(value);
@@ -97,6 +109,22 @@ export function AssistantPage(): React.JSX.Element {
               status="warning"
               title="No model is loaded"
               description="Pick a downloaded model above before sending a message."
+            />
+          ) : null}
+
+          {hasModel && activeSmokeTest === null ? (
+            <Banner
+              status="warning"
+              title="This model has not been tested on this machine"
+              description="It is loaded and usable, but nobody has measured whether it generates at a usable speed here. Run “Test on my machine” on the Models page to find out."
+            />
+          ) : null}
+
+          {activeSmokeTest?.verdict === 'fail' ? (
+            <Banner
+              status="warning"
+              title="This model failed its last test on this machine"
+              description={activeSmokeTest.error ?? 'The recorded run did not produce output.'}
             />
           ) : null}
 
