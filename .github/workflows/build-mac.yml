@@ -29,10 +29,17 @@
 #   mode, so a certificate that fails to import aborts the build instead of
 #   quietly downgrading it to an unsigned one. The outcome is a dialog-free
 #   install: a stapled bundle passes Gatekeeper even with no network.
+#   The .dmg is then signed, notarised and stapled in its own right, because
+#   that is the file users download and Apple's "Packaging Mac software for
+#   distribution" says to sign every nested container and notarise only the
+#   outermost one. electron-builder cannot do it — it deletes its signing
+#   keychain when the build ends, and `dmg.sign` signs without `--timestamp` —
+#   so the workflow rebuilds an identity and runs codesign + notarytool +
+#   stapler itself.
 #   Nothing is uploaded until `Authority=Developer ID Application` is on the
-#   signature, `xcrun stapler validate` succeeds and `spctl -a -t exec` reports
-#   `source=Notarized Developer ID` — checked on the packaged .app AND on the
-#   copy inside the mounted .dmg, which is what a user actually installs from.
+#   signature, `xcrun stapler validate` succeeds and `spctl` reports
+#   `source=Notarized Developer ID` — checked on the packaged .app, on the copy
+#   inside the mounted .dmg, and on the .dmg itself.
 #
 # AD-HOC MODE — no MAC_CERT_P12. This is what forks get, and what every build
 #   before the secrets landed got. CSC_IDENTITY_AUTO_DISCOVERY=false stops
@@ -215,12 +222,15 @@ jobs:
             arch: arm64
             expected_uname: arm64
     runs-on: ${{ matrix.runner }}
-    # Was 60. In certificate mode the critical path gains Apple's notarytool
-    # round trip, which commonly takes 5-20 minutes and has no upper bound worth
-    # relying on, on top of an npm ci that compiles better-sqlite3 and
-    # node-llama-cpp from source. 60 minutes left almost no headroom; a timeout
-    # here burns the whole matrix leg and the release with it.
-    timeout-minutes: 120
+    # Was 60, then 120. In certificate mode the critical path now carries TWO
+    # notarytool round trips per arch — electron-builder's, on the .app, and
+    # this workflow's, on the .dmg — each commonly 5-20 minutes with no upper
+    # bound worth relying on, on top of an npm ci that compiles better-sqlite3
+    # and node-llama-cpp from source. The dmg submission is capped at
+    # `--timeout 45m` so a stuck one fails with a notarytool message rather than
+    # a bare job timeout; 150 leaves room for that cap plus the rest of the job.
+    # A timeout here burns the whole matrix leg and the release with it.
+    timeout-minutes: 150
 
     # `secrets` is not one of the contexts available to a step-level `if:`
     # (github, needs, strategy, matrix, job, runner, env, vars, steps, inputs),
@@ -319,11 +329,20 @@ jobs:
           echo "MAC_CERT_P12 decodes to $BYTES bytes"
           # Heredoc form for the password: it may legitimately contain any
           # character, and KEY=VALUE would break on a newline.
+          #
+          # The delimiter is generated per run rather than fixed. GitHub's own
+          # documentation ("Multiline strings", Workflow commands for GitHub
+          # Actions) says to use a randomly generated delimiter for values whose
+          # content is not controlled: a secret that happens to contain the
+          # delimiter on a line of its own ends the value early, and everything
+          # after it is parsed as further NAME=VALUE lines in $GITHUB_ENV.
+          # Neither the delimiter nor the password is ever echoed.
+          CSC_PASSWORD_EOF="__CSC_KEY_PASSWORD_$(openssl rand -hex 16)__"
           {
             echo "CSC_LINK=data:application/x-pkcs12;base64,$P12"
-            echo "CSC_KEY_PASSWORD<<__CSC_KEY_PASSWORD_EOF__"
+            echo "CSC_KEY_PASSWORD<<$CSC_PASSWORD_EOF"
             printf '%s\n' "$MAC_CERT_PASSWORD"
-            echo "__CSC_KEY_PASSWORD_EOF__"
+            echo "$CSC_PASSWORD_EOF"
           } >> "$GITHUB_ENV"
 
       # `--mac dmg:<arch> zip:<arch>` overrides electron-builder.yml's target
@@ -350,18 +369,22 @@ jobs:
       # identity by design, so a static `forceCodeSigning: true` in
       # electron-builder.yml would kill every fork build. Hence the CLI override.
       #
-      # And the CLI override is why this runs electron-builder directly instead
-      # of `npm run package:mac`. That script passes `--config
-      # electron-builder.yml`, and builder.js:105-120 folds `--config <file>`
-      # plus a `-c.<key>=<value>` into `{extends: "electron-builder.yml", ...}`.
-      # electron-builder then loads electron-builder.yml as the base config AND
-      # again as its own parent, and merges it with itself: `dmg.contents` ends
-      # up holding two `type: link` entries, and dmg.js:287 runs
-      # `ln -s /Applications` twice into the staging volume, so the second one
-      # fails and takes the dmg build with it. Without `--config`, config
-      # auto-discovery loads electron-builder.yml exactly once and the dot
-      # override merges cleanly (verified by loading the config both ways).
-      # `npm run build` is the other half of what `package:mac` does.
+      # This goes through `npm run package:mac` so CI and the documented local
+      # command cannot drift. An earlier revision invoked electron-builder
+      # directly, on the theory that `--config electron-builder.yml` (which
+      # package:mac passes) plus a `-c.<key>=<value>` made electron-builder load
+      # the config as its own `extends` parent and merge it with itself,
+      # duplicating `dmg.contents` to two `type: link` entries. That does not
+      # happen on electron-builder 25.1.8. builder.js:105-120 does fold the two
+      # into `{extends: "electron-builder.yml", forceCodeSigning: "true"}`, but
+      # packager.js:241-256 turns an `extends` that looks like a path straight
+      # back into `configPath` and deletes it before getConfig ever sees it, so
+      # the file is loaded exactly once. Driving the real loader both ways gave
+      # identical results — `dmg.contents` 2 entries, same `mac.target`, same
+      # artifactName, `forceCodeSigning` true — and normalizeOptions produced
+      # the same target map for both argument vectors.
+      #
+      # `package:mac` already runs `npm run build`, so that is not repeated here.
       - name: Package ${{ matrix.arch }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -375,7 +398,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          npm run build
           # Empty in ad-hoc mode. Left unquoted deliberately: it is either empty
           # or one option with no whitespace in it.
           EXTRA=''
@@ -383,7 +405,7 @@ jobs:
             EXTRA='-c.forceCodeSigning=true'
           fi
           # shellcheck disable=SC2086
-          npx --no-install electron-builder --mac "dmg:$ARCH" "zip:$ARCH" --publish never $EXTRA
+          npm run package:mac -- --mac "dmg:$ARCH" "zip:$ARCH" --publish never $EXTRA
 
       - name: Show what was produced
         run: ls -lh release/
@@ -423,7 +445,7 @@ jobs:
           fi
           printf '%s\n' "$OUT"
 
-          if ! printf '%s\n' "$OUT" | grep -q '^CodeDirectory '; then
+          if ! grep -q '^CodeDirectory ' <<<"$OUT"; then
             echo "::error::$APP has no CodeDirectory — it is not signed."
             exit 1
           fi
@@ -435,12 +457,12 @@ jobs:
             # falls back to ANY non-Apple certificate in the keychain when that
             # one is missing. A build signed by that fallback would satisfy a
             # bare `^Authority=` and still be rejected by Gatekeeper.
-            if ! printf '%s\n' "$OUT" | grep -q '^Authority=Developer ID Application:'; then
+            if ! grep -q '^Authority=Developer ID Application:' <<<"$OUT"; then
               echo "::error::MAC_CERT_P12 is configured but $APP has no 'Authority=Developer ID Application:' line, so it was not signed with a Developer ID Application certificate."
               exit 1
             fi
           else
-            if ! printf '%s\n' "$OUT" | grep -q '^Signature=adhoc'; then
+            if ! grep -q '^Signature=adhoc' <<<"$OUT"; then
               echo "::error::No signing certificate is configured, so $APP must carry an ad-hoc signature, but codesign did not report Signature=adhoc."
               exit 1
             fi
@@ -500,13 +522,13 @@ jobs:
             exit 1
           }
           printf '%s\n' "$OUT"
-          if ! printf '%s\n' "$OUT" | grep -q '^Authority=Developer ID Application:'; then
+          if ! grep -q '^Authority=Developer ID Application:' <<<"$OUT"; then
             echo "::error::$APP is not signed by a Developer ID Application certificate."
             exit 1
           fi
           # The rest of the chain must be Apple's, not a self-signed lookalike.
           for AUTHORITY in 'Developer ID Certification Authority' 'Apple Root CA'; do
-            if ! printf '%s\n' "$OUT" | grep -q "^Authority=$AUTHORITY\$"; then
+            if ! grep -q "^Authority=$AUTHORITY\$" <<<"$OUT"; then
               echo "::error::$APP is missing '$AUTHORITY' from its certificate chain, so it is not chained to Apple."
               exit 1
             fi
@@ -527,35 +549,191 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$OUT"
-          if ! printf '%s\n' "$OUT" | grep -q 'accepted'; then
+          if ! grep -q 'accepted' <<<"$OUT"; then
             echo "::error::spctl did not report $APP as accepted."
             exit 1
           fi
-          if ! printf '%s\n' "$OUT" | grep -q '^source=Notarized Developer ID$'; then
+          if ! grep -q '^source=Notarized Developer ID$' <<<"$OUT"; then
             echo "::error::spctl accepted $APP but not as 'source=Notarized Developer ID'. A locally-signed-only app is accepted on the machine that signed it and rejected everywhere else."
             exit 1
           fi
 
-      # The .dmg is a separate artifact from the .app, and electron-builder
-      # treats it as one. dmg.js:62-64 signs the disk image only when
-      # `dmg.sign` is true, which defaults to false (app-builder-lib
-      # scheme.json, DmgOptions.sign: "Whether to sign the DMG or not. Signing is
-      # not required and will lead to unwanted errors in combination with
-      # notarization requirements."), and dmg-builder contains no notarisation
-      # call at all — notarizeIfProvided is reached only from macPackager.sign
-      # (macPackager.js:288-290), which runs against the .app.
+      # electron-builder notarises and staples the .app and then builds the .dmg
+      # around it (macPackager.pack, macPackager.js:168-174, finishes doPack ->
+      # doSignAfterPack -> sign -> notarize -> staple BEFORE calling
+      # packageInDistributableFormat). Nothing in dmg-builder notarises anything,
+      # and dmg.js:62-64 signs the image only when `dmg.sign` is true. So without
+      # this step the .dmg — the file users actually download — ships unsigned
+      # and un-notarised, with only its payload notarised.
       #
-      # That is fine, and the ordering is why. macPackager.pack
-      # (macPackager.js:168-174) finishes doPack — which runs afterPack, then
-      # doSignAfterPack -> sign -> notarize -> staple — BEFORE it calls
-      # packageInDistributableFormat to build the dmg and zip targets. So the
-      # .app that gets copied into the disk image already carries its stapled
-      # ticket, and that is the bundle Gatekeeper assesses when the user drags it
-      # to /Applications and launches it. Signing the container would add a
-      # second signature over a payload that already proves itself.
+      # Apple's documentation says that is not the supported shape. "Packaging
+      # Mac software for distribution"
+      # (https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution):
+      #   - "Sign your code, and sign each nested container that supports
+      #     signing. For example, if you ship an app inside an installer package
+      #     on a disk image, sign the app, create the installer package, sign
+      #     that package, create the disk image, and then sign the disk image."
+      #   - the documented disk-image signing command is
+      #     `codesign -s <CodeSigningIdentity> --timestamp -i <Identifier> <DiskImageFile>`
+      #     where "<CodeSigningIdentity> is your Developer ID application
+      #     code-signing identity".
+      #   - for third-party image tools (which dmg-builder is) it requires that
+      #     "the resulting disk image: Is signed with your Developer ID
+      #     Application code-signing identity [and] Is a UDIF-format read-only
+      #     zip-compressed disk image (type UDZO)".
+      #   - "If you distribute your product using nested containers, only
+      #     notarize the outermost container."
+      #   - "Once you've notarized your product, staple the resulting ticket to
+      #     the file you intend to distribute. The other common container
+      #     formats, installer packages and disk images, support stapling
+      #     directly," with `xcrun stapler staple FlyingAnimals.dmg` as the
+      #     example.
+      # "Customizing the notarization workflow" adds that "The notary service
+      # accepts disk images (UDIF format) ... It processes nested containers as
+      # well" and "generates a ticket for the top-level file that you specify, as
+      # well as for each nested file."
       #
-      # Rather than take that on faith, this mounts the .dmg that will actually
-      # be published and re-runs stapler and spctl on the app inside it.
+      # So the container is signed here, by hand, rather than with `dmg.sign`:
+      # dmg-builder runs `codesign --sign <hash>` with NO `--timestamp`
+      # (dmg.js), and a signature without a secure timestamp is one of the
+      # documented notarisation failures ("Include a secure timestamp",
+      # Resolving common notarization issues). electron-builder's own schema
+      # warning about `dmg.sign` describes exactly that: signing the image its
+      # way "will lead to unwanted errors in combination with notarization
+      # requirements".
+      #
+      # The identity has to be re-established because electron-builder deletes
+      # its temporary keychain as soon as the build finishes (macPackager.js
+      # disposeOnBuildFinish -> removeKeychain), so by the time this step runs
+      # there is no signing identity on the host at all. The keychain built here
+      # is put ON THE USER SEARCH LIST explicitly — `security create-keychain`
+      # does not do it and `security default-keychain -s` does not either, and a
+      # keychain off the search list is invisible to `security find-identity` and
+      # to codesign. That omission is the exact bug this branch exists to fix;
+      # do not drop the `security list-keychains -d user -s` call.
+      #
+      # notarytool needs no keychain — only APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD
+      # / APPLE_TEAM_ID.
+      - name: Sign, notarise and staple the .dmg
+        if: env.HAS_SIGNING_CERT == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          DMG="release/InvoiceApp-mac-$ARCH.dmg"
+          KEYCHAIN="$RUNNER_TEMP/invoiceapp-dmg-signing.keychain-db"
+          SEARCH_LIST_FILE="$RUNNER_TEMP/keychain-search-list.txt"
+
+          for VAR in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            eval "VALUE=\${$VAR:-}"
+            if [ -z "$VALUE" ]; then
+              echo "::error::$VAR is empty. Certificate mode notarises the .dmg with xcrun notarytool, which needs APPLE_ID, APPLE_APP_PASSWORD and APPLE_TEAM_ID. Signed-but-unnotarised is not a state this workflow publishes."
+              exit 1
+            fi
+          done
+
+          # Apple requires the distributed image to be UDZO. dmg-builder picks
+          # that by default (dmg.js:140-150, anything but compression "store" or
+          # "maximum"), but the artifact is what matters, so read it back.
+          IMAGE_INFO=$(hdiutil imageinfo "$DMG")
+          if ! grep -q '^Format: UDZO$' <<<"$IMAGE_INFO"; then
+            echo "::error::$DMG is not a UDZO (UDIF read-only zip-compressed) image. Apple's 'Packaging Mac software for distribution' requires that format for a disk image built by a third-party tool. Check electron-builder's dmg.format / compression settings."
+            grep '^Format' <<<"$IMAGE_INFO" || true
+            exit 1
+          fi
+
+          # Remember the search list verbatim so the cleanup step can restore it.
+          security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$SEARCH_LIST_FILE"
+          SEARCH_LIST=()
+          while IFS= read -r KC; do
+            if [ -n "$KC" ]; then
+              SEARCH_LIST+=("$KC")
+            fi
+          done < "$SEARCH_LIST_FILE"
+
+          # Never logged. Only has to outlive this step.
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # -lut 3600: do not re-lock while notarytool is waiting on Apple.
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # THE search-list call. Without it nothing below can find the identity.
+          security list-keychains -d user -s "${SEARCH_LIST[@]}" "$KEYCHAIN"
+          echo "keychain search list is now:"
+          security list-keychains -d user
+
+          P12="$RUNNER_TEMP/dmg-signing.p12"
+          # `base64 -d`: macOS /usr/bin/base64 has no GNU --decode.
+          printf '%s' "$MAC_CERT_P12" | tr -d '[:space:]' | base64 -d > "$P12"
+          security import "$P12" -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign -f pkcs12 > /dev/null
+          rm -f "$P12"
+          # Without this, codesign blocks on a GUI keychain-access prompt that
+          # nothing on a runner can answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+
+          # Captured first, then matched from a variable: `security ... | awk
+          # '{...; exit}'` would kill `security` with SIGPIPE and pipefail would
+          # surface 141. Same defect as the zip listing check.
+          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN")
+          printf '%s\n' "$IDENTITIES"
+          IDENTITY=$(awk '/"Developer ID Application:/ { print $2; exit }' <<<"$IDENTITIES")
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity in the keychain built from MAC_CERT_P12, so the .dmg cannot be signed. The .app was signed by electron-builder's own keychain, so this is a search-list or import problem, not a bad certificate."
+            exit 1
+          fi
+
+          # Apple: use a code-signing identifier unique to the image and
+          # different from the app's bundle identifier.
+          echo "=== codesign $DMG ==="
+          codesign --sign "$IDENTITY" --timestamp --force \
+            --identifier com.invoiceapp.desktop.dmg "$DMG"
+
+          OUT=$(codesign -dv --verbose=4 "$DMG" 2>&1)
+          printf '%s\n' "$OUT"
+          if ! grep -q '^Authority=Developer ID Application:' <<<"$OUT"; then
+            echo "::error::$DMG is not signed by a Developer ID Application certificate after codesign ran."
+            exit 1
+          fi
+          if ! grep -q '^Timestamp=' <<<"$OUT"; then
+            echo "::error::$DMG has no secure timestamp. Apple's notary service rejects a signature without one ('The signature does not include a secure timestamp')."
+            exit 1
+          fi
+
+          echo "=== xcrun notarytool submit $DMG ==="
+          # --wait blocks until Apple returns a verdict; --timeout keeps a stuck
+          # submission from eating the whole job timeout with no output.
+          NOTARY_STATUS=0
+          NOTARY_OUT=$(xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 45m 2>&1) || NOTARY_STATUS=$?
+          printf '%s\n' "$NOTARY_OUT"
+          SUBMISSION_ID=$(awk '/^ *id: / { print $2; exit }' <<<"$NOTARY_OUT")
+          if [ "$NOTARY_STATUS" -ne 0 ] || ! grep -q '^ *status: Accepted$' <<<"$NOTARY_OUT"; then
+            if [ -n "$SUBMISSION_ID" ]; then
+              echo "=== xcrun notarytool log $SUBMISSION_ID ==="
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+            fi
+            echo "::error::Apple's notary service did not accept $DMG. The log above lists the offending items."
+            exit 1
+          fi
+
+          echo "=== xcrun stapler staple $DMG ==="
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate -v "$DMG"
+
+      # Rather than take the previous step on faith, this mounts the .dmg that
+      # will actually be published and re-runs stapler and spctl on the app
+      # inside it, then assesses the container itself.
       - name: Verify the app inside the .dmg is notarised and stapled
         if: env.HAS_SIGNING_CERT == 'true'
         env:
@@ -594,18 +772,30 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$OUT"
-          if ! printf '%s\n' "$OUT" | grep -q '^source=Notarized Developer ID$'; then
+          if ! grep -q '^source=Notarized Developer ID$' <<<"$OUT"; then
             echo "::error::The app inside $DMG is not accepted as 'source=Notarized Developer ID'."
             exit 1
           fi
 
-          # Informational only. The disk image itself is deliberately unsigned
-          # (see above); spctl's verdict on an unsigned container is recorded
-          # here so the first real certificate-mode run leaves evidence in the
-          # log instead of leaving the question open. Do not turn this into a
-          # gate without checking what it prints first.
-          echo "=== spctl on the container itself (informational) ==="
-          spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 || true
+          # The container's own verdict is a gate, not a note. The .dmg is the
+          # file users download, the previous step signed and notarised and
+          # stapled it, and `|| true` here would discard the only evidence that
+          # any of that worked. Detach first: spctl assesses the file, and an
+          # attached image is not what we want it looking at.
+          hdiutil detach "$MOUNT" -force
+          trap - EXIT
+
+          echo "=== spctl -a -vvv -t open --context context:primary-signature $DMG ==="
+          if ! OUT=$(spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::Gatekeeper rejected $DMG itself. The disk image is the artifact users download; a rejected container shows the 'cannot verify the developer' dialog no matter how well the app inside it is signed."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+          if ! grep -q '^source=Notarized Developer ID$' <<<"$OUT"; then
+            echo "::error::$DMG was accepted but not as 'source=Notarized Developer ID', so its own notarisation ticket is missing or not stapled."
+            exit 1
+          fi
 
       # Signing the .app is not enough on its own: the signature has to survive
       # into the artifact users actually download. Listing the zip for the outer
@@ -633,10 +823,20 @@ jobs:
           # _CodeSignature/CodeResources whether or not InvoiceApp.app itself was
           # sealed, so a substring count passes on exactly the top-level-unsigned
           # artifact this check exists to reject.
+          #
+          # Fed from a here-string, NOT `printf ... | grep -q`. Under
+          # `set -o pipefail` that pipeline fails a VALID artifact: grep -q exits
+          # the instant it matches, printf dies of SIGPIPE writing the rest of a
+          # 672-entry listing, and pipefail reports the pipeline as 141. The
+          # outer seal sorts early in the listing, so it hit every build in both
+          # signing modes. A here-string is not a pipeline, so there is no writer
+          # to kill and no pipeline status to inherit — and grep may still stop
+          # at the first match. Every `grep -q` in this workflow is fed the same
+          # way for the same reason.
           OUTER='InvoiceApp.app/Contents/_CodeSignature/CodeResources'
-          if ! printf '%s\n' "$LISTING" | grep -qE '^(\./)?InvoiceApp\.app/Contents/_CodeSignature/CodeResources$'; then
+          if ! grep -qE '^(\./)?InvoiceApp\.app/Contents/_CodeSignature/CodeResources$' <<<"$LISTING"; then
             echo "::error::$ZIP contains no $OUTER entry. The outer bundle seal did not survive packaging, so the download would be treated as unsigned and reported as damaged — nested helper signatures do not substitute for it."
-            printf '%s\n' "$LISTING" | head -50
+            head -50 <<<"$LISTING"
             exit 1
           fi
           echo "$ZIP contains the outer bundle seal $OUTER"
@@ -651,6 +851,35 @@ jobs:
             release/InvoiceApp-mac-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 30
+
+      # Runs even when an earlier step failed, so a failed signing or
+      # notarisation attempt cannot leave the certificate sitting in a keychain
+      # on the search list. `security delete-keychain` is not relied on to
+      # restore the search list — it is put back explicitly, from the copy the
+      # signing step saved before it touched anything.
+      - name: Remove the .dmg signing keychain
+        if: always() && env.HAS_SIGNING_CERT == 'true'
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/invoiceapp-dmg-signing.keychain-db"
+          SEARCH_LIST_FILE="$RUNNER_TEMP/keychain-search-list.txt"
+          rm -f "$RUNNER_TEMP/dmg-signing.p12"
+          if [ -f "$SEARCH_LIST_FILE" ]; then
+            SEARCH_LIST=()
+            while IFS= read -r KC; do
+              if [ -n "$KC" ] && [ "$KC" != "$KEYCHAIN" ]; then
+                SEARCH_LIST+=("$KC")
+              fi
+            done < "$SEARCH_LIST_FILE"
+            if [ "${#SEARCH_LIST[@]}" -gt 0 ]; then
+              security list-keychains -d user -s "${SEARCH_LIST[@]}"
+            fi
+            rm -f "$SEARCH_LIST_FILE"
+          fi
+          if [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN"
+          fi
+          security list-keychains -d user
 
   # Publishing happens exactly once, after every matrix leg has finished. Running
   # the release step per matrix leg would race two jobs to create one release.

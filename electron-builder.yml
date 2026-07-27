@@ -71,16 +71,22 @@ mac:
   # break the ad-hoc path that forks depend on. .github/workflows/build-mac.yml
   # passes `-c.forceCodeSigning=true` for the certificate build alone.
 
-# The disk image is deliberately neither signed nor notarised. `dmg.sign`
-# defaults to false and dmg-builder only signs when it is true (dmg.js:62-64);
-# nothing in dmg-builder notarises anything. It does not need to: macPackager
-# finishes signing, notarising and stapling the .app before the dmg target is
-# ever built, so the bundle inside the image already carries its own ticket, and
-# that bundle is what Gatekeeper assesses when the user drags it out and runs
-# it. electron-builder's own schema says as much — "Signing is not required and
-# will lead to unwanted errors in combination with notarization requirements."
-# The workflow mounts the built .dmg and re-validates the app inside it rather
-# than trusting this comment.
+# `dmg.sign` is deliberately left at its default of false, and that does NOT
+# mean the shipped disk image is unsigned. Apple's "Packaging Mac software for
+# distribution" requires the container you distribute to be signed with a
+# Developer ID Application identity and to be the thing you notarise and staple,
+# so .github/workflows/build-mac.yml does all three to the .dmg after
+# electron-builder is finished with it. It has to be done there rather than
+# here for two reasons: dmg-builder signs with `codesign --sign <hash>` and no
+# `--timestamp` (dmg.js:62-64), and a signature with no secure timestamp is a
+# documented notarisation rejection — which is exactly what electron-builder's
+# own schema is warning about, "Signing is not required and will lead to
+# unwanted errors in combination with notarization requirements" — and
+# dmg-builder contains no notarisation call at all.
+#
+# The .app inside the image is separately signed, notarised and stapled by
+# macPackager before the dmg target is ever built. The workflow mounts the built
+# .dmg and re-validates that copy too, rather than trusting this comment.
 dmg:
   contents:
     - x: 130
