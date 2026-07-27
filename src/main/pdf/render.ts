@@ -7,38 +7,41 @@
  */
 
 import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
-import { BrowserWindow, dialog } from 'electron';
+import { app, BrowserWindow, dialog } from 'electron';
 
-export class PdfExportCancelledError extends Error {
-  readonly code = 'PDF_EXPORT_CANCELLED';
-  constructor() {
-    super('PDF export cancelled by the user.');
-    this.name = 'PdfExportCancelledError';
-  }
-}
+import { assertAllowedPdfPath, sanitizeSuggestedFileName } from './export-path';
 
 export interface RenderPdfOptions {
-  /** When omitted, a save dialog picks the path (and may cancel the export). */
+  /**
+   * Renderer-supplied *suggestion* only. Never written to directly: at most
+   * its base name seeds the save dialog's `defaultPath`. The dialog's answer
+   * is the sole write target, and it is still validated by
+   * `assertAllowedPdfPath` before anything touches disk.
+   */
   readonly targetPath?: string;
   /** Suggested file name for the save dialog. */
   readonly defaultFileName: string;
 }
 
+/** `path: ''` / `bytes: 0` means the user cancelled the save dialog. */
 export interface RenderPdfResult {
   readonly path: string;
   readonly bytes: number;
 }
 
-async function resolveTargetPath(options: RenderPdfOptions): Promise<string> {
-  if (options.targetPath) return options.targetPath;
+async function resolveTargetPath(options: RenderPdfOptions): Promise<string | null> {
+  const suggested = sanitizeSuggestedFileName(
+    options.targetPath ? path.basename(options.targetPath) : options.defaultFileName,
+  );
   const result = await dialog.showSaveDialog({
     title: 'Export invoice as PDF',
-    defaultPath: options.defaultFileName,
+    defaultPath: path.join(app.getPath('documents'), suggested),
     filters: [{ name: 'PDF', extensions: ['pdf'] }],
   });
-  if (result.canceled || !result.filePath) throw new PdfExportCancelledError();
-  return result.filePath;
+  if (result.canceled || !result.filePath) return null;
+  return assertAllowedPdfPath(result.filePath);
 }
 
 export async function renderHtmlToPdf(
@@ -46,6 +49,7 @@ export async function renderHtmlToPdf(
   options: RenderPdfOptions,
 ): Promise<RenderPdfResult> {
   const targetPath = await resolveTargetPath(options);
+  if (targetPath === null) return { path: '', bytes: 0 };
 
   const window = new BrowserWindow({
     show: false,
