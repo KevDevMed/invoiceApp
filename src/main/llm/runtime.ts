@@ -39,6 +39,16 @@ export interface LoadedModel {
   readonly contextSize: number;
 }
 
+/**
+ * Whether the model is allowed to spend tokens on chain-of-thought.
+ *
+ * `off` is the default because every model in this app's catalog is a Qwen3
+ * variant, and Qwen3 reasons by default: `node-llama-cpp` keeps thought
+ * segments out of `onTextChunk` and out of `responseText`, so a reasoning turn
+ * that runs out of budget hands back an empty answer.
+ */
+export type ThinkingMode = 'auto' | 'off';
+
 export interface GenerateOptions {
   readonly requestId: string;
   readonly messages: readonly ChatTurn[];
@@ -46,12 +56,23 @@ export interface GenerateOptions {
   readonly maxTokens?: number;
   readonly signal?: AbortSignal;
   readonly onToken?: (token: string) => void;
+  readonly thinking?: ThinkingMode;
 }
+
+/**
+ * `reasoning_only` is not an error: the model ran to completion but every token
+ * it produced was a thought segment, so there is no answer to show. It is a
+ * distinct stop reason so the caller can say that in the UI instead of
+ * persisting an empty assistant message.
+ */
+export type GenerateStopReason = 'stop' | 'length' | 'cancelled' | 'error' | 'reasoning_only';
 
 export interface GenerateResult {
   readonly requestId: string;
   readonly text: string;
-  readonly stopReason: 'stop' | 'length' | 'cancelled' | 'error';
+  readonly stopReason: GenerateStopReason;
+  /** Chain-of-thought text, when the model emitted thought segments. */
+  readonly thoughts?: string;
 }
 
 export type RuntimeErrorCode =
@@ -152,20 +173,55 @@ interface LlamaContextLike {
   dispose(): Promise<void>;
 }
 
-type LlamaSequenceLike = object;
+/**
+ * A context is created with a finite number of sequences (one, by default), and
+ * `getSequence()` hands out one of them. `dispose()` gives the slot back;
+ * `clearHistory()` resets the sequence state so the same slot can serve the
+ * next chat. Both are real `LlamaContextSequence` members —
+ * `node_modules/node-llama-cpp/dist/evaluator/LlamaContext/LlamaContext.d.ts`
+ * declares `dispose(): void`, `get disposed(): boolean` and
+ * `clearHistory(): Promise<void>`.
+ */
+interface LlamaSequenceLike {
+  dispose(): void;
+  clearHistory(): Promise<void>;
+  readonly disposed?: boolean;
+}
+
+interface ChatWrapperLike {
+  readonly wrapperName?: string;
+  readonly variation?: string;
+}
+
+interface PromptSegment {
+  readonly type?: string;
+  readonly segmentType?: string;
+  readonly text?: string;
+}
+
+/** The shape `promptWithMeta` returns, narrowed to the parts used here. */
+interface PromptWithMetaResult {
+  readonly response?: readonly (string | PromptSegment | Record<string, unknown>)[];
+  readonly responseText?: string;
+  readonly stopReason?: string;
+}
+
+interface PromptCallOptions {
+  temperature?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
+  stopOnAbortSignal?: boolean;
+  onTextChunk?: (chunk: string) => void;
+  budgets?: { thoughtTokens?: number };
+}
 
 interface LlamaChatSessionLike {
+  readonly chatWrapper?: ChatWrapperLike;
   setChatHistory(history: unknown[]): void;
-  prompt(
-    text: string,
-    options: {
-      temperature?: number;
-      maxTokens?: number;
-      signal?: AbortSignal;
-      stopOnAbortSignal?: boolean;
-      onTextChunk?: (chunk: string) => void;
-    },
-  ): Promise<string>;
+  prompt(text: string, options: PromptCallOptions): Promise<string>;
+  /** Present since node-llama-cpp 3.x; the runtime falls back to `prompt`. */
+  promptWithMeta?(text: string, options: PromptCallOptions): Promise<PromptWithMetaResult>;
+  dispose?(options?: { disposeSequence?: boolean }): void;
 }
 
 interface LlamaLike {
@@ -177,7 +233,15 @@ interface NodeLlamaCppModule {
   LlamaChatSession: new (options: {
     contextSequence: LlamaSequenceLike;
     systemPrompt?: string;
+    chatWrapper?: ChatWrapperLike;
+    autoDisposeSequence?: boolean;
   }) => LlamaChatSessionLike;
+  /** Only used to turn Qwen3's default reasoning off. Optional on purpose. */
+  QwenChatWrapper?: new (options?: {
+    thoughts?: 'auto' | 'discourage';
+    variation?: string;
+    keepOnlyLastThought?: boolean;
+  }) => ChatWrapperLike;
 }
 
 /** Overridable so tests can inject a module double without touching the addon. */
@@ -200,6 +264,16 @@ interface Resident {
   readonly info: LoadedModel;
   readonly model: LlamaModelLike;
   readonly context: LlamaContextLike;
+  /**
+   * The one sequence every chat on this model borrows.
+   *
+   * Owned by the runtime, not by the chat: a `LlamaChatSession` is created with
+   * `autoDisposeSequence: false` and disposed at the end of its turn, while the
+   * sequence itself is reset (`clearHistory`) and handed to the next chat. It is
+   * disposed with the context in `disposeResident`, and dropped early if a chat
+   * leaves it in an unknown state.
+   */
+  sequence: LlamaSequenceLike | null;
 }
 
 export class NodeLlamaCppRuntime implements LlmRuntime {
@@ -208,6 +282,8 @@ export class NodeLlamaCppRuntime implements LlmRuntime {
   private resident: Resident | null = null;
   /** Serialises load/unload so two `llm:load` calls cannot race the same file. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** Serialises chats, because they share the resident model's one sequence. */
+  private chats: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly loader: NodeLlamaCppLoader = defaultLoader) {}
 
@@ -236,7 +312,7 @@ export class NodeLlamaCppRuntime implements LlmRuntime {
           modelPath: options.modelPath,
           contextSize: context.contextSize ?? contextSize,
         };
-        this.resident = { info, model, context };
+        this.resident = { info, model, context, sequence: null };
         return info;
       } catch (error) {
         throw new LlmRuntimeError(
@@ -263,37 +339,168 @@ export class NodeLlamaCppRuntime implements LlmRuntime {
       throw new LlmRuntimeError('No model is loaded.', 'MODEL_NOT_LOADED');
     }
 
+    // Chats queue rather than race: they share one sequence, and asking a
+    // one-sequence context for a second one is what "No sequences left" means.
+    const run = this.chats.then(
+      () => this.runChat(module, resident, options),
+      () => this.runChat(module, resident, options),
+    );
+    this.chats = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** One chat turn, from borrowing the sequence to giving it back. */
+  private async runChat(
+    module: NodeLlamaCppModule,
+    resident: Resident,
+    options: GenerateOptions,
+  ): Promise<GenerateResult> {
+    // The model may have been unloaded while this chat sat in the queue.
+    if (this.resident !== resident) {
+      throw new LlmRuntimeError('No model is loaded.', 'MODEL_NOT_LOADED');
+    }
+
+    const sequence = this.acquireSequence(resident);
     const shaped = shapePrompt(options.messages);
-    let text = '';
+    const thinking = options.thinking ?? DEFAULT_THINKING;
+    let session: LlamaChatSessionLike | null = null;
+    let streamed = '';
+    let healthy = false;
 
     try {
-      const session = new module.LlamaChatSession({
-        contextSequence: resident.context.getSequence(),
-        systemPrompt: shaped.systemPrompt || undefined,
-      });
+      session = this.createSession(module, sequence, shaped.systemPrompt, thinking);
 
       if (shaped.history.length > 0) {
         session.setChatHistory(toChatHistory(shaped.systemPrompt, shaped.history));
       }
 
-      text = await session.prompt(shaped.prompt, {
+      const promptOptions: PromptCallOptions = {
         temperature: options.temperature ?? DEFAULT_TEMPERATURE,
         maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
         signal: options.signal,
         stopOnAbortSignal: true,
-        onTextChunk: (chunk) => options.onToken?.(chunk),
-      });
+        onTextChunk: (chunk) => {
+          streamed += chunk;
+          options.onToken?.(chunk);
+        },
+        // Cap what a reasoning model may spend on thoughts, so it cannot burn
+        // the whole token budget before it starts answering.
+        budgets: { thoughtTokens: thinking === 'off' ? 0 : undefined },
+      };
+
+      // `promptWithMeta` is the non-streaming return value: it carries the
+      // final `responseText` and the full segmented `response`, which is the
+      // only place thought segments appear. `onTextChunk` sees main-response
+      // text only, so a thinking model streams nothing at all.
+      const meta =
+        typeof session.promptWithMeta === 'function'
+          ? await session.promptWithMeta(shaped.prompt, promptOptions)
+          : { responseText: await session.prompt(shaped.prompt, promptOptions) };
+
+      healthy = true;
+      const responseText = meta.responseText ?? '';
+      const text = responseText.length > 0 ? responseText : streamed;
+      const thoughts = collectThoughts(meta.response);
+
+      if (options.signal?.aborted) {
+        return { requestId: options.requestId, text, stopReason: 'cancelled', thoughts };
+      }
+      if (text.trim().length === 0 && thoughts.trim().length > 0) {
+        return { requestId: options.requestId, text: '', stopReason: 'reasoning_only', thoughts };
+      }
+      return { requestId: options.requestId, text, stopReason: mapStopReason(meta.stopReason), thoughts };
     } catch (error) {
       if (options.signal?.aborted) {
-        return { requestId: options.requestId, text, stopReason: 'cancelled' };
+        return { requestId: options.requestId, text: streamed, stopReason: 'cancelled' };
       }
       throw new LlmRuntimeError(`Generation failed: ${errorMessage(error)}`, 'GENERATION_FAILED', error);
+    } finally {
+      // `disposeSequence: false` — the session is per-turn, the sequence is not.
+      try {
+        session?.dispose?.({ disposeSequence: false });
+      } catch {
+        healthy = false;
+      }
+      await this.releaseSequence(resident, sequence, healthy);
     }
+  }
 
-    if (options.signal?.aborted) {
-      return { requestId: options.requestId, text, stopReason: 'cancelled' };
+  /** Borrow the resident sequence, creating it the first time it is needed. */
+  private acquireSequence(resident: Resident): LlamaSequenceLike {
+    const existing = resident.sequence;
+    if (existing && existing.disposed !== true) return existing;
+    const sequence = resident.context.getSequence();
+    resident.sequence = sequence;
+    return sequence;
+  }
+
+  /**
+   * Give the sequence back for the next chat.
+   *
+   * A clean turn resets the sequence state and keeps the slot. Anything else —
+   * a throw, an abort mid-generation, a `clearHistory` that fails — disposes it,
+   * so the slot is returned to the context and the next chat starts from a fresh
+   * one rather than inheriting an unknown state.
+   */
+  private async releaseSequence(
+    resident: Resident,
+    sequence: LlamaSequenceLike,
+    healthy: boolean,
+  ): Promise<void> {
+    if (healthy) {
+      try {
+        await sequence.clearHistory();
+        return;
+      } catch {
+        // Fall through to disposal.
+      }
     }
-    return { requestId: options.requestId, text, stopReason: 'stop' };
+    disposeSequence(sequence);
+    if (resident.sequence === sequence) resident.sequence = null;
+  }
+
+  /**
+   * Build the chat session for one turn.
+   *
+   * With thinking off and a Qwen model, the session is rebuilt around a
+   * `QwenChatWrapper({thoughts: 'discourage'})` — Qwen3's own no-think switch,
+   * which primes the response with an empty `<think></think>` block so the model
+   * answers directly. The first session is only used to see which wrapper
+   * `node-llama-cpp` resolved; constructing one evaluates nothing.
+   */
+  private createSession(
+    module: NodeLlamaCppModule,
+    sequence: LlamaSequenceLike,
+    systemPrompt: string,
+    thinking: ThinkingMode,
+  ): LlamaChatSessionLike {
+    const base = {
+      contextSequence: sequence,
+      systemPrompt: systemPrompt || undefined,
+      autoDisposeSequence: false,
+    };
+    const session = new module.LlamaChatSession(base);
+    if (thinking !== 'off') return session;
+
+    const wrapper = session.chatWrapper;
+    if (wrapper?.wrapperName !== 'Qwen' || typeof module.QwenChatWrapper !== 'function') return session;
+
+    try {
+      session.dispose?.({ disposeSequence: false });
+      return new module.LlamaChatSession({
+        ...base,
+        chatWrapper: new module.QwenChatWrapper({
+          thoughts: 'discourage',
+          variation: wrapper.variation,
+        }),
+      });
+    } catch {
+      // A wrapper this build will not construct is not worth failing a chat for.
+      return new module.LlamaChatSession(base);
+    }
   }
 
   async dispose(): Promise<void> {
@@ -337,6 +544,10 @@ export class NodeLlamaCppRuntime implements LlmRuntime {
     const resident = this.resident;
     this.resident = null;
     if (!resident) return;
+    if (resident.sequence) {
+      disposeSequence(resident.sequence);
+      resident.sequence = null;
+    }
     await resident.context.dispose().catch(() => undefined);
     await resident.model.dispose().catch(() => undefined);
   }
@@ -349,6 +560,47 @@ export class NodeLlamaCppRuntime implements LlmRuntime {
       () => undefined,
     );
     return next;
+  }
+}
+
+/**
+ * Thinking is off unless a caller asks for it.
+ *
+ * Every entry in this app's catalog is a Qwen3 variant, and a thinking Qwen3
+ * spends its whole budget reasoning and returns nothing to show the user.
+ */
+export const DEFAULT_THINKING: ThinkingMode = 'off';
+
+function disposeSequence(sequence: LlamaSequenceLike): void {
+  try {
+    if (sequence.disposed !== true) sequence.dispose();
+  } catch {
+    // A sequence that will not dispose is already gone as far as we care.
+  }
+}
+
+/** Join the thought segments out of a `promptWithMeta` response array. */
+function collectThoughts(response: PromptWithMetaResult['response']): string {
+  if (!Array.isArray(response)) return '';
+  const parts: string[] = [];
+  for (const item of response) {
+    if (typeof item !== 'object' || item === null) continue;
+    const segment = item as PromptSegment;
+    if (segment.type === 'segment' && segment.segmentType === 'thought' && segment.text) {
+      parts.push(segment.text);
+    }
+  }
+  return parts.join('');
+}
+
+function mapStopReason(stopReason: string | undefined): GenerateStopReason {
+  switch (stopReason) {
+    case 'maxTokens':
+      return 'length';
+    case 'abort':
+      return 'cancelled';
+    default:
+      return 'stop';
   }
 }
 
@@ -380,6 +632,8 @@ export interface FakeRuntimeOptions {
   readonly tokenDelayMs?: number;
   /** Make `load` reject, to exercise the error path in the UI. */
   readonly failLoad?: boolean;
+  /** Answer with thoughts and no text, the way a reasoning model can. */
+  readonly thoughtsOnly?: string;
 }
 
 /**
@@ -418,6 +672,15 @@ export class FakeLlmRuntime implements LlmRuntime {
   async generate(options: GenerateOptions): Promise<GenerateResult> {
     if (!this.resident) {
       throw new LlmRuntimeError('No model is loaded.', 'MODEL_NOT_LOADED');
+    }
+
+    if (this.options.thoughtsOnly) {
+      return {
+        requestId: options.requestId,
+        text: '',
+        stopReason: 'reasoning_only',
+        thoughts: this.options.thoughtsOnly,
+      };
     }
 
     const shaped = shapePrompt(options.messages);
