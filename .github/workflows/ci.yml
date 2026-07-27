@@ -1,0 +1,64 @@
+# Typecheck, lint and test every pull request.
+#
+# `build-mac.yml` runs on tags and manual dispatch only, so before this workflow
+# existed nothing checked a PR — #5 merged green with zero checks because there
+# were none to run.
+#
+# Ubuntu, not macOS: these checks need no Apple toolchain, and macOS runner
+# minutes bill at 10x on a private repository. The mac runner stays reserved for
+# the one thing only it can do, which is produce a signed .dmg.
+#
+# `npm ci` runs the postinstall, which rebuilds better-sqlite3 against Electron's
+# ABI and lets node-llama-cpp fetch a llama.cpp backend. The database tests need
+# the first; the second is unavoidable on a plain `npm ci` and is why install is
+# given a generous slice of the timeout. No test loads real model weights —
+# `live.smoke.test.ts` skips itself without an explicit opt-in.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A force-push or a quick second commit should cancel the run it superseded
+# rather than queue behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the mac build. package.json asks for >=20.19.0.
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          npm_config_foreground_scripts: 'true'
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test:run
+
+      # Catches what typecheck cannot: a bad import path, a missing subpath
+      # export, a renderer bundle that will not build.
+      - name: Build
+        run: npx electron-vite build
