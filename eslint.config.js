@@ -49,6 +49,18 @@ export default tseslint.config(
     },
   },
   {
+    // electron-builder hooks: CommonJS, run by electron-builder under node.
+    files: ['build/**/*.cjs', 'src/build/**/*.ts'],
+    languageOptions: {
+      globals: { ...globals.node },
+    },
+    rules: {
+      // CommonJS is not a choice here: electron-builder `require()`s the hook
+      // from the YAML config at runtime, so it cannot use ESM imports.
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+  {
     files: ['src/shared/**/*.ts'],
     languageOptions: {
       globals: { ...globals.node, ...globals.browser },

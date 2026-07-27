@@ -255,7 +255,15 @@ describe('other routes', () => {
     const response = await fetch(`${origin}/download`);
     expect(response.status).toBe(200);
     const html = await response.text();
+    // The primary Gatekeeper route: System Settings > Privacy & Security > Open
+    // Anyway. The build is signed but not notarised, so this is the path that
+    // actually works — the old right-click advice must not come back as step one.
+    expect(html).toContain('Privacy &amp; Security');
+    expect(html).toContain('Open Anyway');
+    // The Terminal fallback stays, as a fallback.
     expect(html).toContain('xattr -dr com.apple.quarantine /Applications/InvoiceApp.app');
+    // Recovery path for the unsigned v0.1.0 build, which those steps cannot fix.
+    expect(html).toContain('v0.1.0');
     expect(html).toContain('https://github.com/KevDevMed/invoiceApp/releases/latest');
   });
 
@@ -326,9 +334,9 @@ describe('the page routes: landing at /, renderer at /app', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
-    expect(await response.text()).toContain(
-      'xattr -dr com.apple.quarantine /Applications/InvoiceApp.app',
-    );
+    const html = await response.text();
+    expect(html).toContain('Open Anyway');
+    expect(html).toContain('xattr -dr com.apple.quarantine /Applications/InvoiceApp.app');
   });
 
   it('serves the landing page image, and does not mark it immutable', async () => {

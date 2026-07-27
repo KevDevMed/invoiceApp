@@ -19,6 +19,12 @@ asarUnpack:
 
 npmRebuild: true
 
+# Ad-hoc signs the packed .app when no Developer ID certificate is available, so
+# the shipped binary is executable at all on Apple Silicon. Runs before both the
+# dmg/zip targets and electron-builder's own signing, and no-ops entirely when a
+# real certificate is present. See the header of the hook for the full rationale.
+afterPack: build/after-pack.cjs
+
 mac:
   category: public.app-category.finance
   # Version-less on purpose. The landing and download pages link straight at
@@ -36,11 +42,51 @@ mac:
       arch:
         - arm64
         - x64
+  # Applies to the real-certificate path only. electron-builder passes
+  # `--options runtime` to codesign as part of ITS signing pass, and that pass
+  # only happens when an identity is found (macPackager.sign -> isSignAllowed /
+  # findIdentity). With no certificate there is no electron-builder signing pass,
+  # so this key is inert on that path and the afterPack hook's ad-hoc `codesign`
+  # deliberately omits `--options=runtime`. Hardened runtime does enable real
+  # runtime protections on its own — it is not inert in general — but on the
+  # ad-hoc path the trade is all cost: an ad-hoc signature is not a trusted
+  # identity, so the flag earns no Gatekeeper benefit, while its library
+  # validation and JIT/executable-memory restrictions can block better-sqlite3's
+  # .node addon and node-llama-cpp's dlopen'd backend from loading, and no
+  # entitlements are applied there to grant them back. Keeping it here means the
+  # day MAC_CERT_P12 is added, the signed+notarised build gets hardened runtime
+  # with no further change.
   hardenedRuntime: true
   gatekeeperAssess: false
   # Signing and notarisation credentials come from the environment on a macOS
-  # build host. `package:mac` cannot be signed on Linux and is not run here.
+  # build host: CSC_LINK + CSC_KEY_PASSWORD select the certificate
+  # (platformPackager.js getCscLink/doGetCscPassword), and APPLE_ID +
+  # APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID switch on notarisation
+  # (macPackager.getNotarizeOptions). None of them belong in this file.
+  # `package:mac` cannot be signed on Linux and is not run there.
+  #
+  # `forceCodeSigning` is deliberately NOT set here. It has to apply to the
+  # certificate build and only the certificate build: with it on and no
+  # identity available, macPackager.sign throws instead of warning, which would
+  # break the ad-hoc path that forks depend on. .github/workflows/build-mac.yml
+  # passes `-c.forceCodeSigning=true` for the certificate build alone.
 
+# `dmg.sign` is deliberately left at its default of false, and that does NOT
+# mean the shipped disk image is unsigned. Apple's "Packaging Mac software for
+# distribution" requires the container you distribute to be signed with a
+# Developer ID Application identity and to be the thing you notarise and staple,
+# so .github/workflows/build-mac.yml does all three to the .dmg after
+# electron-builder is finished with it. It has to be done there rather than
+# here for two reasons: dmg-builder signs with `codesign --sign <hash>` and no
+# `--timestamp` (dmg.js:62-64), and a signature with no secure timestamp is a
+# documented notarisation rejection — which is exactly what electron-builder's
+# own schema is warning about, "Signing is not required and will lead to
+# unwanted errors in combination with notarization requirements" — and
+# dmg-builder contains no notarisation call at all.
+#
+# The .app inside the image is separately signed, notarised and stapled by
+# macPackager before the dmg target is ever built. The workflow mounts the built
+# .dmg and re-validates that copy too, rather than trusting this comment.
 dmg:
   contents:
     - x: 130
