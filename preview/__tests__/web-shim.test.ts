@@ -11,6 +11,55 @@ import { describe, expect, it, vi } from 'vitest';
 import { EVENT_CHANNELS } from '../../src/shared/ipc-contract';
 import { listenerCount, previewApi } from '../web-shim';
 
+describe('module import side effects', () => {
+  it('installs window.api only — no #preview-banner and no injected style element', async () => {
+    // The shim's import-time block runs when `window` exists. Stub a minimal
+    // window/document, re-import a fresh module instance, and record every
+    // element the shim would have created or mounted.
+    const created: Array<{ tagName: string; id: string }> = [];
+    const headChildren: unknown[] = [];
+    const bodyChildren: unknown[] = [];
+
+    const fakeDocument = {
+      getElementById: () => null,
+      createElement: (tagName: string) => {
+        const element = {
+          tagName,
+          id: '',
+          textContent: '',
+          setAttribute: () => {},
+          appendChild: () => {},
+        };
+        created.push(element);
+        return element;
+      },
+      head: { appendChild: (node: unknown) => headChildren.push(node) },
+      body: { appendChild: (node: unknown) => bodyChildren.push(node) },
+      addEventListener: () => {},
+    };
+    const fakeWindow = {};
+
+    vi.stubGlobal('document', fakeDocument);
+    vi.stubGlobal('window', fakeWindow);
+    vi.resetModules();
+    try {
+      await import('../web-shim');
+    } finally {
+      vi.unstubAllGlobals();
+      vi.resetModules();
+    }
+
+    // The API must still be installed by the import-time block...
+    expect((fakeWindow as { api?: unknown }).api).toBeDefined();
+
+    // ...but nothing may be injected into the document: no banner, no style.
+    expect(created.filter((element) => element.id === 'preview-banner')).toEqual([]);
+    expect(created).toEqual([]);
+    expect(headChildren).toEqual([]);
+    expect(bodyChildren).toEqual([]);
+  });
+});
+
 describe('window.api.on', () => {
   it('returns a callable unsubscribe for every event channel', () => {
     for (const channel of EVENT_CHANNELS) {

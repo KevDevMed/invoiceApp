@@ -147,83 +147,8 @@ export function installApi(target: Window = window): void {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Preview banner
-// ---------------------------------------------------------------------------
-
-const BANNER_ID = 'preview-banner';
-const BANNER_TEXT = 'Preview build — PDF export and local models need the desktop app.';
-const BANNER_HEIGHT = '2.25rem';
-
-const BANNER_CSS = `
-:root { --preview-banner-height: ${BANNER_HEIGHT}; }
-
-/*
- * The app sizes itself to the whole viewport. Shorten it by the banner rather
- * than letting the banner sit on top of the last row of the invoice table.
- */
-#root.app-root, #root { height: calc(100dvh - var(--preview-banner-height)) !important; }
-
-#${BANNER_ID} {
-  position: fixed;
-  inset: auto 0 0 0;
-  z-index: 2147483647;
-  height: var(--preview-banner-height);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.75rem;
-  padding: 0 1rem;
-  box-sizing: border-box;
-  font-family: Figtree, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  font-size: 0.8125rem;
-  line-height: 1;
-  color: #1b1b1b;
-  background: #f3d17a;
-  border-top: 1px solid #c0990e;
-}
-
-#${BANNER_ID} a { color: #1b1b1b; font-weight: 600; }
-`;
-
-/**
- * Make it unmistakable that this is a preview, and say which parts are missing.
- *
- * Injected from here rather than added to a renderer component on purpose: the
- * preview is not allowed to change `src/**`, and a banner the real app would
- * have to carry around is exactly the kind of fork that turns a preview into a
- * second product.
- */
-export function installBanner(doc: Document = document): void {
-  if (doc.getElementById(BANNER_ID)) return;
-
-  const style = doc.createElement('style');
-  style.textContent = BANNER_CSS;
-  doc.head.appendChild(style);
-
-  const banner = doc.createElement('div');
-  banner.id = BANNER_ID;
-  banner.setAttribute('role', 'status');
-
-  const text = doc.createElement('span');
-  text.textContent = BANNER_TEXT;
-  banner.appendChild(text);
-
-  const link = doc.createElement('a');
-  link.href = '/download';
-  link.textContent = 'Get the macOS app';
-  banner.appendChild(link);
-
-  const mount = (): void => {
-    if (doc.body && !doc.getElementById(BANNER_ID)) doc.body.appendChild(banner);
-  };
-  if (doc.body) mount();
-  else doc.addEventListener('DOMContentLoaded', mount, { once: true });
-}
-
 // Runs on import, before the renderer's entry module — see preview/index.html.
 // Guarded so the module can also be imported by the node-environment tests.
 if (typeof window !== 'undefined') {
   installApi();
-  installBanner();
 }
