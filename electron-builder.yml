@@ -1,0 +1,45 @@
+appId: com.invoiceapp.desktop
+productName: InvoiceApp
+copyright: Copyright © 2026 InvoiceApp
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+  - '!**/*.map'
+
+# better-sqlite3 is a native addon: keep it unpacked so the .node binary is a
+# real file on disk rather than an asar entry.
+asar: true
+asarUnpack:
+  - node_modules/better-sqlite3/**
+
+npmRebuild: true
+
+mac:
+  category: public.app-category.finance
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # Signing and notarisation credentials come from the environment on a macOS
+  # build host. `package:mac` cannot be signed on Linux and is not run here.
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

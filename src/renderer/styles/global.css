@@ -1,0 +1,32 @@
+/* Astryx design system. Order matters: reset, then base styles, then theme. */
+@import '@astryxdesign/core/reset.css';
+@import '@astryxdesign/core/astryx.css';
+@import '@astryxdesign/theme-neutral/theme.css';
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background-body);
+  color: var(--color-text-primary);
+}
+
+/*
+ * Astryx components carry their own layout; these two are the only app-level
+ * rules, both about filling the Electron window edge to edge.
+ */
+.app-root {
+  height: 100dvh;
+}
+
+.app-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-4, 16px);
+  padding: var(--spacing-4, 16px);
+  max-width: 900px;
+}
