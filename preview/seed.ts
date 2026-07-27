@@ -2,8 +2,17 @@
  * Demo data for the browser preview.
  *
  * An empty app shows nothing worth reviewing: no charts, no overdue badge, no
- * sense of what a real invoice list looks like. This fills a fresh preview
- * database with a plausible eight months of trading.
+ * sense of what a real invoice list looks like — and fourteen rows prove
+ * nothing about a list that paginates, filters inline and pages by ten. This
+ * fills a fresh preview database with a plausible year of trading: ten clients
+ * and sixty-six invoices spanning several pages, every status, four
+ * currencies and a wide amount range, so every filter field has both matching
+ * and non-matching rows.
+ *
+ * Nothing here is random. The generated invoices come from fixed cycles and a
+ * seeded LCG, so two runs against the same reference date produce byte-identical
+ * data — the screenshot harness cross-checks the rendered totals against a
+ * direct read of the SQLite file and would flag any drift.
  *
  * Every total is computed by `createInvoice` in `src/domain/invoices/repository.ts`,
  * which runs the same integer-cent arithmetic the desktop app runs. Nothing here
@@ -112,6 +121,76 @@ const CLIENTS: readonly ClientInput[] = [
     taxId: 'CA-889012334-RT0001',
     notes: null,
   },
+  {
+    name: 'Aurora Health Systems',
+    email: 'invoices@aurorahealth.org',
+    phone: '+1 312 555 4408',
+    addressLine1: '77 West Wacker Drive',
+    addressLine2: 'Floor 12',
+    city: 'Chicago',
+    region: 'IL',
+    postalCode: '60601',
+    country: 'United States',
+    taxId: 'US-36-4471209',
+    notes: 'Purchase order number must appear on every invoice.',
+  },
+  {
+    name: 'Blackwater Marine Ltd',
+    email: 'ap@blackwatermarine.co.uk',
+    phone: '+44 141 555 9012',
+    addressLine1: '3 Clyde Quay',
+    addressLine2: null,
+    city: 'Glasgow',
+    region: null,
+    postalCode: 'G3 8HN',
+    country: 'United Kingdom',
+    taxId: 'GB 771 4420 88',
+    notes: null,
+  },
+  {
+    name: 'Solstice Media Group',
+    email: 'finance@solsticemedia.com',
+    phone: '+1 212 555 6633',
+    addressLine1: '410 Lafayette Street',
+    addressLine2: 'Studio 5',
+    city: 'New York',
+    region: 'NY',
+    postalCode: '10003',
+    country: 'United States',
+    taxId: 'US-13-9902114',
+    notes: 'Pays on the 15th of the month following invoice date.',
+  },
+  {
+    name: 'Tamarind Foods NV',
+    email: 'crediteuren@tamarindfoods.be',
+    phone: '+32 3 555 2277',
+    addressLine1: 'Scheldestraat 24',
+    addressLine2: null,
+    city: 'Antwerpen',
+    region: null,
+    postalCode: '2000',
+    country: 'Belgium',
+    taxId: 'BE0899123456',
+    notes: 'Reverse-charge VAT — invoices are raised at 0%.',
+  },
+];
+
+/**
+ * Billing currency per client, positionally aligned with CLIENTS. The invoice
+ * list shows a currency-aware total per row, so the spread has to be real data
+ * rather than a display trick.
+ */
+const CLIENT_CURRENCY: readonly string[] = [
+  'USD', // Northwind Analytics
+  'EUR', // Kestrel Freight BV
+  'GBP', // Halloway & Finch LLP
+  'EUR', // Corvus Robotics GmbH
+  'EUR', // Marisol Ferreira Studio
+  'CAD', // Ridgeline Outfitters
+  'USD', // Aurora Health Systems
+  'GBP', // Blackwater Marine Ltd
+  'USD', // Solstice Media Group
+  'EUR', // Tamarind Foods NV
 ];
 
 // ---------------------------------------------------------------------------
@@ -315,6 +394,124 @@ const OVERDUE: readonly SeedInvoice[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Generated back-catalogue
+// ---------------------------------------------------------------------------
+
+/**
+ * The fourteen hand-written invoices above carry the awkward arithmetic worth
+ * looking at by hand. They are not enough to exercise a paginated, inline
+ * filtered list, so the rest of the year is generated — deterministically.
+ */
+const GENERATED_COUNT = 52;
+
+/**
+ * Status is assigned by walking this cycle, not by chance: 52 invoices over a
+ * 13-long cycle is exactly four laps, so the split is fixed and readable —
+ * 24 paid, 12 sent, 8 draft, 4 overdue, 4 void.
+ */
+const STATUS_CYCLE: readonly InvoiceStatus[] = [
+  'paid',
+  'paid',
+  'sent',
+  'paid',
+  'draft',
+  'paid',
+  'sent',
+  'overdue',
+  'paid',
+  'draft',
+  'sent',
+  'void',
+  'paid',
+];
+
+/** Client index per generated invoice. Length 11 against 52 — an uneven, and
+ *  therefore realistic, spread across the roster; every client still appears. */
+const CLIENT_CYCLE: readonly number[] = [0, 2, 6, 1, 8, 3, 0, 9, 5, 7, 4];
+
+const NET_DAYS_CYCLE: readonly number[] = [14, 30, 45, 21, 30, 60, 30, 7];
+
+interface CatalogueLine {
+  readonly description: string;
+  /** Milli-units. Multiplied by a per-invoice factor below. */
+  readonly quantityMilli: number;
+  readonly unitPriceCents: number;
+}
+
+/** Line items drawn from, in the order the generator asks for them. */
+const CATALOGUE: readonly CatalogueLine[] = [
+  { description: 'Platform engineering (hours)', quantityMilli: 12500, unitPriceCents: 18500 },
+  { description: 'Integration build, milestone', quantityMilli: 1000, unitPriceCents: 245000 },
+  { description: 'Support retainer (months)', quantityMilli: 1000, unitPriceCents: 320000 },
+  { description: 'Data migration (hours)', quantityMilli: 22750, unitPriceCents: 16500 },
+  { description: 'Consumable parts (units)', quantityMilli: 48000, unitPriceCents: 1999 },
+  { description: 'Design review (half days)', quantityMilli: 3500, unitPriceCents: 68000 },
+  { description: 'Incident response (hours)', quantityMilli: 5250, unitPriceCents: 32500 },
+  { description: 'Reporting pack build', quantityMilli: 1000, unitPriceCents: 89000 },
+  { description: 'Training session (attendees)', quantityMilli: 9000, unitPriceCents: 12500 },
+  { description: 'Licence recharge (seats)', quantityMilli: 25000, unitPriceCents: 4900 },
+  { description: 'Field survey (days)', quantityMilli: 2750, unitPriceCents: 110000 },
+  { description: 'Copywriting (per page)', quantityMilli: 14000, unitPriceCents: 8500 },
+];
+
+/**
+ * A 32-bit linear congruential generator (Numerical Recipes constants) with a
+ * hard-coded seed. Used only to pick between fixed catalogue entries and to
+ * scale quantities — so the output varies, but never between two runs.
+ */
+function lcg(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    return state / 0x1_0000_0000;
+  };
+}
+
+/** The seeded, fixed-shape back-catalogue. Pure: same input, same output. */
+export function generateInvoices(count: number = GENERATED_COUNT): SeedInvoice[] {
+  const random = lcg(0x5eed_1234);
+  const generated: SeedInvoice[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const status = STATUS_CYCLE[index % STATUS_CYCLE.length] ?? 'draft';
+    const client = CLIENT_CYCLE[index % CLIENT_CYCLE.length] ?? 0;
+    const netDays = NET_DAYS_CYCLE[index % NET_DAYS_CYCLE.length] ?? 30;
+
+    // Newest first in the loop, oldest last: ~7 days apart, spanning about a
+    // year, so the revenue chart has a bar for every month.
+    const issuedDaysAgo = 6 + index * 7;
+
+    // Two or three lines, drawn from the catalogue and scaled. The scale
+    // factors are wide on purpose: the smallest invoices land under $500 and
+    // the largest over $20,000, so an "amount not more than" token always has
+    // rows on both sides of it.
+    const lineCount = 2 + Math.floor(random() * 2);
+    const scale = 0.25 + Math.floor(random() * 12) * 0.55;
+    const items: SeedItem[] = [];
+    for (let line = 0; line < lineCount; line += 1) {
+      const entry = CATALOGUE[Math.floor(random() * CATALOGUE.length)] ?? CATALOGUE[0]!;
+      items.push({
+        description: entry.description,
+        quantityMilli: Math.max(250, Math.round((entry.quantityMilli * scale) / 250) * 250),
+        unitPriceCents: entry.unitPriceCents,
+      });
+    }
+
+    generated.push({
+      client,
+      status,
+      issuedDaysAgo,
+      netDays,
+      // Belgian and Dutch customers are invoiced under the reverse charge.
+      ...(client === 1 || client === 9 ? { taxRateBps: 0 } : {}),
+      items,
+    });
+  }
+
+  return generated;
+}
+
+// ---------------------------------------------------------------------------
 // Seeding
 // ---------------------------------------------------------------------------
 
@@ -379,14 +576,19 @@ export function seed(db: Db, reference: Date = new Date()): SeedResult {
   const clientIds = CLIENTS.map((input) => createClient(db, input).id);
 
   // Oldest first, so the allocated invoice numbers run in chronological order.
-  const all = [...INVOICES, ...OVERDUE].sort((a, b) => b.issuedDaysAgo - a.issuedDaysAgo);
+  // Ties break on the client index, so the order never depends on sort stability.
+  const all = [...INVOICES, ...OVERDUE, ...generateInvoices()].sort(
+    (a, b) => b.issuedDaysAgo - a.issuedDaysAgo || a.client - b.client,
+  );
 
   for (const spec of all) {
     const clientId = clientIds[spec.client];
     if (clientId === undefined) throw new Error(`seed: no client at index ${spec.client}`);
+    const currency = CLIENT_CURRENCY[spec.client] ?? 'USD';
 
     createInvoice(db, {
       clientId,
+      currency,
       status: spec.status,
       issueDate: isoDay(reference, spec.issuedDaysAgo),
       dueDate: isoDay(reference, spec.issuedDaysAgo - spec.netDays),
