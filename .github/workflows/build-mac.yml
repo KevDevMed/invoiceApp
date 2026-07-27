@@ -16,29 +16,55 @@
 # labels only — every `-large`/`-xlarge` runner is billable even on a public
 # repository.
 #
-# Ad-hoc signed by default — NOT signed with an Apple identity, and not
-# notarized. The build/after-pack.cjs hook runs `codesign --force --deep --sign -`
-# on the packed .app before the dmg and zip are built, so both artifacts carry a
-# signature. That is the minimum macOS needs to execute an arm64 Mach-O at all:
-# a bundle with no signature whatsoever is refused by the kernel and reported as
-# `"InvoiceApp" is damaged and can't be opened`, which no amount of quarantine
-# removal can fix. Releases up to v0.1.0 shipped exactly that.
+# There are exactly two signing modes, chosen entirely by whether the
+# MAC_CERT_P12 secret exists. The build job collapses that to the string
+# `HAS_SIGNING_CERT`, and every signing-related step conditions on it, so both
+# modes are readable from this file without running it.
 #
-# What an ad-hoc signature does NOT do is satisfy Gatekeeper. A download still
-# gets quarantined and still shows the "unidentified developer" / "cannot verify"
-# dialog on first launch, which the user gets past with right-click > Open, or:
-#   xattr -dr com.apple.quarantine /Applications/InvoiceApp.app
+# CERTIFICATE MODE — MAC_CERT_P12 is set.
+#   electron-builder imports the .p12 into a temporary keychain of its own
+#   making, signs the .app with the Developer ID Application identity under
+#   hardened runtime, then submits it to Apple's notarytool and staples the
+#   resulting ticket into the bundle. `forceCodeSigning` is turned on for this
+#   mode, so a certificate that fails to import aborts the build instead of
+#   quietly downgrading it to an unsigned one. The outcome is a dialog-free
+#   install: a stapled bundle passes Gatekeeper even with no network.
+#   Nothing is uploaded until `Authority=Developer ID Application` is on the
+#   signature, `xcrun stapler validate` succeeds and `spctl -a -t exec` reports
+#   `source=Notarized Developer ID` — checked on the packaged .app AND on the
+#   copy inside the mounted .dmg, which is what a user actually installs from.
 #
-# The "Verify the packaged app is signed" and "Verify the signature survives into
-# the zip" steps below fail the job if a build ever regresses to unsigned.
+# AD-HOC MODE — no MAC_CERT_P12. This is what forks get, and what every build
+#   before the secrets landed got. CSC_IDENTITY_AUTO_DISCOVERY=false stops
+#   electron-builder from signing at all, and build/after-pack.cjs runs
+#   `codesign --force --deep --sign -` on the packed .app instead, before the
+#   dmg and zip targets are built, so both artifacts carry that signature. It is
+#   the minimum macOS needs to execute an arm64 Mach-O at all: a bundle with no
+#   signature whatsoever is refused by the kernel and reported as
+#   `"InvoiceApp" is damaged and can't be opened`, which no amount of quarantine
+#   removal can fix. Releases up to v0.1.0 shipped exactly that.
+#   What an ad-hoc signature does NOT do is satisfy Gatekeeper. A download is
+#   still quarantined and still shows the "cannot verify the developer" dialog
+#   on first launch, which the user gets past through System Settings >
+#   Privacy & Security > Open Anyway, or:
+#     xattr -dr com.apple.quarantine /Applications/InvoiceApp.app
+#   Nothing is uploaded until codesign reports `Signature=adhoc` and the zip
+#   contains _CodeSignature entries.
 #
-# To sign and notarize properly instead, add these repository secrets and the build
-# picks them up automatically:
-#   MAC_CERT_P12         base64 of a Developer ID Application .p12
+# The modes are mutually exclusive by construction: build/after-pack.cjs no-ops
+# whenever MAC_HAS_SIGNING_CERT is true, and CSC_IDENTITY_AUTO_DISCOVERY is the
+# inverse of MAC_ADHOC_SIGN.
+#
+# What the five secrets buy:
+#   MAC_CERT_P12         base64 of a Developer ID Application .p12 — selects
+#                        certificate mode on its own
 #   MAC_CERT_PASSWORD    its password
-#   APPLE_ID             Apple account email
-#   APPLE_APP_PASSWORD   app-specific password
-#   APPLE_TEAM_ID        10-character team id
+#   APPLE_ID             Apple account email          \
+#   APPLE_APP_PASSWORD   app-specific password         > notarisation
+#   APPLE_TEAM_ID        10-character team id         /
+# MAC_CERT_P12 alone flips the mode, and the notarisation checks then fail the
+# job if the other three are absent. Signed-but-unnotarised is not a state this
+# workflow will publish.
 #
 # NOTE: macOS runner minutes bill at 10x on private repositories.
 
@@ -188,7 +214,12 @@ jobs:
             arch: arm64
             expected_uname: arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # Was 60. In certificate mode the critical path gains Apple's notarytool
+    # round trip, which commonly takes 5-20 minutes and has no upper bound worth
+    # relying on, on top of an npm ci that compiles better-sqlite3 and
+    # node-llama-cpp from source. 60 minutes left almost no headroom; a timeout
+    # here burns the whole matrix leg and the release with it.
+    timeout-minutes: 120
 
     # `secrets` is not one of the contexts available to a step-level `if:`
     # (github, needs, strategy, matrix, job, runner, env, vars, steps, inputs),
@@ -232,23 +263,67 @@ jobs:
         env:
           npm_config_foreground_scripts: 'true'
 
-      - name: Import signing certificate
+      # No keychain is built by hand here. electron-builder does it, and does it
+      # correctly: macPackager's codeSigningInfo (macPackager.js:25-50) reads
+      # CSC_LINK / CSC_KEY_PASSWORD (platformPackager.js:79 and :84) and calls
+      # createKeychain (codeSign/macCodeSign.js:123), which creates a temporary
+      # keychain, unlocks it, ADDS IT TO THE USER KEYCHAIN SEARCH LIST
+      # (macCodeSign.js:147-151), imports the .p12 and runs
+      # set-key-partition-list (macCodeSign.js:163-171), and deletes it when the
+      # build finishes (macPackager.js:43-46).
+      #
+      # The hand-rolled `security create-keychain` block that used to live here
+      # did every one of those things except the search-list one. `security
+      # create-keychain` does not put a keychain on the search list and
+      # `security default-keychain -s` does not either, but electron-builder
+      # locates the identity with `security find-identity -v -p codesigning`
+      # (macCodeSign.js:190-196), which only ever sees keychains that are ON the
+      # search list. The identity would not have been found, macPackager.sign
+      # would have reached reportError and `return false`
+      # (macPackager.js:202-212), and the build would have shipped unsigned —
+      # the exact failure this whole branch exists to eliminate. It had never
+      # run, because MAC_CERT_P12 had never existed.
+      #
+      # The base64 is handed over as a data: URI so importCertificate takes its
+      # base64 branch unconditionally (codeSign/codesign.js:29-35, which
+      # otherwise guesses from the string's length or a trailing "="), and the
+      # .p12 is only ever materialised inside electron-builder's own temp dir,
+      # never in the workspace.
+      #
+      # These go to $GITHUB_ENV rather than the Package step's `env:` because an
+      # empty CSC_LINK is not the same as an absent one: getCscLink would hand
+      # back "" and macPackager.js:27 only bails on `== null`, so an ad-hoc build
+      # would die inside importCertificate on a zero-byte .p12.
+      - name: Hand the signing certificate to electron-builder
         if: env.HAS_SIGNING_CERT == 'true'
         env:
           MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
-          KEYCHAIN=build.keychain
-          KEYCHAIN_PASSWORD=$(uuidgen)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security default-keychain -s "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          echo "$MAC_CERT_P12" | base64 --decode > /tmp/cert.p12
-          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/productbuild
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          rm -f /tmp/cert.p12
+          set -euo pipefail
+          # Base64 tolerates the line wrapping `base64` emits by default, but the
+          # value has to be a single line to go into $GITHUB_ENV as one.
+          P12=$(printf '%s' "$MAC_CERT_P12" | tr -d '[:space:]')
+          if [ -z "$P12" ]; then
+            echo "::error::MAC_CERT_P12 is set but holds no data once whitespace is stripped."
+            exit 1
+          fi
+          # `base64 -d` on purpose: macOS /usr/bin/base64 accepts -d and -D but
+          # NOT the GNU long option --decode, which is what the old block used.
+          BYTES=$(printf '%s' "$P12" | base64 -d | wc -c | tr -d ' ')
+          if [ "$BYTES" -lt 100 ]; then
+            echo "::error::MAC_CERT_P12 did not base64-decode into a plausible .p12 (got $BYTES bytes). Regenerate it with: base64 -i DeveloperID.p12 | tr -d '\\n'"
+            exit 1
+          fi
+          echo "MAC_CERT_P12 decodes to $BYTES bytes"
+          # Heredoc form for the password: it may legitimately contain any
+          # character, and KEY=VALUE would break on a newline.
+          {
+            echo "CSC_LINK=data:application/x-pkcs12;base64,$P12"
+            echo "CSC_KEY_PASSWORD<<__CSC_KEY_PASSWORD_EOF__"
+            printf '%s\n' "$MAC_CERT_PASSWORD"
+            echo "__CSC_KEY_PASSWORD_EOF__"
+          } >> "$GITHUB_ENV"
 
       # `--mac dmg:<arch> zip:<arch>` overrides electron-builder.yml's target
       # list for this run: a target list carrying explicit types short-circuits
@@ -265,6 +340,27 @@ jobs:
       # The two flags are mutually exclusive by construction: the hook no-ops
       # whenever MAC_HAS_SIGNING_CERT is true, so the real-certificate path is
       # untouched.
+      #
+      # forceCodeSigning is what turns "signing did not happen" from a warning
+      # into a failed build. platformPackager.js:528-530 reads it from the
+      # config (root or `mac`); macPackager.js:184-186 and
+      # codeSign/macCodeSign.js:96-98 throw instead of warning when it is on. It
+      # can only be enabled in certificate mode — in ad-hoc mode there is no
+      # identity by design, so a static `forceCodeSigning: true` in
+      # electron-builder.yml would kill every fork build. Hence the CLI override.
+      #
+      # And the CLI override is why this runs electron-builder directly instead
+      # of `npm run package:mac`. That script passes `--config
+      # electron-builder.yml`, and builder.js:105-120 folds `--config <file>`
+      # plus a `-c.<key>=<value>` into `{extends: "electron-builder.yml", ...}`.
+      # electron-builder then loads electron-builder.yml as the base config AND
+      # again as its own parent, and merges it with itself: `dmg.contents` ends
+      # up holding two `type: link` entries, and dmg.js:287 runs
+      # `ln -s /Applications` twice into the staging volume, so the second one
+      # fails and takes the dmg build with it. Without `--config`, config
+      # auto-discovery loads electron-builder.yml exactly once and the dot
+      # override merges cleanly (verified by loading the config both ways).
+      # `npm run build` is the other half of what `package:mac` does.
       - name: Package ${{ matrix.arch }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -273,8 +369,20 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.HAS_SIGNING_CERT }}
           MAC_HAS_SIGNING_CERT: ${{ env.HAS_SIGNING_CERT }}
           MAC_ADHOC_SIGN: ${{ env.HAS_SIGNING_CERT == 'true' && 'false' || 'true' }}
+          HAS_CERT: ${{ env.HAS_SIGNING_CERT }}
+          ARCH: ${{ matrix.arch }}
           GH_TOKEN: ${{ github.token }}
-        run: npm run package:mac -- --mac dmg:${{ matrix.arch }} zip:${{ matrix.arch }} --publish never
+        run: |
+          set -euo pipefail
+          npm run build
+          # Empty in ad-hoc mode. Left unquoted deliberately: it is either empty
+          # or one option with no whitespace in it.
+          EXTRA=''
+          if [ "$HAS_CERT" = "true" ]; then
+            EXTRA='-c.forceCodeSigning=true'
+          fi
+          # shellcheck disable=SC2086
+          npx --no-install electron-builder --mac "dmg:$ARCH" "zip:$ARCH" --publish never $EXTRA
 
       - name: Show what was produced
         run: ls -lh release/
@@ -320,8 +428,14 @@ jobs:
           fi
 
           if [ "$HAS_CERT" = "true" ]; then
-            if ! printf '%s\n' "$OUT" | grep -q '^Authority='; then
-              echo "::error::MAC_CERT_P12 is configured but $APP reports no Authority, so it was not signed with the certificate."
+            # Not just "some Authority". getCertificateTypes (macPackager.js:492)
+            # asks for a "Developer ID Application" identity for a non-mas
+            # distribution build, and _findIdentity (macCodeSign.js:236-252)
+            # falls back to ANY non-Apple certificate in the keychain when that
+            # one is missing. A build signed by that fallback would satisfy a
+            # bare `^Authority=` and still be rejected by Gatekeeper.
+            if ! printf '%s\n' "$OUT" | grep -q '^Authority=Developer ID Application:'; then
+              echo "::error::MAC_CERT_P12 is configured but $APP has no 'Authority=Developer ID Application:' line, so it was not signed with a Developer ID Application certificate."
               exit 1
             fi
           else
@@ -348,6 +462,149 @@ jobs:
               exit 1
             fi
           done
+
+      # Certificate mode only. In ad-hoc mode every one of these checks fails by
+      # definition — there is no Developer ID chain, no notarisation ticket and
+      # nothing for Gatekeeper to accept — and ad-hoc stays a legitimate outcome
+      # for forks and for any build made before the secrets landed.
+      #
+      # Notarisation is "automatic" here in the sense that
+      # macPackager.getNotarizeOptions (macPackager.js:439-484) builds notarytool
+      # options as soon as APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+      # are all exported, and notarizeIfProvided (macPackager.js:425-438) then
+      # calls @electron/notarize, which submits the app and staples the ticket
+      # (@electron/notarize lib/index.js:47 -> lib/staple.js:46). But when those
+      # env vars are missing it just logs "skipped macOS notarization" and
+      # carries on, so "automatic" is not evidence. This step is the evidence.
+      #
+      # All three commands print in full: the provenance of a released artifact
+      # has to stay auditable from the job log after the fact.
+      - name: Verify the app is Developer ID signed, notarised and stapled
+        if: env.HAS_SIGNING_CERT == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [ "$ARCH" = "x64" ]; then
+            APP=release/mac/InvoiceApp.app
+          else
+            APP="release/mac-$ARCH/InvoiceApp.app"
+          fi
+
+          echo "=== codesign -dv --verbose=4 $APP ==="
+          # Reported on stderr; captured so the whole chain is printed either way.
+          OUT=$(codesign -dv --verbose=4 "$APP" 2>&1) || {
+            printf '%s\n' "$OUT"
+            echo "::error::codesign could not read a signature from $APP."
+            exit 1
+          }
+          printf '%s\n' "$OUT"
+          if ! printf '%s\n' "$OUT" | grep -q '^Authority=Developer ID Application:'; then
+            echo "::error::$APP is not signed by a Developer ID Application certificate."
+            exit 1
+          fi
+          # The rest of the chain must be Apple's, not a self-signed lookalike.
+          for AUTHORITY in 'Developer ID Certification Authority' 'Apple Root CA'; do
+            if ! printf '%s\n' "$OUT" | grep -q "^Authority=$AUTHORITY\$"; then
+              echo "::error::$APP is missing '$AUTHORITY' from its certificate chain, so it is not chained to Apple."
+              exit 1
+            fi
+          done
+
+          echo "=== xcrun stapler validate $APP ==="
+          if ! OUT=$(xcrun stapler validate -v "$APP" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::$APP carries no stapled notarisation ticket. Either notarisation was skipped (APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID missing) or Apple rejected the submission. A build without a ticket shows a Gatekeeper dialog on any machine that is offline or behind a blocked notarisation lookup."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+
+          echo "=== spctl -a -vvv -t exec $APP ==="
+          if ! OUT=$(spctl -a -vvv -t exec "$APP" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::Gatekeeper rejected $APP."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+          if ! printf '%s\n' "$OUT" | grep -q 'accepted'; then
+            echo "::error::spctl did not report $APP as accepted."
+            exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep -q '^source=Notarized Developer ID$'; then
+            echo "::error::spctl accepted $APP but not as 'source=Notarized Developer ID'. A locally-signed-only app is accepted on the machine that signed it and rejected everywhere else."
+            exit 1
+          fi
+
+      # The .dmg is a separate artifact from the .app, and electron-builder
+      # treats it as one. dmg.js:62-64 signs the disk image only when
+      # `dmg.sign` is true, which defaults to false (app-builder-lib
+      # scheme.json, DmgOptions.sign: "Whether to sign the DMG or not. Signing is
+      # not required and will lead to unwanted errors in combination with
+      # notarization requirements."), and dmg-builder contains no notarisation
+      # call at all — notarizeIfProvided is reached only from macPackager.sign
+      # (macPackager.js:288-290), which runs against the .app.
+      #
+      # That is fine, and the ordering is why. macPackager.pack
+      # (macPackager.js:168-174) finishes doPack — which runs afterPack, then
+      # doSignAfterPack -> sign -> notarize -> staple — BEFORE it calls
+      # packageInDistributableFormat to build the dmg and zip targets. So the
+      # .app that gets copied into the disk image already carries its stapled
+      # ticket, and that is the bundle Gatekeeper assesses when the user drags it
+      # to /Applications and launches it. Signing the container would add a
+      # second signature over a payload that already proves itself.
+      #
+      # Rather than take that on faith, this mounts the .dmg that will actually
+      # be published and re-runs stapler and spctl on the app inside it.
+      - name: Verify the app inside the .dmg is notarised and stapled
+        if: env.HAS_SIGNING_CERT == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          DMG="release/InvoiceApp-mac-$ARCH.dmg"
+          MOUNT=/tmp/invoiceapp-dmg-verify
+          mkdir -p "$MOUNT"
+          # -nobrowse keeps it out of the Finder sidebar; an explicit mountpoint
+          # avoids depending on DmgTarget.computeVolumeName's naming.
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT"
+          # Detach whatever happens, or a failure leaves the runner with the
+          # image still attached.
+          trap 'hdiutil detach "$MOUNT" -force || true' EXIT
+
+          APP="$MOUNT/InvoiceApp.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::$DMG does not contain InvoiceApp.app at its root."
+            ls -la "$MOUNT"
+            exit 1
+          fi
+
+          echo "=== xcrun stapler validate (inside $DMG) ==="
+          if ! OUT=$(xcrun stapler validate -v "$APP" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::The InvoiceApp.app inside $DMG has no stapled ticket, even though the packaged app did. The dmg was built from something other than the notarised bundle."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+
+          echo "=== spctl -a -vvv -t exec (inside $DMG) ==="
+          if ! OUT=$(spctl -a -vvv -t exec "$APP" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::Gatekeeper rejected the app inside $DMG."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+          if ! printf '%s\n' "$OUT" | grep -q '^source=Notarized Developer ID$'; then
+            echo "::error::The app inside $DMG is not accepted as 'source=Notarized Developer ID'."
+            exit 1
+          fi
+
+          # Informational only. The disk image itself is deliberately unsigned
+          # (see above); spctl's verdict on an unsigned container is recorded
+          # here so the first real certificate-mode run leaves evidence in the
+          # log instead of leaving the question open. Do not turn this into a
+          # gate without checking what it prints first.
+          echo "=== spctl on the container itself (informational) ==="
+          spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 || true
 
       # Signing the .app is not enough on its own: the signature has to survive
       # into the artifact users actually download. Listing the zip for
