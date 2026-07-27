@@ -16,11 +16,23 @@
 # labels only — every `-large`/`-xlarge` runner is billable even on a public
 # repository.
 #
-# Unsigned by default. macOS quarantines an unsigned download, so the first
-# launch needs right-click > Open, or:
+# Ad-hoc signed by default — NOT signed with an Apple identity, and not
+# notarized. The build/after-pack.cjs hook runs `codesign --force --deep --sign -`
+# on the packed .app before the dmg and zip are built, so both artifacts carry a
+# signature. That is the minimum macOS needs to execute an arm64 Mach-O at all:
+# a bundle with no signature whatsoever is refused by the kernel and reported as
+# `"InvoiceApp" is damaged and can't be opened`, which no amount of quarantine
+# removal can fix. Releases up to v0.1.0 shipped exactly that.
+#
+# What an ad-hoc signature does NOT do is satisfy Gatekeeper. A download still
+# gets quarantined and still shows the "unidentified developer" / "cannot verify"
+# dialog on first launch, which the user gets past with right-click > Open, or:
 #   xattr -dr com.apple.quarantine /Applications/InvoiceApp.app
 #
-# To sign and notarize instead, add these repository secrets and the build
+# The "Verify the packaged app is signed" and "Verify the signature survives into
+# the zip" steps below fail the job if a build ever regresses to unsigned.
+#
+# To sign and notarize properly instead, add these repository secrets and the build
 # picks them up automatically:
 #   MAC_CERT_P12         base64 of a Developer ID Application .p12
 #   MAC_CERT_PASSWORD    its password
@@ -247,18 +259,81 @@ jobs:
       # config's per-target `arch:` lists get added on top of them.)
       #
       # CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder from hunting for
-      # an identity that is not there and failing the whole build over it.
+      # an identity that is not there and failing the whole build over it. It
+      # also means electron-builder does no signing at all, which is why
+      # MAC_ADHOC_SIGN arms build/after-pack.cjs to ad-hoc sign the .app itself.
+      # The two flags are mutually exclusive by construction: the hook no-ops
+      # whenever MAC_HAS_SIGNING_CERT is true, so the real-certificate path is
+      # untouched.
       - name: Package ${{ matrix.arch }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.HAS_SIGNING_CERT }}
+          MAC_HAS_SIGNING_CERT: ${{ env.HAS_SIGNING_CERT }}
+          MAC_ADHOC_SIGN: ${{ env.HAS_SIGNING_CERT == 'true' && 'false' || 'true' }}
           GH_TOKEN: ${{ github.token }}
         run: npm run package:mac -- --mac dmg:${{ matrix.arch }} zip:${{ matrix.arch }} --publish never
 
       - name: Show what was produced
         run: ls -lh release/
+
+      # The bug this guards: v0.1.0's arm64 zip unpacked to 672 entries with zero
+      # _CodeSignature directories. Unsigned + quarantined is precisely what
+      # produces the "damaged" dialog on Apple Silicon, so an unsigned .app must
+      # never leave this job again.
+      - name: Verify the packaged app is signed
+        env:
+          ARCH: ${{ matrix.arch }}
+          HAS_CERT: ${{ env.HAS_SIGNING_CERT }}
+        run: |
+          set -euo pipefail
+          # platformPackager.computeAppOutDir joins outDir with the platform key
+          # ("mac") plus getArchSuffix(arch, defaultArch), and getArchSuffix
+          # returns "" when arch is the default (x64). So x64 packs into
+          # release/mac and arm64 into release/mac-arm64.
+          if [ "$ARCH" = "x64" ]; then
+            APP_DIR=release/mac
+          else
+            APP_DIR="release/mac-$ARCH"
+          fi
+          APP="$APP_DIR/InvoiceApp.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::Expected the packaged app at $APP but it is not there. electron-builder's output layout changed; update this check and the afterPack hook together."
+            ls -la release/ || true
+            exit 1
+          fi
+
+          # codesign writes its report to stderr. Print all of it either way so
+          # the signing path of every artifact stays auditable after the fact.
+          if ! OUT=$(codesign -dv --verbose=4 "$APP" 2>&1); then
+            printf '%s\n' "$OUT"
+            echo "::error::codesign found no signature on $APP. macOS refuses to execute an unsigned arm64 bundle and reports it as damaged."
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+
+          if ! printf '%s\n' "$OUT" | grep -q '^CodeDirectory '; then
+            echo "::error::$APP has no CodeDirectory — it is not signed."
+            exit 1
+          fi
+
+          if [ "$HAS_CERT" = "true" ]; then
+            if ! printf '%s\n' "$OUT" | grep -q '^Authority='; then
+              echo "::error::MAC_CERT_P12 is configured but $APP reports no Authority, so it was not signed with the certificate."
+              exit 1
+            fi
+          else
+            if ! printf '%s\n' "$OUT" | grep -q '^Signature=adhoc'; then
+              echo "::error::No signing certificate is configured, so $APP must carry an ad-hoc signature, but codesign did not report Signature=adhoc."
+              exit 1
+            fi
+          fi
+
+          # --deep reaches the nested helper apps and the Electron Framework;
+          # -dv above only reads the outermost seal.
+          codesign --verify --deep --verbose=2 "$APP"
 
       # The download pages hard-code these names; a rename must fail the build,
       # not silently publish a release the site cannot link to.
@@ -273,6 +348,24 @@ jobs:
               exit 1
             fi
           done
+
+      # Signing the .app is not enough on its own: the signature has to survive
+      # into the artifact users actually download. Listing the zip for
+      # _CodeSignature/CodeResources is the exact check that caught the v0.1.0
+      # bug, so it runs on every build.
+      - name: Verify the signature survives into the zip
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ZIP="release/InvoiceApp-mac-$ARCH.zip"
+          ENTRIES=$(unzip -Z1 "$ZIP" | grep -c '_CodeSignature/CodeResources' || true)
+          echo "$ZIP contains $ENTRIES _CodeSignature/CodeResources entries"
+          if [ "$ENTRIES" -lt 1 ]; then
+            echo "::error::$ZIP contains no _CodeSignature/CodeResources entry. The signature did not survive packaging, so the download would be treated as unsigned and reported as damaged."
+            unzip -Z1 "$ZIP" | head -50
+            exit 1
+          fi
 
       # v4 artifacts are immutable and names must be unique per job, so each
       # matrix leg uploads under its own arch-suffixed name.

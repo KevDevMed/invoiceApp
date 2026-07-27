@@ -19,6 +19,12 @@ asarUnpack:
 
 npmRebuild: true
 
+# Ad-hoc signs the packed .app when no Developer ID certificate is available, so
+# the shipped binary is executable at all on Apple Silicon. Runs before both the
+# dmg/zip targets and electron-builder's own signing, and no-ops entirely when a
+# real certificate is present. See the header of the hook for the full rationale.
+afterPack: build/after-pack.cjs
+
 mac:
   category: public.app-category.finance
   # Version-less on purpose. The landing and download pages link straight at
@@ -36,6 +42,16 @@ mac:
       arch:
         - arm64
         - x64
+  # Applies to the real-certificate path only. electron-builder passes
+  # `--options runtime` to codesign as part of ITS signing pass, and that pass
+  # only happens when an identity is found (macPackager.sign -> isSignAllowed /
+  # findIdentity). With no certificate there is no electron-builder signing pass,
+  # so this key is inert and the afterPack hook's ad-hoc `codesign` deliberately
+  # omits `--options=runtime`: hardened runtime is only meaningful alongside
+  # notarisation, and under an ad-hoc signature it can block better-sqlite3's
+  # .node addon and node-llama-cpp's dlopen'd backend from loading. Keeping it
+  # here means the day MAC_CERT_P12 is added, the signed+notarised build gets
+  # hardened runtime with no further change.
   hardenedRuntime: true
   gatekeeperAssess: false
   # Signing and notarisation credentials come from the environment on a macOS
