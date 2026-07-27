@@ -124,6 +124,23 @@ The semantic icon registry has no invoicing-domain icons, so the sidebar is
 deliberately text-only. A feature that wants icons should pass SVG components
 directly or call `registerIcons()`.
 
+## macOS builds and releases
+
+electron-builder cannot produce a mac target from Linux, so release builds run
+on GitHub Actions: `.github/workflows/build-mac.yml` on a `macos-latest`
+runner. It is triggered by pushing a `v*` tag or manually via
+`workflow_dispatch` with the `release` input, and publishes two stable-named
+assets to the GitHub Release:
+
+```
+https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-arm64.dmg
+https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg
+```
+
+The published build is unsigned unless the Apple signing secrets are
+configured, so Gatekeeper quarantines it on first launch — the preview's
+`/download` page walks users through the workaround.
+
 ## Browser preview
 
 `preview/` serves the **real renderer** over HTTP so the app can be reviewed
@@ -139,6 +156,14 @@ npm run preview:serve   # http://0.0.0.0:4300
 npm run preview:dev     # both
 npm run preview:test    # the preview's own vitest suite
 ```
+
+The server exposes three routes:
+
+| Route | What it serves |
+| --- | --- |
+| `/` | The marketing landing page (`preview/landing/`) |
+| `/app` | The live in-browser preview of the real renderer |
+| `/download` | Install instructions for the macOS build (`preview/download/`) |
 
 Environment: `PREVIEW_HOST`, `PREVIEW_PORT` (default `0.0.0.0:4300`),
 `PREVIEW_DB_PATH` (default `./preview-data/preview.db`), and `PREVIEW_RESET=1`

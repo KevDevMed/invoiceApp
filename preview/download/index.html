@@ -204,10 +204,27 @@
       </header>
 
       <div class="actions">
-        <a class="button" href="https://github.com/KevDevMed/invoiceApp/releases/latest">
-          Download for macOS
+        <a
+          class="button"
+          href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-arm64.dmg"
+        >
+          Download for Apple Silicon (M1 or newer)
         </a>
-        <a class="button button--secondary" href="/">Open the live browser preview</a>
+        <a
+          class="button button--secondary"
+          href="https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg"
+        >
+          Download for Intel
+        </a>
+      </div>
+      <p class="lede" style="font-size: 0.875rem">
+        Not sure which chip you have? Apple menu &rarr; <strong>About This Mac</strong>: a chip line
+        starting with &ldquo;Apple M&hellip;&rdquo; means Apple Silicon; &ldquo;Intel&rdquo; means
+        Intel.
+      </p>
+      <div class="actions">
+        <a class="button button--secondary" href="/app">Open the live browser preview</a>
+        <a class="button button--secondary" href="/">Back to the landing page</a>
       </div>
 
       <section class="card card--warning">
@@ -238,7 +255,10 @@
           <dt>Operating system</dt>
           <dd>macOS 11 Big Sur or later</dd>
           <dt>Processor</dt>
-          <dd>Apple Silicon (M1 or newer) or Intel</dd>
+          <dd>
+            Apple Silicon (M1 or newer) &mdash; use the <code>arm64</code> download above; Intel
+            &mdash; use the <code>x64</code> download
+          </dd>
           <dt>Disk space</dt>
           <dd>
             About 8 GB free if you want to use the assistant — that is the model weights. The app
