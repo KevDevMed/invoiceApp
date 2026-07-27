@@ -44,6 +44,24 @@ const TOLERATED_CONSOLE_ERRORS = [/501 \(Not Implemented\)/];
 /** The client used for the two-token filter test. */
 const FILTER_CLIENT = 'Northwind Analytics';
 
+/**
+ * What `preview/seed.ts` produces, as a fixture contract. Kept in step with the
+ * constants asserted in `preview/__tests__/seed.test.ts`; if the seed changes,
+ * both move together.
+ *
+ * `seedOnBoot` only seeds an empty database, so a `preview-data/` directory left
+ * over from an older, smaller seed survives untouched and the server happily
+ * serves it. Every expectation below is then computed from that stale file and
+ * the run fails somewhere far away — "seed provides a status narrow enough to
+ * shrink the page", a 30s timeout in a range label — blaming the seed for a
+ * fixture problem. The preflight below catches that before a browser opens.
+ */
+const SEED_CONTRACT = {
+  clients: 10,
+  invoices: 66,
+  byStatus: { paid: 32, sent: 16, draft: 10, overdue: 4, void: 4 },
+};
+
 /** Major units for the "Amount at least" token. Compared against total_cents. */
 const AMOUNT_THRESHOLD_MAJOR = 20_000;
 
@@ -153,6 +171,49 @@ function readFromSqlite() {
   };
 }
 
+/**
+ * Every way the served database differs from what the current seed produces, as
+ * human-readable lines. Empty means the fixture is the current one.
+ */
+function fixtureMismatches(actual) {
+  const lines = [];
+  if (actual.clients !== SEED_CONTRACT.clients) {
+    lines.push(`clients: current seed produces ${SEED_CONTRACT.clients}, this database holds ${actual.clients}`);
+  }
+  if (actual.listTotal !== SEED_CONTRACT.invoices) {
+    lines.push(`invoices: current seed produces ${SEED_CONTRACT.invoices}, this database holds ${actual.listTotal}`);
+  }
+  const statuses = new Set([...Object.keys(SEED_CONTRACT.byStatus), ...actual.byStatus.keys()]);
+  for (const status of [...statuses].sort()) {
+    const want = SEED_CONTRACT.byStatus[status] ?? 0;
+    const got = actual.byStatus.get(status) ?? 0;
+    if (want !== got) lines.push(`status "${status}": current seed produces ${want}, this database holds ${got}`);
+  }
+  return lines;
+}
+
+/**
+ * Refuses to assert anything against a database the current seed did not
+ * produce. Prints the real cause and the remedy on the first lines of output —
+ * a stale fixture must never surface as a failing UI check.
+ */
+function assertCurrentFixture(actual) {
+  const mismatches = fixtureMismatches(actual);
+  if (mismatches.length === 0) return;
+
+  console.log('FAIL  preview database was not produced by the current seed');
+  console.log('        This is a stale fixture, not a UI or seed defect. Nothing below was run.');
+  console.log(`        database: ${DB_PATH}`);
+  for (const line of mismatches) console.log(`        ${line}`);
+  console.log('        Cause: seedOnBoot only seeds an empty database, so a preview-data/');
+  console.log('        directory created by an earlier seed is served unchanged.');
+  console.log('        Remedy: stop the preview server, then restart it as');
+  console.log('        `PREVIEW_RESET=1 npm run preview:serve`, which wipes and reseeds the demo');
+  console.log(`        tables — or delete ${DB_PATH}`);
+  console.log('        and start the server again. Then rerun this harness.');
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
 // Page helpers
 // ---------------------------------------------------------------------------
@@ -198,6 +259,20 @@ async function rangeLabel(page) {
 
 async function firstRowNumber(page) {
   return (await bodyRows(page).first().getByText(/^INV-\d{4}$/).innerText()).trim();
+}
+
+/** How many of the current page's row checkboxes are checked. */
+async function checkedRowCount(page) {
+  const boxes = await bodyRows(page).getByRole('checkbox', { name: 'Select row' }).all();
+  const states = await Promise.all(boxes.map((box) => box.isChecked()));
+  return states.filter(Boolean).length;
+}
+
+/** The "N selected on this page" banner text, or null when no banner is shown. */
+async function selectionBanner(page) {
+  const banner = page.getByText(/\d+ selected on this page/);
+  if ((await banner.count()) === 0) return null;
+  return (await banner.first().innerText()).trim();
 }
 
 /** Every visible row's status badge text, top to bottom. */
@@ -351,6 +426,9 @@ async function main() {
   mkdirSync(ARTIFACTS, { recursive: true });
 
   const expected = readFromSqlite();
+  // Before a browser opens and before any expectation is trusted: is this the
+  // fixture the current seed makes?
+  assertCurrentFixture(expected);
   console.log('SQLite (read directly from the preview database file):');
   console.log(`  ${DB_PATH}`);
   console.log(
@@ -541,6 +619,71 @@ async function main() {
   );
   await removeFilterToken(page, 'Amount: at least');
   check('removing the amount token restores the full list', await resultCount(page), expected.listTotal);
+
+  // --- Selection contract --------------------------------------------------
+  // The contract, verbatim: "Changing the active filters, the search term, or
+  // the sort order clears the row selection. Changing page or page size does
+  // NOT clear it." Asserted against the contract, not against whatever the list
+  // happens to do today.
+  console.log('\nSelection contract');
+
+  // (a) filters clear the selection, and clearing the filter does not bring it back.
+  await page.getByRole('checkbox', { name: 'Select all rows' }).check();
+  await page.waitForTimeout(300);
+  check('contract baseline: select-all checks the whole page', await checkedRowCount(page), 10);
+
+  await addFilterToken(page, {
+    field: 'Status',
+    value: { kind: 'option', label: 'Void' },
+  });
+  await removeFilterToken(page, 'Status: is');
+  check(
+    'applying then clearing a filter leaves no selection banner',
+    await selectionBanner(page),
+    null,
+  );
+  check('applying then clearing a filter leaves no row checked', await checkedRowCount(page), 0);
+
+  // Whatever the two checks above concluded, the next scenario starts clean.
+  const headerBox = page.getByRole('checkbox', { name: 'Select all rows' });
+  if (await headerBox.isChecked()) await headerBox.uncheck();
+  await page.waitForTimeout(300);
+  await headerBox.check();
+  await page.waitForTimeout(300);
+  await headerBox.uncheck();
+  await page.waitForTimeout(300);
+
+  // (b) paging and page size keep it. Page 2 holds none of the selected rows, so
+  // the banner is legitimately absent there — the selection is read back on a
+  // page that shows the selected rows again, after the page-size change sends
+  // the list back to page one.
+  await headerBox.check();
+  await page.waitForTimeout(300);
+  check('contract baseline: ten rows selected before paging', await checkedRowCount(page), 10);
+
+  await clickThroughBanner(page.getByRole('button', { name: 'Go to next page' }));
+  await page.waitForTimeout(400);
+  check('paging moved the list on', await rangeLabel(page), `11-20 of ${expected.listTotal}`);
+
+  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('option', { name: '25', exact: true }).click();
+  await page.waitForTimeout(400);
+  check('page-size change shows the first page again', await rangeLabel(page), `1-25 of ${expected.listTotal}`);
+  check('page and page-size changes keep the ten rows checked', await checkedRowCount(page), 10);
+  check(
+    'page and page-size changes keep the selection banner',
+    await selectionBanner(page),
+    '10 selected on this page',
+  );
+
+  // Back to the state the rest of the run expects: ten per page, nothing selected.
+  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('option', { name: '10', exact: true }).click();
+  await page.waitForTimeout(400);
+  if (!(await headerBox.isChecked())) await headerBox.check();
+  await page.waitForTimeout(300);
+  await headerBox.uncheck();
+  await page.waitForTimeout(300);
 
   // --- Navigation ----------------------------------------------------------
   console.log('\nNavigation');
