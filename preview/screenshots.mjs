@@ -17,7 +17,7 @@
  *              PREVIEW_DB_PATH (default ./preview-data/preview.db).
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -281,9 +281,63 @@ async function clickThroughBanner(locator) {
   });
 }
 
-/** Background colour of the document body — the thing dark mode has to change. */
-async function bodyBackground(page) {
-  return page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+/**
+ * Reads the two colours dark mode has to change: the document body, and the
+ * background of the widest painted element inside the page — the app shell,
+ * which is what carries the white top bar, sidebar and rows in light mode.
+ *
+ * Kept as source rather than a function so the same reader backs both the
+ * one-shot read and the browser-side wait predicate below. Nothing here keys
+ * off a class name: the shell is found by paint and area, not by identity.
+ */
+const READ_PAINTED_COLORS = `(() => {
+  const painted = (value) => Boolean(value) && value !== 'transparent' && !/,\\s*0\\)$/.test(value);
+  let surface = null;
+  let widest = 0;
+  for (const element of document.querySelectorAll('body *')) {
+    const background = getComputedStyle(element).backgroundColor;
+    if (!painted(background)) continue;
+    const box = element.getBoundingClientRect();
+    const area = box.width * box.height;
+    if (area > widest) {
+      widest = area;
+      surface = background;
+    }
+  }
+  return { body: getComputedStyle(document.body).backgroundColor, surface };
+})()`;
+
+async function paintedColors(page) {
+  return page.evaluate(READ_PAINTED_COLORS);
+}
+
+/**
+ * Blocks until the page is really painted in `mode` — body *and* app shell.
+ * The condition is the wait: no fixed padding, so a screenshot taken after
+ * this resolves cannot land on a pre-repaint frame. Returns false on timeout
+ * so the caller can report a FAIL instead of throwing.
+ */
+async function waitForTheme(page, mode) {
+  const wantBright = mode === 'light';
+  try {
+    await page.waitForFunction(
+      `(() => {
+         const colors = ${READ_PAINTED_COLORS};
+         if (!colors.surface) return false;
+         const bright = (color) => {
+           const parts = color.match(/[\\d.]+/g);
+           if (!parts || parts.length < 3) return false;
+           return (Number(parts[0]) + Number(parts[1]) + Number(parts[2])) / 3 > 128;
+         };
+         return bright(colors.body) === ${wantBright} && bright(colors.surface) === ${wantBright};
+       })()`,
+      null,
+      { timeout: 15_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +345,9 @@ async function bodyBackground(page) {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // A shot from an earlier run must never stand in for one this run refused to
+  // take: start from an empty directory.
+  rmSync(ARTIFACTS, { recursive: true, force: true });
   mkdirSync(ARTIFACTS, { recursive: true });
 
   const expected = readFromSqlite();
@@ -360,13 +417,19 @@ async function main() {
   await page.waitForTimeout(300);
   const rowBoxes = await bodyRows(page).getByRole('checkbox', { name: 'Select row' }).all();
   const checkedStates = await Promise.all(rowBoxes.map((box) => box.isChecked()));
-  check('select-all checks every row checkbox', checkedStates.filter(Boolean).length, rowBoxes.length);
-  check(
+  const allChecked = check(
+    'select-all checks every row checkbox',
+    checkedStates.filter(Boolean).length,
+    rowBoxes.length,
+  );
+  const countShown = check(
     'selection count matches the checked rows',
     (await page.getByText(/\d+ selected on this page/).innerText()).trim(),
     `${rowBoxes.length} selected on this page`,
   );
-  await shoot(page, 'invoices-selected');
+  // Photographed only once the selection it illustrates is proven on screen.
+  if (allChecked && countShown) await shoot(page, 'invoices-selected');
+  else console.log('  screenshot skipped: invoices-selected (selection did not hold)');
 
   await page.getByRole('checkbox', { name: 'Select all rows' }).uncheck();
   await page.waitForTimeout(300);
@@ -412,10 +475,14 @@ async function main() {
     field: 'Client',
     value: { kind: 'option', label: FILTER_CLIENT },
   });
-  check('two tokens narrow to the SQLite count', await resultCount(page), expected.paidForClient);
+  const twoTokenCount = check(
+    'two tokens narrow to the SQLite count',
+    await resultCount(page),
+    expected.paidForClient,
+  );
   const twoTokenStatuses = await visibleStatuses(page);
   const twoTokenClients = await visibleClients(page);
-  checkTrue(
+  const twoTokenRows = checkTrue(
     'every row matches both tokens',
     twoTokenStatuses.length > 0 &&
       twoTokenStatuses.every((status) => status === 'paid') &&
@@ -423,11 +490,30 @@ async function main() {
     `statuses: ${twoTokenStatuses.join(',')} | clients: ${[...new Set(twoTokenClients)].join(',')}`,
   );
   // The typeahead list stays open over the first rows after a token is added;
-  // close it so the shot shows the table the tokens produced.
+  // close it so the shot shows the table the tokens produced. Waiting on the
+  // options being gone beats waiting a fixed number of milliseconds.
   await page.keyboard.press('Escape');
   await page.getByRole('heading', { name: 'Invoices', exact: true }).first().click();
-  await page.waitForTimeout(400);
-  await shoot(page, 'invoices-filtered');
+  const popoverClosed = await page
+    .waitForFunction(
+      `[...document.querySelectorAll('[role="option"]')].every((option) => {
+         const box = option.getBoundingClientRect();
+         return box.width === 0 || box.height === 0 || getComputedStyle(option).visibility === 'hidden';
+       })`,
+      null,
+      { timeout: 5_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  // Closing the popover is itself an interaction, so the state is re-asserted
+  // here: the image is taken after the last check that describes it, not before.
+  const stillFiltered = checkTrue(
+    'filtered view is intact when the shot is taken',
+    popoverClosed && (await resultCount(page)) === expected.paidForClient,
+    `options open: ${!popoverClosed}, results: ${await resultCount(page)}`,
+  );
+  if (twoTokenCount && twoTokenRows && stillFiltered) await shoot(page, 'invoices-filtered');
+  else console.log('  screenshot skipped: invoices-filtered (filtered state did not hold)');
 
   // --- Clear all -----------------------------------------------------------
   console.log('\nClear all');
@@ -532,25 +618,48 @@ async function main() {
   // The theme mode is persisted in the database, so a previous run may have
   // left it dark. Start from a known light baseline.
   await page.getByRole('radio', { name: 'Light' }).click();
-  await page.waitForTimeout(900);
-  const lightBackground = await bodyBackground(page);
-  await page.getByRole('radio', { name: 'Dark' }).click();
-  await page.waitForTimeout(900);
-  const darkBackground = await bodyBackground(page);
+  const lightSettled = await waitForTheme(page, 'light');
+  const lightColors = await paintedColors(page);
   checkTrue(
-    'dark mode repaints the page background',
-    darkBackground !== lightBackground,
-    `light: ${lightBackground}, dark: ${darkBackground}`,
+    'light baseline paints body and app surface light',
+    lightSettled,
+    `body: ${lightColors.body}, surface: ${lightColors.surface}`,
   );
-  check('dark mode keeps the list rendered', await bodyRows(page).count(), 10);
-  await shoot(page, 'invoices-dark');
+
+  await page.getByRole('radio', { name: 'Dark' }).click();
+  const darkSettled = await waitForTheme(page, 'dark');
+  const darkColors = await paintedColors(page);
+  const repaintOk = checkTrue(
+    'dark mode repaints body and app surface, not just body',
+    darkSettled && darkColors.body !== lightColors.body && darkColors.surface !== lightColors.surface,
+    `light: body ${lightColors.body} / surface ${lightColors.surface}\n        dark:  body ${darkColors.body} / surface ${darkColors.surface}`,
+  );
+  const rowsOk = check('dark mode keeps the list rendered', await bodyRows(page).count(), 10);
+  // The shot exists to show dark mode. It is only taken once the page is
+  // proven dark, so the artifact can never contradict the check above.
+  if (repaintOk && rowsOk) await shoot(page, 'invoices-dark');
+  else console.log('  screenshot skipped: invoices-dark (page was not dark)');
 
   await page.goto(`${ORIGIN}/#/reports`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: /Revenue by month/ }).waitFor({ timeout: 15_000 });
-  await shoot(page, 'reports-dark');
+  // The mode is persisted, but the reports route paints its own surface: wait
+  // for that repaint too rather than assuming the previous page's state.
+  const reportsSettled = await waitForTheme(page, 'dark');
+  const reportsColors = await paintedColors(page);
+  if (
+    checkTrue(
+      'reports page stays dark after navigation',
+      reportsSettled,
+      `body: ${reportsColors.body}, surface: ${reportsColors.surface}`,
+    )
+  ) {
+    await shoot(page, 'reports-dark');
+  } else {
+    console.log('  screenshot skipped: reports-dark (page was not dark)');
+  }
 
   await page.getByRole('radio', { name: 'Light' }).click();
-  await page.waitForTimeout(600);
+  await waitForTheme(page, 'light');
 
   await browser.close();
 
