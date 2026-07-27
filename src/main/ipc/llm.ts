@@ -1,0 +1,541 @@
+/**
+ * IPC surface for the local model subsystem.
+ *
+ * Discovered automatically by `registry.ts` — there is no list to edit. Every
+ * channel here is declared in the frozen contract and validated by
+ * `registerHandler` before this file sees a payload.
+ *
+ * Two places where the contract could not express what the feature needs, and
+ * what was done instead (both are written up in the piece report):
+ *
+ *   1. `llm:downloadProgress` carries bytes but no rate or ETA. The downloader
+ *      computes both; the renderer re-derives them from the byte deltas and the
+ *      arrival times of these events.
+ *   2. There is no channel for reading chat history back, and no channel for
+ *      approving a tool call. History is mirrored into the `settings` table
+ *      (an open key/value store the contract does expose), and approvals travel
+ *      as a JSON body on a `tool`-role message inside `llm:chat`.
+ */
+
+import { randomUUID } from 'node:crypto';
+
+import { BrowserWindow } from 'electron';
+
+import { getDatabase } from '../../db/client';
+import {
+  IPC_CONTRACT,
+  type IpcEventChannel,
+  type IpcEventPayload,
+} from '../../shared/ipc-contract';
+import type { ChatMessage } from '../../shared/types';
+import {
+  CATALOG,
+  describeEntry,
+  findCatalogEntry,
+  resolveModelPath,
+} from '../llm/catalog';
+import { ModelDownloader, removeLocalModel, type DownloadProgress } from '../llm/downloader';
+import {
+  DEFAULT_CONTEXT_SIZE,
+  FakeLlmRuntime,
+  LlmRuntimeError,
+  NodeLlamaCppRuntime,
+  type ChatTurn,
+  type LlmRuntime,
+} from '../llm/runtime';
+import {
+  appendMessage,
+  createDiskProbe,
+  createThread,
+  deleteModelRow,
+  getModel,
+  listMessages,
+  listModels,
+  listThreads,
+  markInterrupted,
+  reconcileOnBoot,
+  requireThread,
+  updateThread,
+} from '../llm/store';
+import {
+  describeToolCall,
+  dispatchToolCall,
+  isMutatingTool,
+  parseToolCallProposal,
+  parseToolDecision,
+  toolSystemPrompt,
+  type ToolCall,
+} from '../llm/tools';
+import { modelsDir } from '../paths';
+import { registerHandler } from './registry';
+
+/** How many read-only tool round-trips one `llm:chat` call may make on its own. */
+const MAX_TOOL_ITERATIONS = 4;
+
+/** Settings keys the renderer reads chat history back from. */
+const THREAD_INDEX_KEY = 'llm.threadIndex';
+/** Which model is resident right now, so both renderer pages can agree on it. */
+const ACTIVE_MODEL_KEY = 'llm.activeModelId';
+const THREAD_TRANSCRIPT_PREFIX = 'llm.thread.';
+/** `settings.value` is capped at 100k characters by the contract. Stay well under. */
+const TRANSCRIPT_CHAR_BUDGET = 80_000;
+
+// ---------------------------------------------------------------------------
+// main -> renderer events
+// ---------------------------------------------------------------------------
+
+function broadcast<C extends IpcEventChannel>(channel: C, payload: IpcEventPayload<C>): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send(channel, payload);
+  }
+}
+
+function emitDownloadProgress(progress: DownloadProgress): void {
+  // The contract's event has no rate/ETA fields, so only the byte counts and
+  // status cross the boundary. The renderer differentiates them for the speed
+  // readout — see the report for the field this event is missing.
+  broadcast('llm:downloadProgress', {
+    modelId: progress.modelId,
+    receivedBytes: progress.receivedBytes,
+    totalBytes: progress.totalBytes,
+    status: progress.status,
+    error: progress.error,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Lazily-built singletons
+// ---------------------------------------------------------------------------
+
+let downloader: ModelDownloader | null = null;
+
+function getDownloader(): ModelDownloader {
+  downloader ??= new ModelDownloader({
+    db: () => getDatabase(),
+    modelsRoot: () => modelsDir(),
+    fetch: (url, init) => fetch(url, init),
+    emit: emitDownloadProgress,
+  });
+  return downloader;
+}
+
+let runtime: LlmRuntime | null = null;
+
+function getRuntime(): LlmRuntime {
+  if (!runtime) {
+    // The double exists so a machine with no working llama.cpp backend can still
+    // exercise the UI. It is opt-in, never a silent fallback.
+    runtime = process.env.INVOICEAPP_FAKE_LLM === '1' ? new FakeLlmRuntime() : new NodeLlamaCppRuntime();
+  }
+  return runtime;
+}
+
+/** Chat generations that can still be cancelled, keyed by `requestId`. */
+const activeChats = new Map<string, AbortController>();
+
+/** Mutating tool calls waiting on the user, keyed by call id. */
+const pendingToolCalls = new Map<string, ToolCall>();
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+export function register(): void {
+  reconcileModelsAgainstDisk();
+
+  registerHandler('llm:catalog', IPC_CONTRACT['llm:catalog'].request, () => ({
+    entries: CATALOG.map((entry) => ({
+      id: entry.id,
+      repo: entry.repo,
+      filename: entry.filename,
+      quant: entry.quant,
+      sizeBytes: entry.sizeBytes,
+      // The contract has no license/context/notes fields, so the one-line
+      // summary carries all three.
+      description: describeEntry(entry),
+    })),
+  }));
+
+  registerHandler('llm:download', IPC_CONTRACT['llm:download'].request, (payload) => {
+    const started = getDownloader().start({
+      repo: payload.repo,
+      filename: payload.filename,
+      quant: payload.quant,
+    });
+    // The transfer outlives this call; progress and failures arrive as events.
+    void started.completion;
+    return { modelId: started.modelId };
+  });
+
+  registerHandler('llm:cancelDownload', IPC_CONTRACT['llm:cancelDownload'].request, ({ modelId }) => ({
+    modelId,
+    cancelled: getDownloader().cancel(modelId),
+  }));
+
+  registerHandler('llm:removeModel', IPC_CONTRACT['llm:removeModel'].request, async ({ modelId }) => {
+    const db = getDatabase();
+    getDownloader().cancel(modelId);
+    await getDownloader().wait(modelId);
+
+    const active = getRuntime().current();
+    if (active?.modelId === modelId) {
+      await getRuntime().unload();
+      writeSetting(db, ACTIVE_MODEL_KEY, '');
+    }
+
+    const removed = await removeLocalModel(modelsDir(), modelId);
+    const deleted = deleteModelRow(db, modelId);
+    return { id: modelId, deleted: removed && deleted };
+  });
+
+  registerHandler('llm:listLocal', IPC_CONTRACT['llm:listLocal'].request, () => ({
+    models: listModels(getDatabase()),
+  }));
+
+  registerHandler('llm:load', IPC_CONTRACT['llm:load'].request, async (payload) => {
+    const db = getDatabase();
+    const record = getModel(db, payload.modelId);
+    if (!record || record.status !== 'ready' || !record.localPath) {
+      throw new Error(`Model ${payload.modelId} is not downloaded yet.`);
+    }
+
+    // Re-derive the path rather than trusting the stored one: the row survives
+    // upgrades, the allow-list is the thing that has to hold.
+    const modelPath = resolveModelPath(modelsDir(), record.id, record.filename);
+    const entry = findCatalogEntry(record.id);
+    const contextSize =
+      payload.contextSize ?? entry?.defaultContextSize ?? DEFAULT_CONTEXT_SIZE;
+
+    const loaded = await getRuntime().load({
+      modelId: record.id,
+      modelPath,
+      contextSize,
+      gpuLayers: payload.gpuLayers,
+    });
+
+    writeSetting(db, ACTIVE_MODEL_KEY, loaded.modelId);
+    return { modelId: loaded.modelId, loaded: true, contextSize: loaded.contextSize };
+  });
+
+  registerHandler('llm:unload', IPC_CONTRACT['llm:unload'].request, async () => {
+    const unloaded = await getRuntime().unload();
+    writeSetting(getDatabase(), ACTIVE_MODEL_KEY, '');
+    return { unloaded };
+  });
+
+  registerHandler('llm:chat', IPC_CONTRACT['llm:chat'].request, (payload) => handleChat(payload));
+
+  registerHandler('llm:cancelChat', IPC_CONTRACT['llm:cancelChat'].request, ({ requestId }) => {
+    const controller = activeChats.get(requestId);
+    controller?.abort();
+    return { requestId, cancelled: controller !== undefined };
+  });
+}
+
+/**
+ * Settle the `models` table against the filesystem before anything can read it.
+ *
+ * Rows left in `downloading` by a previous run have no writer any more; their
+ * `.part` files are the resumable truth.
+ */
+function reconcileModelsAgainstDisk(): void {
+  try {
+    // Nothing is resident this early in boot, whatever the last run left behind.
+    writeSetting(getDatabase(), ACTIVE_MODEL_KEY, '');
+    const result = reconcileOnBoot(getDatabase(), createDiskProbe(modelsDir()));
+    if (result.promotedToReady.length || result.resetToAvailable.length) {
+      console.log(
+        `[llm] reconciled models — ready: [${result.promotedToReady.join(', ')}], reset: [${result.resetToAvailable.join(', ')}]`,
+      );
+    }
+  } catch (error) {
+    console.warn('[llm] could not reconcile the models table against disk:', error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+type ChatRequest = (typeof IPC_CONTRACT)['llm:chat']['request']['_output'];
+type ChatResponse = (typeof IPC_CONTRACT)['llm:chat']['response']['_output'];
+
+interface RecordedToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: unknown;
+  readonly summary: string;
+  readonly isMutating: boolean;
+  readonly status: 'awaiting_approval' | 'executed' | 'failed' | 'rejected';
+  readonly result?: unknown;
+  readonly error?: string;
+}
+
+async function handleChat(payload: ChatRequest): Promise<ChatResponse> {
+  const db = getDatabase();
+  const active = getRuntime().current();
+  if (!active) {
+    throw new LlmRuntimeError(
+      'No model is loaded. Download a model on the Models page and press Load.',
+      'MODEL_NOT_LOADED',
+    );
+  }
+
+  const thread = payload.threadId
+    ? requireThread(db, payload.threadId)
+    : createThread(db, { title: deriveTitle(payload.messages), modelId: active.modelId });
+  if (thread.modelId !== active.modelId) {
+    updateThread(db, thread.id, { modelId: active.modelId });
+  }
+
+  const controller = new AbortController();
+  activeChats.set(payload.requestId, controller);
+
+  const recorded: RecordedToolCall[] = [];
+  let working: ChatTurn[] = [
+    { role: 'system', content: toolSystemPrompt() },
+    ...payload.messages.filter((message) => message.role !== 'system'),
+  ];
+
+  try {
+    const incoming = payload.messages[payload.messages.length - 1];
+    if (incoming) {
+      const resolved = await applyIncomingMessage(db, thread.id, incoming, recorded);
+      if (resolved) {
+        working = [...working.slice(0, -1), resolved];
+      }
+    }
+
+    let text = '';
+    let stopReason: ChatResponse['stopReason'] = 'stop';
+
+    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+      const generated = await getRuntime().generate({
+        requestId: payload.requestId,
+        messages: working,
+        temperature: payload.temperature,
+        maxTokens: payload.maxTokens,
+        signal: controller.signal,
+        onToken: (token) => {
+          broadcast('llm:chatToken', { requestId: payload.requestId, token, done: false });
+        },
+      });
+
+      text = generated.text;
+      stopReason = generated.stopReason;
+      if (stopReason !== 'stop') break;
+
+      const proposal = parseToolCallProposal(generated.text);
+      if (!proposal) break;
+
+      const call: ToolCall = {
+        id: randomUUID(),
+        name: proposal.name,
+        arguments: proposal.arguments,
+      };
+
+      if (isMutatingTool(call.name)) {
+        // The model proposes; the user disposes. Nothing is executed here.
+        pendingToolCalls.set(call.id, call);
+        recorded.push({
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          summary: describeToolCall(call),
+          isMutating: true,
+          status: 'awaiting_approval',
+        });
+        break;
+      }
+
+      const result = await dispatchToolCall(call);
+      recorded.push(toRecorded(call, result.ok, result));
+      appendMessage(db, {
+        threadId: thread.id,
+        role: 'tool',
+        content: result.content,
+        toolCalls: [toRecorded(call, result.ok, result)],
+      });
+
+      working = [
+        ...working,
+        { role: 'assistant', content: generated.text },
+        { role: 'tool', content: result.content },
+      ];
+    }
+
+    broadcast('llm:chatToken', { requestId: payload.requestId, token: '', done: true });
+
+    const message = appendMessage(db, {
+      threadId: thread.id,
+      role: 'assistant',
+      content: text,
+      toolCalls: recorded.length > 0 ? recorded : undefined,
+    });
+
+    const updated = requireThread(db, thread.id);
+    mirrorHistory(db, thread.id);
+    return { requestId: payload.requestId, threadId: thread.id, message, thread: updated, stopReason };
+  } catch (error) {
+    broadcast('llm:chatToken', { requestId: payload.requestId, token: '', done: true });
+    const message = error instanceof Error ? error.message : String(error);
+    const stored = appendMessage(db, {
+      threadId: thread.id,
+      role: 'assistant',
+      content: message,
+      toolCalls: recorded.length > 0 ? recorded : undefined,
+    });
+    mirrorHistory(db, thread.id);
+    return {
+      requestId: payload.requestId,
+      threadId: thread.id,
+      message: stored,
+      thread: requireThread(db, thread.id),
+      stopReason: 'error',
+    };
+  } finally {
+    activeChats.delete(payload.requestId);
+  }
+}
+
+/**
+ * Persist the newly-arrived message and, when it is an approve/reject decision,
+ * run (or refuse) the tool call it refers to.
+ *
+ * Returns the turn that should replace the incoming one in the model's context
+ * — for a decision, the actual tool output — or null to leave it as it is.
+ */
+async function applyIncomingMessage(
+  db: ReturnType<typeof getDatabase>,
+  threadId: string,
+  incoming: { role: ChatTurn['role']; content: string },
+  recorded: RecordedToolCall[],
+): Promise<ChatTurn | null> {
+  if (incoming.role !== 'tool') {
+    appendMessage(db, { threadId, role: incoming.role, content: incoming.content });
+    return null;
+  }
+
+  const decision = parseToolDecision(incoming.content);
+  if (!decision) {
+    appendMessage(db, { threadId, role: 'tool', content: incoming.content });
+    return null;
+  }
+
+  const call = pendingToolCalls.get(decision.callId);
+  if (!call) {
+    const content = JSON.stringify({
+      error: 'UNKNOWN_TOOL_CALL',
+      message: 'That tool call is no longer pending.',
+    });
+    appendMessage(db, { threadId, role: 'tool', content });
+    return { role: 'tool', content };
+  }
+
+  pendingToolCalls.delete(decision.callId);
+  const result = await dispatchToolCall(call, {
+    isConfirmed: decision.decision === 'approve',
+    isRejected: decision.decision === 'reject',
+  });
+
+  const entry: RecordedToolCall =
+    decision.decision === 'reject'
+      ? {
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          summary: describeToolCall(call),
+          isMutating: true,
+          status: 'rejected',
+        }
+      : toRecorded(call, result.ok, result);
+
+  recorded.push(entry);
+  appendMessage(db, { threadId, role: 'tool', content: result.content, toolCalls: [entry] });
+  return { role: 'tool', content: result.content };
+}
+
+function toRecorded(
+  call: ToolCall,
+  ok: boolean,
+  result: Awaited<ReturnType<typeof dispatchToolCall>>,
+): RecordedToolCall {
+  return {
+    id: call.id,
+    name: call.name,
+    arguments: call.arguments,
+    summary: describeToolCall(call),
+    isMutating: isMutatingTool(call.name),
+    status: ok ? 'executed' : 'failed',
+    result: result.ok ? result.result : undefined,
+    error: result.ok ? undefined : result.message,
+  };
+}
+
+function deriveTitle(messages: readonly { role: string; content: string }[]): string {
+  const firstUser = messages.find((message) => message.role === 'user');
+  const text = (firstUser?.content ?? 'New conversation').trim().replace(/\s+/g, ' ');
+  return text.length > 60 ? `${text.slice(0, 57)}…` : text;
+}
+
+// ---------------------------------------------------------------------------
+// History mirror
+// ---------------------------------------------------------------------------
+
+/**
+ * Copy the thread index and this thread's transcript into `settings`.
+ *
+ * `chat_threads` / `chat_messages` remain the source of truth; this mirror
+ * exists purely because the frozen contract gives the renderer no channel for
+ * reading them back, and `settings:get` is the one general-purpose read it does
+ * have.
+ */
+function mirrorHistory(db: ReturnType<typeof getDatabase>, threadId: string): void {
+  try {
+    const index = listThreads(db, 100).map((thread) => ({
+      id: thread.id,
+      title: thread.title,
+      modelId: thread.modelId,
+      updatedAt: thread.updatedAt,
+    }));
+    writeSetting(db, THREAD_INDEX_KEY, JSON.stringify(index));
+
+    const messages = listMessages(db, threadId);
+    writeSetting(db, `${THREAD_TRANSCRIPT_PREFIX}${threadId}`, encodeTranscript(messages));
+  } catch (error) {
+    console.warn('[llm] could not mirror chat history into settings:', error);
+  }
+}
+
+function encodeTranscript(messages: readonly ChatMessage[]): string {
+  const trimmed = [...messages];
+  let encoded = JSON.stringify(trimmed);
+  // Drop from the front until it fits: the tail of a conversation is the part
+  // the user is looking at.
+  while (encoded.length > TRANSCRIPT_CHAR_BUDGET && trimmed.length > 1) {
+    trimmed.shift();
+    encoded = JSON.stringify(trimmed);
+  }
+  return encoded;
+}
+
+function writeSetting(db: ReturnType<typeof getDatabase>, key: string, value: string): void {
+  db.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+  ).run(key, value);
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/** Cancel everything in flight. Exported for the app's `will-quit` path. */
+export async function shutdownLlm(): Promise<void> {
+  for (const controller of activeChats.values()) controller.abort();
+  activeChats.clear();
+  for (const id of getDownloader().activeDownloadIds()) {
+    getDownloader().cancel(id);
+    markInterrupted(getDatabase(), id, 0);
+  }
+  await getRuntime().dispose();
+}

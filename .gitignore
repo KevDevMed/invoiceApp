@@ -6,7 +6,9 @@ release/
 .DS_Store
 .env
 .env.*
-models/
+# Downloaded GGUF weights only. Root-anchored on purpose — an unanchored
+# `models/` also matches src/renderer/features/models/ and silently drops source.
+/models/
 
 # Test / tooling output
 coverage/
