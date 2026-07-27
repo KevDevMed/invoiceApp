@@ -14,7 +14,7 @@
 import { useMemo, useState } from 'react';
 
 import { formatMoney } from '../../../shared/money';
-import { barPath, niceMax } from './chartScale';
+import { barPath, bucketLabels, labelStep, niceMax } from './chartScale';
 
 export interface RevenueChartBucket {
   readonly bucket: string;
@@ -27,13 +27,16 @@ export interface RevenueChartProps {
   readonly currency: string;
 }
 
-// Everything on semantic tokens; they resolve per theme mode via light-dark().
+// Everything on semantic tokens. Series 1 is the neutral context ink; series 2
+// is the one blue accent. The accent uses icon-blue in light mode but
+// border-blue in dark, where icon-blue sits too close to the gray for
+// colour-blind (and full-colour) separation from series 1.
 const CHART_STYLE = `
 .revenue-chart {
   --chart-grid: var(--color-border);
   --chart-baseline: var(--color-border-emphasized);
-  --chart-series-1: var(--color-accent);
-  --chart-series-2: var(--color-icon-orange);
+  --chart-series-1: var(--color-icon-secondary);
+  --chart-series-2: light-dark(var(--color-icon-blue), var(--color-border-blue));
   position: relative;
   background: var(--color-background-surface);
   border: var(--border-width) solid var(--color-border);
@@ -88,6 +91,11 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
   // Two bars per band, 2px surface gap between them, capped at 24px each.
   const barWidth = Math.max(2, Math.min(24, (bandWidth - 2) * 0.35));
   const yFor = (cents: number): number => baseline - (cents / maxCents) * plotHeight;
+
+  // Short axis labels ("Jul 2025" / "7 Jul 25"), thinned to every Nth so they
+  // stay legible at any bucket count. Bars are never dropped, only label text.
+  const labels = useMemo(() => bucketLabels(buckets.map((b) => b.bucket)), [buckets]);
+  const step = labelStep(buckets.length, plotWidth, 64);
 
   const hoveredBucket = hovered !== null ? buckets[hovered] : undefined;
   const hoveredCenter = hovered !== null ? MARGIN.left + bandWidth * (hovered + 0.5) : 0;
@@ -147,15 +155,17 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
               {bucket.paidCents > 0 ? (
                 <path d={barPath(x2, yFor(bucket.paidCents), barWidth, baseline)} fill="var(--chart-series-2)" />
               ) : null}
-              <text
-                x={center}
-                y={HEIGHT - 8}
-                textAnchor="middle"
-                fontSize={11}
-                fill="var(--color-text-secondary)"
-              >
-                {bucket.bucket}
-              </text>
+              {index % step === 0 ? (
+                <text
+                  x={center}
+                  y={HEIGHT - 8}
+                  textAnchor="middle"
+                  fontSize={11}
+                  fill="var(--color-text-secondary)"
+                >
+                  {labels[index]}
+                </text>
+              ) : null}
               {/* full-band hit target: bigger than the marks, per interaction spec */}
               <rect
                 x={MARGIN.left + bandWidth * index}
@@ -167,7 +177,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
                 onFocus={() => setHovered(index)}
                 onBlur={() => setHovered(null)}
                 tabIndex={0}
-                aria-label={`${bucket.bucket}: invoiced ${formatMoney(bucket.totalCents, currency)}, paid ${formatMoney(bucket.paidCents, currency)}`}
+                aria-label={`${labels[index]}: invoiced ${formatMoney(bucket.totalCents, currency)}, paid ${formatMoney(bucket.paidCents, currency)}`}
               />
             </g>
           );
@@ -184,7 +194,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
           }}
         >
           <div style={{ color: 'var(--color-text-secondary)', marginBottom: 'var(--spacing-0-5)' }}>
-            {hoveredBucket.bucket}
+            {hovered !== null ? labels[hovered] : ''}
           </div>
           <div>
             <span
