@@ -3,15 +3,18 @@
 # electron-builder cannot produce a mac target from Linux, so this is the only
 # way to get an installable .dmg without a Mac in hand.
 #
-# Each arch is built natively (macos-13 = Intel/x64, macos-14 = Apple Silicon/
-# arm64) because node-llama-cpp's backend packages are optional dependencies
+# Each arch is built natively (macos-15-intel = Intel/x64, macos-15 = Apple
+# Silicon/arm64) because node-llama-cpp's backend packages are optional dependencies
 # gated on `cpu`. A cross-arch build installs only the host's backend, so an x64
 # .dmg packaged on an arm64 runner ships without @node-llama-cpp/mac-x64 and the
 # assistant dies with NoBinaryFoundError on a real Intel Mac.
 #
-# Runner labels are pinned on purpose. `macos-latest` silently moved from x64 to
-# arm64 once already; a retired explicit label fails the job loudly instead of
-# quietly producing a mismatched binary.
+# Runner labels are pinned to explicit, current, non-deprecated images on
+# purpose. `macos-latest` silently moved from x64 to arm64 once already, and
+# `macos-13` has since been retired outright; an explicit versioned label fails
+# the job loudly instead of quietly producing a mismatched binary. Standard
+# labels only — every `-large`/`-xlarge` runner is billable even on a public
+# repository.
 #
 # Unsigned by default. macOS quarantines an unsigned download, so the first
 # launch needs right-click > Open, or:
@@ -69,13 +72,32 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           WANT_RELEASE: ${{ inputs.release }}
           TAG_INPUT: ${{ inputs.tag }}
+          BUILD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # Commit a tag currently points at, dereferencing annotated tags, or
+          # empty when the tag does not exist yet.
+          tag_commit() {
+            local ref_json object_type object_sha
+            if ! ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$1" 2>/dev/null); then
+              printf ''
+              return 0
+            fi
+            object_type=$(printf '%s' "$ref_json" | jq -r '.object.type')
+            object_sha=$(printf '%s' "$ref_json" | jq -r '.object.sha')
+            if [ "$object_type" = "tag" ]; then
+              object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')
+            fi
+            printf '%s' "$object_sha"
+          }
+
           if [ "$EVENT_NAME" = "push" ]; then
             # Only tags matching v* trigger this workflow, so ref_name is the tag.
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "Tag push: publishing release $REF_NAME"
+            echo "Tag push: publishing release $REF_NAME from $BUILD_SHA"
             exit 0
           fi
 
@@ -91,18 +113,39 @@ jobs:
             echo "::error::'release' was checked but no 'tag' was given. A manual run cannot infer a tag (github.ref is a branch here), and the release would fail with 'GitHub Releases requires a tag'. Re-run and set the 'tag' input, e.g. v1.2.3."
             exit 1
           fi
+          # A manual dispatch builds the dispatch ref ($BUILD_SHA), but the
+          # release is published under a tag typed by hand. If that tag already
+          # exists on another commit, the GitHub Release API ignores
+          # target_commitish for existing tags and action-gh-release overwrites
+          # same-named assets — so v1.2.3's .dmg would silently become a build of
+          # a different commit, invisible in the version-less asset names. Refuse
+          # here, before any macOS minute is spent.
+          EXISTING=$(tag_commit "$TAG")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "$BUILD_SHA" ]; then
+            echo "::error::Tag $TAG already exists and points at $EXISTING, but this run would build $BUILD_SHA. Publishing would overwrite $TAG's assets with binaries from a different commit. Push the tag at the commit you want released and let the tag-push trigger build it, or dispatch a new tag name."
+            exit 1
+          fi
+          if [ -n "$EXISTING" ]; then
+            echo "Tag $TAG already exists and points at the commit being built."
+          fi
+
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Manual run: publishing release $TAG from ${{ github.sha }}"
+          echo "Manual run: publishing release $TAG from $BUILD_SHA"
 
   # One verification pass gates packaging for both arches. It is arch-neutral
   # (typecheck / lint / unit tests), so running it twice would buy nothing.
   verify:
     needs: [validate]
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
+      # Pinned to the exact commit that triggered the run. On a dispatch the
+      # default ref is a moving branch, so verify and build must both name the
+      # sha or verify could pass on one commit while build packages another.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -126,10 +169,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13   # Intel / x86_64
+          - runner: macos-15-intel   # Intel / x86_64
             arch: x64
             expected_uname: x86_64
-          - runner: macos-14   # Apple Silicon
+          - runner: macos-15         # Apple Silicon
             arch: arm64
             expected_uname: arm64
     runs-on: ${{ matrix.runner }}
@@ -159,7 +202,10 @@ jobs:
             exit 1
           fi
 
+      # Same commit `verify` checked out — never the branch head as of now.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -264,6 +310,31 @@ jobs:
               exit 1
             fi
           done
+
+      # `validate` ran up to an hour ago; a tag could have been created in the
+      # meantime. Re-check immediately before publishing so the assets can never
+      # land on a tag that names a commit other than the one that was built.
+      - name: Confirm the tag is unused or points at the built commit
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          BUILD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! REF_JSON=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
+            echo "Tag $TAG does not exist yet; it will be created at $BUILD_SHA."
+            exit 0
+          fi
+          OBJECT_TYPE=$(printf '%s' "$REF_JSON" | jq -r '.object.type')
+          OBJECT_SHA=$(printf '%s' "$REF_JSON" | jq -r '.object.sha')
+          if [ "$OBJECT_TYPE" = "tag" ]; then
+            OBJECT_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$OBJECT_SHA" --jq '.object.sha')
+          fi
+          if [ "$OBJECT_SHA" != "$BUILD_SHA" ]; then
+            echo "::error::Tag $TAG points at $OBJECT_SHA but these binaries were built from $BUILD_SHA. Refusing to publish assets that do not match the tag."
+            exit 1
+          fi
+          echo "Tag $TAG points at the built commit $BUILD_SHA."
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
