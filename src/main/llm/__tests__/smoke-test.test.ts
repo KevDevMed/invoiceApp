@@ -21,8 +21,6 @@ import {
   clearSmokeTest,
   decodeSmokeTest,
   describeSmokeTest,
-  downloadErrorOf,
-  readSmokeTest,
   runSmokeTest,
   saveSmokeTest,
   SLOW_TOKENS_PER_SECOND,
@@ -267,6 +265,9 @@ describe('runSmokeTest', () => {
 // Persistence into the frozen schema
 // ---------------------------------------------------------------------------
 
+/** Any 64-hex string: `markReady` records what was verified, it does not re-hash. */
+const DIGEST = 'b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897';
+
 describe('smoke-test persistence', () => {
   let db: Db;
 
@@ -278,23 +279,23 @@ describe('smoke-test persistence', () => {
       repo: 'unsloth/Qwen3-1.7B-GGUF',
       filename: 'Qwen3-1.7B-Q4_K_M.gguf',
     });
-    markReady(db, 'qwen3-1-7b-q4-k-m', '/models/x/Qwen3-1.7B-Q4_K_M.gguf', 1_107_409_472);
+    markReady(db, 'qwen3-1-7b-q4-k-m', '/models/x/Qwen3-1.7B-Q4_K_M.gguf', 1_107_409_472, DIGEST);
   });
 
   afterEach(() => {
     db.close();
   });
 
-  it('round-trips through the models.error column', async () => {
+  it('round-trips through the models.smoke_test column', async () => {
     const runtime = new ScriptedRuntime({ msPerToken: 10 });
     const result = await run(runtime);
 
     saveSmokeTest(db, 'qwen3-1-7b-q4-k-m', result);
 
     const row = db
-      .prepare<[string], { error: string | null }>('SELECT error FROM models WHERE id = ?')
+      .prepare<[string], { smoke_test: string | null }>('SELECT smoke_test FROM models WHERE id = ?')
       .get('qwen3-1-7b-q4-k-m');
-    const decoded = decodeSmokeTest(row?.error ?? null);
+    const decoded = decodeSmokeTest(row?.smoke_test ?? null);
 
     expect(decoded).not.toBeNull();
     expect(decoded?.verdict).toBe('pass');
@@ -311,13 +312,13 @@ describe('smoke-test persistence', () => {
     saveSmokeTest(db, 'qwen3-1-7b-q4-k-m', result);
 
     const row = db
-      .prepare<[string], { error: string | null }>('SELECT error FROM models WHERE id = ?')
+      .prepare<[string], { smoke_test: string | null }>('SELECT smoke_test FROM models WHERE id = ?')
       .get('qwen3-1-7b-q4-k-m');
-    expect((row?.error ?? '').length).toBeLessThanOrEqual(4000);
-    expect(decodeSmokeTest(row?.error ?? null)).not.toBeNull();
+    expect((row?.smoke_test ?? '').length).toBeLessThanOrEqual(4000);
+    expect(decodeSmokeTest(row?.smoke_test ?? null)).not.toBeNull();
   });
 
-  it('tells a stored smoke test apart from a download error', () => {
+  it('keeps a download error and a smoke test in separate columns', async () => {
     const record: SmokeTestRecord = {
       kind: 'smokeTest',
       modelId: 'x',
@@ -336,19 +337,25 @@ describe('smoke-test persistence', () => {
       ranAt: '2026-07-27T00:00:00.000Z',
     };
 
-    expect(readSmokeTest({ error: JSON.stringify(record) })?.verdict).toBe('pass');
-    expect(downloadErrorOf({ error: JSON.stringify(record) })).toBeNull();
-
-    expect(readSmokeTest({ error: 'Checksum mismatch, the file was deleted.' })).toBeNull();
-    expect(downloadErrorOf({ error: 'Checksum mismatch, the file was deleted.' })).toBe(
+    saveSmokeTest(db, 'qwen3-1-7b-q4-k-m', record);
+    db.prepare('UPDATE models SET error = ? WHERE id = ?').run(
       'Checksum mismatch, the file was deleted.',
+      'qwen3-1-7b-q4-k-m',
     );
 
-    expect(readSmokeTest({ error: null })).toBeNull();
-    expect(downloadErrorOf({ error: null })).toBeNull();
-    // Some other JSON is not a smoke test.
-    expect(readSmokeTest({ error: '{"kind":"somethingElse"}' })).toBeNull();
-    expect(readSmokeTest({ error: '{not json' })).toBeNull();
+    const row = db
+      .prepare<[string], { error: string | null; smoke_test: string | null }>(
+        'SELECT error, smoke_test FROM models WHERE id = ?',
+      )
+      .get('qwen3-1-7b-q4-k-m');
+
+    // No accessor has to disambiguate: the two facts are two columns.
+    expect(row?.error).toBe('Checksum mismatch, the file was deleted.');
+    expect(decodeSmokeTest(row?.smoke_test ?? null)?.verdict).toBe('pass');
+    expect(decodeSmokeTest('Checksum mismatch, the file was deleted.')).toBeNull();
+    expect(decodeSmokeTest(null)).toBeNull();
+    expect(decodeSmokeTest('{"kind":"somethingElse"}')).toBeNull();
+    expect(decodeSmokeTest('{not json')).toBeNull();
   });
 
   it('clears a stored result', async () => {
@@ -357,20 +364,27 @@ describe('smoke-test persistence', () => {
     clearSmokeTest(db, 'qwen3-1-7b-q4-k-m');
 
     const row = db
-      .prepare<[string], { error: string | null }>('SELECT error FROM models WHERE id = ?')
+      .prepare<[string], { smoke_test: string | null }>('SELECT smoke_test FROM models WHERE id = ?')
       .get('qwen3-1-7b-q4-k-m');
-    expect(row?.error).toBeNull();
+    expect(row?.smoke_test).toBeNull();
   });
 
-  it('is cleared by a re-download, because markReady nulls the column', async () => {
+  it('survives markReady, and is cleared explicitly when the weights are replaced', async () => {
     const runtime = new ScriptedRuntime({ msPerToken: 10 });
     saveSmokeTest(db, 'qwen3-1-7b-q4-k-m', await run(runtime));
-    markReady(db, 'qwen3-1-7b-q4-k-m', '/models/x/Qwen3-1.7B-Q4_K_M.gguf', 1_107_409_472);
+    markReady(db, 'qwen3-1-7b-q4-k-m', '/models/x/Qwen3-1.7B-Q4_K_M.gguf', 1_107_409_472, DIGEST);
+    expect(
+      db
+        .prepare<[string], { smoke_test: string | null }>('SELECT smoke_test FROM models WHERE id = ?')
+        .get('qwen3-1-7b-q4-k-m')?.smoke_test,
+    ).not.toBeNull();
+
+    clearSmokeTest(db, 'qwen3-1-7b-q4-k-m');
 
     const row = db
-      .prepare<[string], { error: string | null }>('SELECT error FROM models WHERE id = ?')
+      .prepare<[string], { smoke_test: string | null }>('SELECT smoke_test FROM models WHERE id = ?')
       .get('qwen3-1-7b-q4-k-m');
-    expect(row?.error).toBeNull();
+    expect(row?.smoke_test).toBeNull();
   });
 });
 

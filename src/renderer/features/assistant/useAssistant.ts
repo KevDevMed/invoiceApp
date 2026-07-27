@@ -15,7 +15,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import type { ChatMessage, ModelRecord } from '../../../shared/types';
+import type { ChatMessage } from '../../../shared/types';
+import type { LocalModel } from '../models/llmExtra';
 
 const THREAD_INDEX_KEY = 'llm.threadIndex';
 const THREAD_TRANSCRIPT_PREFIX = 'llm.thread.';
@@ -42,7 +43,7 @@ export interface AssistantState {
   readonly threads: ThreadSummary[];
   readonly threadId: string | null;
   readonly messages: ChatMessage[];
-  readonly readyModels: ModelRecord[];
+  readonly readyModels: LocalModel[];
   readonly activeModelId: string | null;
   readonly streamingText: string;
   readonly isStreaming: boolean;
@@ -97,7 +98,7 @@ export function useAssistant(): AssistantState {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [readyModels, setReadyModels] = useState<ModelRecord[]>([]);
+  const [readyModels, setReadyModels] = useState<LocalModel[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState('');
   const [requestId, setRequestId] = useState<string | null>(null);

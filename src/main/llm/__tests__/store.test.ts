@@ -58,7 +58,7 @@ describe('models table', () => {
 
   it('never downgrades a ready row back to downloading', () => {
     upsertModel(db, MODEL);
-    markReady(db, MODEL.id, '/models/x.gguf', MODEL.sizeBytes);
+    markReady(db, MODEL.id, '/models/x.gguf', MODEL.sizeBytes, MODEL.sha256);
 
     const again = upsertModel(db, { ...MODEL, status: 'downloading' });
     expect(again.status).toBe('ready');
@@ -72,7 +72,7 @@ describe('models table', () => {
     recordProgress(db, MODEL.id, 4096);
     expect(getModel(db, MODEL.id)?.downloadedBytes).toBe(4096);
 
-    const ready = markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes);
+    const ready = markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes, MODEL.sha256);
     expect(ready.status).toBe('ready');
     expect(ready.localPath).toBe('/models/qwen/model.gguf');
     expect(ready.downloadedBytes).toBe(MODEL.sizeBytes);
@@ -105,7 +105,7 @@ describe('models table', () => {
 
   it('sums disk usage across ready and partial models', () => {
     upsertModel(db, MODEL);
-    markReady(db, MODEL.id, '/models/a.gguf', 1000);
+    markReady(db, MODEL.id, '/models/a.gguf', 1000, MODEL.sha256);
 
     upsertModel(db, { ...MODEL, id: 'qwen3-0-6b-q8-0', filename: 'Qwen3-0.6B-Q8_0.gguf' });
     markInterrupted(db, 'qwen3-0-6b-q8-0', 250);
@@ -164,9 +164,12 @@ describe('reconcileOnBoot', () => {
     expect(record?.downloadedBytes).toBe(0);
   });
 
-  it('promotes a downloading row whose file actually finished before the crash', () => {
+  it('promotes a downloading row whose file actually finished and was verified', () => {
     upsertModel(db, MODEL);
     markDownloading(db, MODEL.id, MODEL.sizeBytes - 1);
+    // The downloader hashed these bytes before the crash; the digest is what
+    // makes them promotable now.
+    db.prepare('UPDATE models SET verified_sha256 = ? WHERE id = ?').run(MODEL.sha256, MODEL.id);
 
     const result = reconcileOnBoot(
       db,
@@ -180,9 +183,42 @@ describe('reconcileOnBoot', () => {
     expect(record?.downloadedBytes).toBe(MODEL.sizeBytes);
   });
 
+  it('refuses to promote a file that was never checksum-verified', () => {
+    upsertModel(db, MODEL);
+    markDownloading(db, MODEL.id, MODEL.sizeBytes - 1);
+
+    // Right size, right place, never hashed on this machine.
+    const result = reconcileOnBoot(
+      db,
+      probeWith({ finalPath: '/models/qwen/model.gguf', finalBytes: MODEL.sizeBytes }),
+    );
+
+    expect(result.promotedToReady).toEqual([]);
+    expect(result.unverified).toEqual([MODEL.id]);
+    expect(result.resetToAvailable).toEqual([MODEL.id]);
+
+    const record = getModel(db, MODEL.id);
+    expect(record?.status).toBe('available');
+    expect(record?.localPath).toBeNull();
+    expect(record?.verifiedSha256).toBeNull();
+  });
+
+  it('demotes a ready row that lost its verification, even at the right size', () => {
+    upsertModel(db, MODEL);
+    markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes, MODEL.sha256);
+    db.prepare('UPDATE models SET verified_sha256 = NULL WHERE id = ?').run(MODEL.id);
+
+    reconcileOnBoot(
+      db,
+      probeWith({ finalPath: '/models/qwen/model.gguf', finalBytes: MODEL.sizeBytes }),
+    );
+
+    expect(getModel(db, MODEL.id)?.status).toBe('available');
+  });
+
   it('demotes a ready row whose weights were deleted behind our back', () => {
     upsertModel(db, MODEL);
-    markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes);
+    markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes, MODEL.sha256);
 
     reconcileOnBoot(db, probeWith({}));
 
@@ -193,7 +229,7 @@ describe('reconcileOnBoot', () => {
 
   it('demotes a ready row whose file is the wrong size', () => {
     upsertModel(db, MODEL);
-    markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes);
+    markReady(db, MODEL.id, '/models/qwen/model.gguf', MODEL.sizeBytes, MODEL.sha256);
 
     reconcileOnBoot(db, probeWith({ finalBytes: 12 }));
 
@@ -206,7 +242,7 @@ describe('reconcileOnBoot', () => {
 
     const result = reconcileOnBoot(db, probeWith({ finalBytes: MODEL.sizeBytes }));
 
-    expect(result).toEqual({ promotedToReady: [], resetToAvailable: [] });
+    expect(result).toEqual({ promotedToReady: [], resetToAvailable: [], unverified: [] });
     expect(getModel(db, MODEL.id)?.status).toBe('error');
   });
 });

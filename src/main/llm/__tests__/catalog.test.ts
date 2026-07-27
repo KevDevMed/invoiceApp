@@ -175,7 +175,28 @@ describe('deriveModelId', () => {
   it('slugifies an unknown pair into something the allow-list accepts', () => {
     const id = deriveModelId('SomeOwner/Some.Model-GGUF', 'Some.Model-Q4_K_M.gguf');
     expect(isSafeModelId(id)).toBe(true);
-    expect(id).toBe('someowner-some-model-gguf-some-model-q4-k-m');
+    expect(id).toMatch(/^someowner-some-model-gguf-some-model-q4-k-m-[0-9a-f]{10}$/);
+    // Same input, same id: the directory a model lives in has to be stable.
+    expect(deriveModelId('SomeOwner/Some.Model-GGUF', 'Some.Model-Q4_K_M.gguf')).toBe(id);
+  });
+
+  it('gives colliding slugs distinct ids', () => {
+    // Both slugify to `a-b-c-x`: the separator between repo and filename is the
+    // same character the slugifier maps `/` and `.` to.
+    const first = deriveModelId('a/b-c', 'x.gguf');
+    const second = deriveModelId('a/b', 'c-x.gguf');
+
+    expect(first).not.toBe(second);
+    expect(isSafeModelId(first)).toBe(true);
+    expect(isSafeModelId(second)).toBe(true);
+    expect(first.startsWith('a-b-c-x-')).toBe(true);
+    expect(second.startsWith('a-b-c-x-')).toBe(true);
+  });
+
+  it('keeps a derived id inside the allow-list length even for a long pair', () => {
+    const id = deriveModelId(`${'o'.repeat(90)}/${'n'.repeat(90)}`, `${'f'.repeat(200)}.gguf`);
+    expect(isSafeModelId(id)).toBe(true);
+    expect(id.length).toBeLessThanOrEqual(64);
   });
 
   it('strips traversal out of a hostile repo name rather than passing it through', () => {

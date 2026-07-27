@@ -23,12 +23,23 @@ import { SETTINGS_KEYS } from '../../shared/types';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
 
+/**
+ * Settings key the model downloader reads its Hugging Face token from.
+ *
+ * It is not in `SETTINGS_KEYS` — that lives in the frozen contract and covers
+ * the business defaults only. The main process spells the same string in
+ * `src/main/llm/extra-channels.ts` (`HF_TOKEN_SETTING_KEY`); the renderer cannot
+ * import from `src/main`, so it is written out here.
+ */
+const HF_TOKEN_KEY = 'llm.hfToken';
+
 interface BusinessSettings {
   businessName: string;
   businessAddress: string;
   defaultCurrency: string;
   defaultTaxRateBps: number;
   invoiceNumberPrefix: string;
+  hfToken: string;
 }
 
 const DEFAULT_SETTINGS: BusinessSettings = {
@@ -37,6 +48,7 @@ const DEFAULT_SETTINGS: BusinessSettings = {
   defaultCurrency: 'USD',
   defaultTaxRateBps: 0,
   invoiceNumberPrefix: 'INV-',
+  hfToken: '',
 };
 
 async function readSetting(key: string): Promise<string | null> {
@@ -55,12 +67,13 @@ export function SettingsPage(): React.JSX.Element {
 
     void (async () => {
       try {
-        const [name, address, currency, taxRate, prefix] = await Promise.all([
+        const [name, address, currency, taxRate, prefix, hfToken] = await Promise.all([
           readSetting(SETTINGS_KEYS.businessName),
           readSetting(SETTINGS_KEYS.businessAddress),
           readSetting(SETTINGS_KEYS.defaultCurrency),
           readSetting(SETTINGS_KEYS.defaultTaxRateBps),
           readSetting(SETTINGS_KEYS.invoiceNumberPrefix),
+          readSetting(HF_TOKEN_KEY),
         ]);
         if (cancelled) return;
 
@@ -71,6 +84,7 @@ export function SettingsPage(): React.JSX.Element {
           defaultCurrency: currency ?? DEFAULT_SETTINGS.defaultCurrency,
           defaultTaxRateBps: Number.isFinite(parsedTaxRate) ? parsedTaxRate : 0,
           invoiceNumberPrefix: prefix ?? DEFAULT_SETTINGS.invoiceNumberPrefix,
+          hfToken: hfToken ?? DEFAULT_SETTINGS.hfToken,
         });
       } catch (error) {
         if (!cancelled) {
@@ -110,6 +124,10 @@ export function SettingsPage(): React.JSX.Element {
         window.api.invoke('settings:set', {
           key: SETTINGS_KEYS.invoiceNumberPrefix,
           value: settings.invoiceNumberPrefix,
+        }),
+        window.api.invoke('settings:set', {
+          key: HF_TOKEN_KEY,
+          value: settings.hfToken.trim(),
         }),
       ]);
       setStatus({ kind: 'success', message: 'Settings saved.' });
@@ -179,6 +197,24 @@ export function SettingsPage(): React.JSX.Element {
             isDisabled={isLoading}
             onChange={(value) => {
               setSettings((prev) => ({ ...prev, invoiceNumberPrefix: value }));
+            }}
+          />
+          {/*
+            Optional on purpose: every model in the catalog downloads without a
+            token. This is only for gated or private repos, where Hugging Face
+            answers 401/403 until a token from an account that accepted the
+            licence is sent.
+          */}
+          <TextInput
+            label="Hugging Face access token"
+            type="password"
+            isOptional
+            description="Only needed for gated or private model repos. Leave empty otherwise. Stored locally in the app database, in plain text."
+            placeholder="hf_..."
+            value={settings.hfToken}
+            isDisabled={isLoading}
+            onChange={(value) => {
+              setSettings((prev) => ({ ...prev, hfToken: value }));
             }}
           />
         </FormLayout>

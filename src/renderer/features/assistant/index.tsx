@@ -59,7 +59,7 @@ export function AssistantPage(): React.JSX.Element {
   const hasModel = assistant.activeModelId !== null;
   const activeRecord =
     assistant.readyModels.find((record) => record.id === assistant.activeModelId) ?? null;
-  const activeSmokeTest = activeRecord ? readSmokeTest(activeRecord.error) : null;
+  const activeSmokeTest = activeRecord ? readSmokeTest(activeRecord) : null;
 
   return (
     <HStack gap={0} height="100%">
@@ -85,7 +85,7 @@ export function AssistantPage(): React.JSX.Element {
               placeholder="Choose a model"
               options={assistant.readyModels.map((record) => ({
                 value: record.id,
-                label: `${record.id} · ${describeSmokeTest(readSmokeTest(record.error))}`,
+                label: `${record.id} · ${describeSmokeTest(readSmokeTest(record))}`,
               }))}
               value={assistant.activeModelId ?? undefined}
               onChange={(value) => {

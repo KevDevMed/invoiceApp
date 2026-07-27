@@ -10,15 +10,13 @@
  *
  * The model is unloaded in a `finally`, always, including on timeout.
  *
- * Persistence: the schema is frozen and `models` has no column for this, so the
- * record is serialised into `models.error`, which is `NULL` for every `ready`
- * row (`markReady` clears it). `readSmokeTest` and `downloadErrorOf` are the two
- * accessors that keep the two meanings apart — see the piece report.
+ * Persistence: `models.smoke_test`, its own column since migration 002.
+ * `models.error` means "the download failed" and nothing else.
  */
 
 import type { Db } from '../../db/client';
-import type { ModelRecord } from '../../shared/types';
 import type { LlmRuntime } from './runtime';
+import { clearSmokeTestRecord } from './store';
 
 /** Below this, a model is technically working but painful to use. */
 export const SLOW_TOKENS_PER_SECOND = 5;
@@ -36,7 +34,7 @@ export const SMOKE_TEST_CONTEXT_SIZE = 512;
 export const SMOKE_TEST_MAX_TOKENS = 32;
 export const SMOKE_TEST_TIMEOUT_MS = 180_000;
 
-/** Keeps the serialised record comfortably inside `models.error`'s 4000-char budget. */
+/** Keeps the serialised record comfortably inside the stored 4000-char budget. */
 const MAX_STORED_TEXT_CHARS = 600;
 const MAX_STORED_ERROR_CHARS = 1200;
 
@@ -44,7 +42,7 @@ export type SmokeTestVerdict = 'pass' | 'slow' | 'fail';
 export type SmokeTestFailureKind = 'timeout' | 'out_of_memory' | 'no_output' | 'error';
 
 export interface SmokeTestRecord {
-  /** Discriminator that tells a smoke-test payload from a download error string. */
+  /** Kept so an already-stored record still decodes, and as a sanity check. */
   readonly kind: 'smokeTest';
   readonly modelId: string;
   readonly verdict: SmokeTestVerdict;
@@ -267,14 +265,14 @@ export async function runSmokeTest(options: SmokeTestOptions): Promise<SmokeTest
 }
 
 // ---------------------------------------------------------------------------
-// Persistence (into a column that already exists)
+// Persistence
 // ---------------------------------------------------------------------------
 
 export function encodeSmokeTest(record: SmokeTestRecord): string {
   return JSON.stringify(record);
 }
 
-/** Parse a `models.error` value back into a smoke-test record, or null if it is not one. */
+/** Parse a stored `models.smoke_test` value back into a record, or null if there is none. */
 export function decodeSmokeTest(value: string | null): SmokeTestRecord | null {
   if (value === null || value.length === 0 || !value.startsWith('{')) return null;
   try {
@@ -285,22 +283,8 @@ export function decodeSmokeTest(value: string | null): SmokeTestRecord | null {
   }
 }
 
-/** The recorded smoke test for a model row, if it has one. */
-export function readSmokeTest(record: Pick<ModelRecord, 'error'>): SmokeTestRecord | null {
-  return decodeSmokeTest(record.error);
-}
-
-/**
- * The download error for a model row — `null` when the `error` column is holding
- * a smoke-test record instead. Every UI that shows `record.error` must go
- * through this, or a passing test renders as a failed download.
- */
-export function downloadErrorOf(record: Pick<ModelRecord, 'error'>): string | null {
-  return readSmokeTest(record) === null ? record.error : null;
-}
-
 export function saveSmokeTest(db: Db, modelId: string, record: SmokeTestRecord): void {
-  db.prepare('UPDATE models SET error = ?, updated_at = ? WHERE id = ?').run(
+  db.prepare('UPDATE models SET smoke_test = ?, updated_at = ? WHERE id = ?').run(
     encodeSmokeTest(record).slice(0, 4000),
     new Date().toISOString(),
     modelId,
@@ -309,10 +293,7 @@ export function saveSmokeTest(db: Db, modelId: string, record: SmokeTestRecord):
 
 /** Drop a stored result — used when the weights are re-downloaded and the old run no longer applies. */
 export function clearSmokeTest(db: Db, modelId: string): void {
-  db.prepare('UPDATE models SET error = NULL, updated_at = ? WHERE id = ?').run(
-    new Date().toISOString(),
-    modelId,
-  );
+  clearSmokeTestRecord(db, modelId);
 }
 
 /** Short label for the model picker and the model card, e.g. `tested · 12.4 tok/s`. */

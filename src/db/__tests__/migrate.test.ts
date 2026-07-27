@@ -42,7 +42,7 @@ describe('migrate', () => {
 
     expect(result.applied).toEqual(MIGRATIONS.map((m) => m.id));
     expect(result.alreadyApplied).toEqual([]);
-    expect(appliedMigrations(db)).toEqual(['001_init']);
+    expect(appliedMigrations(db)).toEqual(['001_init', '002_model_diagnostics']);
   });
 
   it('creates every table and index the schema promises', () => {
@@ -84,7 +84,7 @@ describe('migrate', () => {
 
     const second = migrate(db);
     expect(second.applied).toEqual([]);
-    expect(second.alreadyApplied).toEqual(['001_init']);
+    expect(second.alreadyApplied).toEqual(['001_init', '002_model_diagnostics']);
 
     const third = migrate(db);
     expect(third.applied).toEqual([]);
@@ -93,7 +93,7 @@ describe('migrate', () => {
     expect(
       db.prepare<[], { c: number }>('SELECT COUNT(*) AS c FROM clients').get()?.c,
     ).toBe(1);
-    expect(appliedMigrations(db)).toEqual(['001_init']);
+    expect(appliedMigrations(db)).toEqual(['001_init', '002_model_diagnostics']);
   });
 
   it('enforces the invoice status CHECK constraint', () => {

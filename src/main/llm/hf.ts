@@ -47,6 +47,13 @@ export interface GgufVariant {
   /** Quant label parsed out of the filename, e.g. `Q4_K_M`. Null when unrecognisable. */
   readonly quant: string | null;
   readonly sizeBytes: number | null;
+  /**
+   * The blob digest the Hub reports for this file (`lfs.oid`, a SHA-256).
+   *
+   * Null for a file the Hub does not report one for. The downloader refuses to
+   * fetch a model it has no expected digest for, so this is not decoration.
+   */
+  readonly sha256: string | null;
   readonly downloadUrl: string;
   /** True for `-00001-of-00003.gguf` style splits, which the downloader cannot handle. */
   readonly isSplit: boolean;
@@ -119,7 +126,7 @@ export function isSplitFile(filename: string): boolean {
 interface HubSibling {
   rfilename?: unknown;
   size?: unknown;
-  lfs?: { size?: unknown } | null;
+  lfs?: { size?: unknown; oid?: unknown; sha256?: unknown } | null;
 }
 
 interface HubModelResponse {
@@ -128,6 +135,14 @@ interface HubModelResponse {
   private?: unknown;
   lastModified?: unknown;
   cardData?: { license?: unknown } | null;
+}
+
+/** A 64-character lowercase hex digest, or null. Nothing else is accepted. */
+function digestOf(sibling: HubSibling): string | null {
+  for (const raw of [sibling.lfs?.oid, sibling.lfs?.sha256]) {
+    if (typeof raw === 'string' && /^[0-9a-f]{64}$/.test(raw)) return raw;
+  }
+  return null;
 }
 
 function sizeOf(sibling: HubSibling): number | null {
@@ -203,6 +218,7 @@ export async function lookupRepo(repoInput: string, options: HfLookupOptions = {
       filename,
       quant: parseQuant(filename),
       sizeBytes: sizeOf(raw),
+      sha256: digestOf(raw),
       downloadUrl: resolved,
       isSplit: false,
     });
@@ -262,4 +278,21 @@ function errorForStatus(status: number, repo: string, hasToken: boolean): HfErro
     default:
       return new HfError(`Hugging Face returned HTTP ${status} for ${repo}.`, 'HTTP_ERROR', status);
   }
+}
+
+/**
+ * The Hub's SHA-256 for one file in a repo, or null when it does not report one.
+ *
+ * This is the same `?blobs=true` call the catalog's digests were taken from, and
+ * it is what lets the downloader refuse a model it has no expected digest for
+ * without restricting downloads to the curated list.
+ */
+export async function lookupFileDigest(
+  repo: string,
+  filename: string,
+  options: HfLookupOptions = {},
+): Promise<string | null> {
+  const info = await lookupRepo(repo, options);
+  const variant = info.variants.find((candidate) => candidate.filename === filename);
+  return variant?.sha256 ?? null;
 }

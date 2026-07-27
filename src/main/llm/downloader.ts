@@ -10,6 +10,16 @@
  * via `rename()` of a fully verified `.part`, so a torn write can leave a
  * partial file but never a partial *model*.
  *
+ * Two rules hold above that shape:
+ *
+ *   - Nothing is downloaded without a known SHA-256, and nothing is renamed into
+ *     place until the `.part` has been hashed and matched. A file that reaches
+ *     the final name has been verified on this machine, and the digest is stored
+ *     so a later boot can tell verified bytes from merely well-sized ones.
+ *   - Redirects are followed by hand, asserting https on every hop before it is
+ *     requested. `redirect: 'follow'` walks an https-to-http redirect silently
+ *     and only lets you complain afterwards.
+ *
  * Every filesystem effect is injectable so the tests can drive the whole thing
  * with a fake `fetch` and a temp directory, and never touch the network.
  */
@@ -31,7 +41,10 @@ import {
   resolveModelPath,
   type CatalogEntry,
 } from './catalog';
+import { lookupFileDigest } from './hf';
 import {
+  clearSmokeTestRecord,
+  clearVerification,
   markDownloading,
   markError,
   markInterrupted,
@@ -71,7 +84,9 @@ export class DownloadError extends Error {
     readonly code:
       | 'INSUFFICIENT_DISK_SPACE'
       | 'CHECKSUM_MISMATCH'
+      | 'DIGEST_UNAVAILABLE'
       | 'HTTP_ERROR'
+      | 'TOO_MANY_REDIRECTS'
       | 'UNSAFE_PATH'
       | 'ALREADY_RUNNING',
   ) {
@@ -92,6 +107,22 @@ export interface DownloaderDeps {
   readonly freeDiskBytes?: (dir: string) => Promise<number | null>;
   /** Minimum gap between progress emissions. ~4 per second by default. */
   readonly throttleMs?: number;
+  /**
+   * The expected SHA-256 for a repo/file pair that is not in the catalog.
+   *
+   * Defaults to the Hub's `?blobs=true` blob digest — the same source the
+   * catalog's own digests came from. Returning null means "no digest can be
+   * obtained", and the download is refused rather than run unverified.
+   */
+  readonly resolveDigest?: (
+    repo: string,
+    filename: string,
+    signal: AbortSignal,
+  ) => Promise<string | null>;
+  /** Hugging Face token, for digest lookups against gated repos. */
+  readonly hfToken?: () => string | null;
+  /** How many transfers may run at once. The rest queue. */
+  readonly maxConcurrentDownloads?: number;
 }
 
 export interface StartDownloadRequest {
@@ -109,6 +140,15 @@ export interface StartedDownload {
 /** Headroom on top of the remaining bytes, so we do not fill the disk exactly. */
 const DISK_SPACE_MARGIN = 1.05;
 
+/** Hops a download may follow before we call it a redirect chain gone wrong. */
+const MAX_REDIRECTS = 5;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function isRedirect(status: number): boolean {
+  return REDIRECT_STATUSES.has(status);
+}
+
 async function defaultFreeDiskBytes(dir: string): Promise<number | null> {
   try {
     const stats = await fs.statfs(dir);
@@ -118,11 +158,31 @@ async function defaultFreeDiskBytes(dir: string): Promise<number | null> {
   }
 }
 
+/** Transfers allowed to run at once. The rest queue rather than share bandwidth. */
+export const DEFAULT_MAX_CONCURRENT_DOWNLOADS = 2;
+
 export class ModelDownloader {
   private readonly deps: Required<Pick<DownloaderDeps, 'now' | 'freeDiskBytes' | 'throttleMs'>> &
     DownloaderDeps;
 
   private readonly active = new Map<string, { controller: AbortController; completion: Promise<DownloadOutcome> }>();
+
+  private readonly maxConcurrent: number;
+
+  /** Transfers holding a slot right now. */
+  private running = 0;
+
+  /** Transfers parked waiting for a slot, in arrival order. */
+  private readonly waiting: Array<{ grant: () => void }> = [];
+
+  /**
+   * Bytes each in-flight transfer still intends to write.
+   *
+   * Without this the free-space check is a race: six downloads each ask "is
+   * there room for me?" against the same untouched free space, all six say yes,
+   * and the disk fills half-way through.
+   */
+  private readonly committedBytes = new Map<string, number>();
 
   constructor(deps: DownloaderDeps) {
     this.deps = {
@@ -131,6 +191,7 @@ export class ModelDownloader {
       freeDiskBytes: deps.freeDiskBytes ?? defaultFreeDiskBytes,
       throttleMs: deps.throttleMs ?? 250,
     };
+    this.maxConcurrent = Math.max(1, deps.maxConcurrentDownloads ?? DEFAULT_MAX_CONCURRENT_DOWNLOADS);
   }
 
   isDownloading(modelId: string): boolean {
@@ -139,6 +200,16 @@ export class ModelDownloader {
 
   activeDownloadIds(): string[] {
     return [...this.active.keys()];
+  }
+
+  /** Transfers actually transferring, as opposed to queued. */
+  runningCount(): number {
+    return this.running;
+  }
+
+  /** Transfers accepted but waiting for a slot. */
+  queuedCount(): number {
+    return this.waiting.length;
   }
 
   /**
@@ -170,7 +241,7 @@ export class ModelDownloader {
     });
 
     const controller = new AbortController();
-    const completion = this.run(modelId, url, target, entry, controller.signal).finally(() => {
+    const completion = this.run(modelId, request, url, target, entry, controller.signal).finally(() => {
       this.active.delete(modelId);
     });
 
@@ -194,6 +265,7 @@ export class ModelDownloader {
 
   private async run(
     modelId: string,
+    request: StartDownloadRequest,
     url: string,
     target: string,
     entry: CatalogEntry | undefined,
@@ -203,29 +275,52 @@ export class ModelDownloader {
     const partPath = `${target}${PART_SUFFIX}`;
     let received = 0;
     let resumed = false;
+    let holdsSlot = false;
 
     try {
+      // Queue behind the concurrency cap before anything is fetched or measured,
+      // so the disk-space arithmetic below sees a stable set of transfers.
+      holdsSlot = await this.acquireSlot(signal);
+      if (!holdsSlot || signal.aborted) {
+        return this.cancelled(db, modelId, await sizeOrZero(partPath), entry?.sizeBytes ?? null);
+      }
+
+      // Nothing is fetched until we know what the bytes are supposed to hash to.
+      const expected = await this.expectedDigest(db, request, entry, signal);
+      const expectedTotal = entry?.sizeBytes ?? null;
+
       await fs.mkdir(path.dirname(target), { recursive: true });
 
+      // A final file may already be sitting there: left by a previous run, or
+      // demoted at boot for never having been verified. Hash it rather than
+      // spend the bandwidth again.
+      const existingFinalBytes = await sizeOrZero(target);
+      if (existingFinalBytes > 0) {
+        if ((await sha256File(target)) === expected) {
+          return this.promote(db, modelId, target, expected, existingFinalBytes, false);
+        }
+        await fs.rm(target, { force: true });
+        clearVerification(db, modelId);
+      }
+
       const already = await sizeOrZero(partPath);
-      const expectedTotal = entry?.sizeBytes ?? null;
 
       if (expectedTotal !== null && already >= expectedTotal) {
         // A `.part` that is already the full size means the previous run died
-        // between the last write and the rename. Verify and promote it.
-        await fs.rename(partPath, target);
-        return await this.finish(db, modelId, target, entry, expectedTotal, true);
+        // between the last write and the verify. Verify and promote it.
+        return await this.finish(db, modelId, partPath, target, expected, entry, already, true);
       }
 
-      await this.assertEnoughDiskSpace(target, (expectedTotal ?? 0) - already);
+      const remaining = (expectedTotal ?? 0) - already;
+      await this.assertEnoughDiskSpace(modelId, target, remaining);
+      this.committedBytes.set(modelId, Math.max(0, remaining));
 
       const headers: Record<string, string> = {};
       if (already > 0) {
         headers.Range = `bytes=${already}-`;
       }
 
-      const response = await this.deps.fetch(url, { headers, signal, redirect: 'follow' });
-      if (response.url) assertHttpsUrl(response.url);
+      const response = await this.fetchFollowingRedirects(url, headers, signal);
 
       if (!response.ok) {
         throw new DownloadError(
@@ -265,8 +360,7 @@ export class ModelDownloader {
         return this.cancelled(db, modelId, received, total);
       }
 
-      await fs.rename(partPath, target);
-      return await this.finish(db, modelId, target, entry, received, resumed);
+      return await this.finish(db, modelId, partPath, target, expected, entry, received, resumed);
     } catch (error) {
       if (isAbortError(error) || signal.aborted) {
         const bytes = await sizeOrZero(partPath);
@@ -288,7 +382,157 @@ export class ModelDownloader {
         true,
       );
       return { modelId, status: 'error', path: null, bytes: received, error: message, resumed };
+    } finally {
+      this.committedBytes.delete(modelId);
+      if (holdsSlot) this.releaseSlot();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Concurrency
+  // -------------------------------------------------------------------------
+
+  /**
+   * Take a transfer slot, waiting for one if the cap is reached.
+   *
+   * Resolves false when the download was cancelled while queued — the caller
+   * must not release a slot it never held.
+   */
+  private async acquireSlot(signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted) return false;
+    if (this.running < this.maxConcurrent) {
+      this.running += 1;
+      return true;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      const waiter = {
+        grant: () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(true);
+        },
+      };
+      const onAbort = (): void => {
+        const index = this.waiting.indexOf(waiter);
+        if (index >= 0) this.waiting.splice(index, 1);
+        resolve(false);
+      };
+      this.waiting.push(waiter);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /** Hand the slot to the next queued transfer, or give it back to the pool. */
+  private releaseSlot(): void {
+    const next = this.waiting.shift();
+    if (next) next.grant();
+    else this.running -= 1;
+  }
+
+  // -------------------------------------------------------------------------
+  // Integrity
+  // -------------------------------------------------------------------------
+
+  /**
+   * The SHA-256 these bytes must hash to, or a refusal.
+   *
+   * Catalog entries carry their digest. Anything else — and `llm:download` takes
+   * a free-form repo and filename from the renderer — is looked up against the
+   * Hub blob API, the same source the catalog's digests came from. No digest, no
+   * download: an unverified GGUF ends up in llama.cpp's native parser, and that
+   * is not a place to send bytes nobody vouched for.
+   */
+  private async expectedDigest(
+    db: Db,
+    request: StartDownloadRequest,
+    entry: CatalogEntry | undefined,
+    signal: AbortSignal,
+  ): Promise<string> {
+    if (entry?.sha256) return entry.sha256;
+
+    const resolve =
+      this.deps.resolveDigest ??
+      ((repo, filename, abort) =>
+        lookupFileDigest(repo, filename, {
+          token: this.deps.hfToken?.() ?? null,
+          signal: abort,
+        }));
+
+    let digest: string | null;
+    try {
+      digest = await resolve(request.repo, request.filename, signal);
+    } catch (error) {
+      if (isAbortError(error) || signal.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new DownloadError(
+        `Could not obtain a SHA-256 for ${request.repo}/${request.filename}: ${message}. Refusing to download weights that cannot be verified.`,
+        'DIGEST_UNAVAILABLE',
+      );
+    }
+
+    if (digest === null || !/^[0-9a-f]{64}$/.test(digest)) {
+      throw new DownloadError(
+        `No SHA-256 is published for ${request.repo}/${request.filename}, so the download cannot be verified. Refusing to download it.`,
+        'DIGEST_UNAVAILABLE',
+      );
+    }
+
+    // Store what we will check against, so the UI and a later boot can see it.
+    upsertModel(db, {
+      id: deriveModelId(request.repo, request.filename),
+      repo: request.repo,
+      filename: request.filename,
+      sha256: digest,
+      status: 'downloading',
+    });
+    return digest;
+  }
+
+  /**
+   * Follow redirects by hand, asserting https on every hop *before* requesting it.
+   *
+   * `redirect: 'follow'` would issue the plaintext request first and only then
+   * let us look at `response.url`, which is one plaintext request too late.
+   */
+  private async fetchFollowingRedirects(
+    initialUrl: string,
+    headers: Record<string, string>,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    let url = assertHttpsUrl(initialUrl);
+    const seen = new Set<string>([url]);
+
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+      const response = await this.deps.fetch(url, { headers, signal, redirect: 'manual' });
+
+      const location = isRedirect(response.status) ? response.headers.get('location') : null;
+      if (location === null) {
+        // Not a redirect. `response.url` is checked too, in case the fetch
+        // implementation resolved something on our behalf.
+        if (response.url) assertHttpsUrl(response.url);
+        return response;
+      }
+
+      let next: string;
+      try {
+        next = new URL(location, url).toString();
+      } catch {
+        throw new DownloadError(`Redirect to an unreadable location: ${location}`, 'HTTP_ERROR');
+      }
+
+      // Throws before the next request is made, which is the whole point.
+      next = assertHttpsUrl(next);
+      if (seen.has(next)) {
+        throw new DownloadError(`Redirect loop while downloading: ${next}`, 'TOO_MANY_REDIRECTS');
+      }
+      seen.add(next);
+      url = next;
+    }
+
+    throw new DownloadError(
+      `Gave up after ${MAX_REDIRECTS} redirects starting at ${initialUrl}.`,
+      'TOO_MANY_REDIRECTS',
+    );
   }
 
   private async pump(
@@ -355,38 +599,62 @@ export class ModelDownloader {
     return received;
   }
 
+  /**
+   * Verify the `.part`, then — and only then — rename it into place.
+   *
+   * Hashing before the rename closes the crash window the other order left open:
+   * a rename that lands and a process that dies before the checksum runs leaves
+   * a final-named file of exactly the right size that nothing ever hashed, and
+   * boot reconciliation used to call that `ready`.
+   */
   private async finish(
     db: Db,
     modelId: string,
+    partPath: string,
     target: string,
+    expectedSha256: string,
     entry: CatalogEntry | undefined,
     bytes: number,
     resumed: boolean,
   ): Promise<DownloadOutcome> {
-    if (entry?.sha256) {
-      const actual = await sha256File(target);
-      if (actual !== entry.sha256) {
-        await fs.rm(target, { force: true });
-        const message = `Checksum mismatch for ${modelId}: expected ${entry.sha256}, got ${actual}`;
-        markError(db, modelId, message);
-        this.emitProgress(
-          {
-            modelId,
-            receivedBytes: bytes,
-            totalBytes: entry.sizeBytes,
-            bytesPerSecond: 0,
-            etaSeconds: null,
-            status: 'error',
-            error: message,
-          },
-          true,
-        );
-        return { modelId, status: 'error', path: null, bytes, error: message, resumed };
-      }
+    const actual = await sha256File(partPath);
+    if (actual !== expectedSha256) {
+      // The bad bytes go, and no file ever appears under the final name.
+      await fs.rm(partPath, { force: true });
+      const message = `Checksum mismatch for ${modelId}: expected ${expectedSha256}, got ${actual}`;
+      markError(db, modelId, message);
+      this.emitProgress(
+        {
+          modelId,
+          receivedBytes: bytes,
+          totalBytes: entry?.sizeBytes ?? null,
+          bytesPerSecond: 0,
+          etaSeconds: null,
+          status: 'error',
+          error: message,
+        },
+        true,
+      );
+      return { modelId, status: 'error', path: null, bytes, error: message, resumed };
     }
 
+    await fs.rename(partPath, target);
     const finalBytes = await sizeOrZero(target);
-    markReady(db, modelId, target, finalBytes);
+    return this.promote(db, modelId, target, expectedSha256, finalBytes, resumed);
+  }
+
+  /** Record verified weights and announce them. The only path to `ready`. */
+  private promote(
+    db: Db,
+    modelId: string,
+    target: string,
+    verifiedSha256: string,
+    finalBytes: number,
+    resumed: boolean,
+  ): DownloadOutcome {
+    markReady(db, modelId, target, finalBytes, verifiedSha256);
+    // Any earlier smoke test described bytes that are no longer the ones here.
+    clearSmokeTestRecord(db, modelId);
     this.emitProgress(
       {
         modelId,
@@ -419,15 +687,28 @@ export class ModelDownloader {
     return { modelId, status: 'cancelled', path: null, bytes, error: null, resumed: false };
   }
 
-  private async assertEnoughDiskSpace(target: string, remainingBytes: number): Promise<void> {
+  /**
+   * Refuse a transfer the disk cannot hold — counting what the other in-flight
+   * transfers have already promised to write, not just this one's share.
+   */
+  private async assertEnoughDiskSpace(
+    modelId: string,
+    target: string,
+    remainingBytes: number,
+  ): Promise<void> {
     if (remainingBytes <= 0) return;
     const free = await this.deps.freeDiskBytes(path.dirname(target));
     if (free === null) return;
 
-    const needed = Math.ceil(remainingBytes * DISK_SPACE_MARGIN);
+    let committedElsewhere = 0;
+    for (const [id, bytes] of this.committedBytes) {
+      if (id !== modelId) committedElsewhere += bytes;
+    }
+
+    const needed = Math.ceil((remainingBytes + committedElsewhere) * DISK_SPACE_MARGIN);
     if (free < needed) {
       throw new DownloadError(
-        `Not enough free disk space: ${formatBytes(needed)} needed, ${formatBytes(free)} available.`,
+        `Not enough free disk space: ${formatBytes(needed)} needed${committedElsewhere > 0 ? ` (including ${formatBytes(committedElsewhere)} already committed by other downloads)` : ''}, ${formatBytes(free)} available.`,
         'INSUFFICIENT_DISK_SPACE',
       );
     }

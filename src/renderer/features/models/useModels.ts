@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import type { ModelRecord } from '../../../shared/types';
+
 import {
   checkSupport as checkSupportCall,
   fetchCatalog,
@@ -21,6 +21,7 @@ import {
   runSmokeTest as runSmokeTestCall,
   variantKey,
   type HfRepoView,
+  type LocalModel,
   type SmokeTestView,
   type SupportVerdict,
   type SystemInfoView,
@@ -62,7 +63,7 @@ export const ACTIVE_MODEL_SETTING_KEY = 'llm.activeModelId';
 export interface ModelsState {
   readonly catalog: CatalogEntryView[];
   readonly groups: CatalogGroup[];
-  readonly local: ModelRecord[];
+  readonly local: LocalModel[];
   readonly progress: Record<string, DownloadState>;
   readonly activeModelId: string | null;
   readonly isLoading: boolean;
@@ -111,7 +112,7 @@ function message(error: unknown): string {
 
 export function useModels(): ModelsState {
   const [catalog, setCatalog] = useState<CatalogEntryView[]>([]);
-  const [local, setLocal] = useState<ModelRecord[]>([]);
+  const [local, setLocal] = useState<LocalModel[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadState>>({});
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
