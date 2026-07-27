@@ -246,6 +246,144 @@ export async function lookupRepo(repoInput: string, options: HfLookupOptions = {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Repo search
+// ---------------------------------------------------------------------------
+
+export interface HfSearchHit {
+  readonly repo: string;
+  /** All-time downloads as the Hub reports them. Null when it does not. */
+  readonly downloads: number | null;
+  readonly likes: number | null;
+  readonly gated: boolean;
+  readonly isPrivate: boolean;
+  readonly lastModified: string | null;
+  readonly tags: readonly string[];
+}
+
+export interface HfSearchOptions extends HfLookupOptions {
+  /** Repos to ask the Hub for. The Hub's own ceiling is much higher; ours is not. */
+  readonly limit?: number;
+  /** Extra `filter=` tags, ANDed with `gguf`. */
+  readonly tags?: readonly string[];
+  /**
+   * Hub pipeline tag. Defaults to `text-generation`; pass null for no filter.
+   *
+   * Without it the top GGUF repos by downloads are embedding models —
+   * `mxbai-embed-large-v1`, `embeddinggemma-300M` — which produce vectors, not
+   * replies, and would be a confusing first screen in a chat assistant.
+   */
+  readonly pipelineTag?: string | null;
+}
+
+export const DEFAULT_SEARCH_LIMIT = 30;
+export const MAX_SEARCH_LIMIT = 100;
+export const DEFAULT_PIPELINE_TAG = 'text-generation';
+
+interface HubSearchEntry {
+  id?: unknown;
+  downloads?: unknown;
+  likes?: unknown;
+  gated?: unknown;
+  private?: unknown;
+  lastModified?: unknown;
+  tags?: unknown;
+}
+
+function integerOr(value: unknown, fallback: number | null): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Search the Hub for repos that carry GGUF weights.
+ *
+ * One request, no per-file detail: the Hub's list endpoint reports repo-level
+ * metadata only, so sizes still come from `lookupRepo`. `filter=gguf` is the
+ * Hub's own library tag and is what keeps safetensors-only repos — which this
+ * app cannot run — out of the results entirely. `pipeline_tag=text-generation`
+ * does the same for embedding models, which otherwise take the top spots by
+ * download count and cannot hold a conversation.
+ *
+ * An empty query is legitimate and means "the most downloaded GGUF repos",
+ * which is the sensible first screen for someone who does not know what to type.
+ *
+ * Repo ids that our own allow-list would refuse are dropped rather than
+ * returned: offering a row that cannot be looked up or downloaded is worse than
+ * a shorter list.
+ */
+export async function searchRepos(
+  query: string,
+  options: HfSearchOptions = {},
+): Promise<HfSearchHit[]> {
+  const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
+  const limit = Math.min(Math.max(options.limit ?? DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
+
+  const params = new URLSearchParams();
+  const trimmed = query.trim();
+  if (trimmed.length > 0) params.set('search', trimmed);
+  params.append('filter', 'gguf');
+  for (const tag of options.tags ?? []) params.append('filter', tag);
+  const pipelineTag = options.pipelineTag === undefined ? DEFAULT_PIPELINE_TAG : options.pipelineTag;
+  if (pipelineTag !== null) params.set('pipeline_tag', pipelineTag);
+  params.set('sort', 'downloads');
+  params.set('direction', '-1');
+  params.set('limit', String(limit));
+
+  const headers: Record<string, string> = { accept: 'application/json' };
+  if (options.token && options.token.length > 0) {
+    headers.authorization = `Bearer ${options.token}`;
+  }
+
+  const response = await doFetch(`${HF_API_ORIGIN}/api/models?${params.toString()}`, {
+    method: 'GET',
+    headers,
+    signal: options.signal,
+  });
+
+  if (!response.ok) {
+    throw errorForStatus(response.status, trimmed.length > 0 ? trimmed : 'the model index', Boolean(options.token));
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new HfError('Hugging Face returned something that is not JSON for the search.', 'BAD_RESPONSE');
+  }
+
+  if (!Array.isArray(payload)) {
+    throw new HfError('Hugging Face returned no result list for the search.', 'BAD_RESPONSE');
+  }
+
+  const hits: HfSearchHit[] = [];
+  // The Hub can repeat a repo across the page; a duplicate would cost a second
+  // listing and a second header read for the same files.
+  const seen = new Set<string>();
+  for (const raw of payload as HubSearchEntry[]) {
+    const id = raw?.id;
+    if (typeof id !== 'string') continue;
+    let repo: string;
+    try {
+      repo = assertRepoId(id);
+    } catch {
+      continue;
+    }
+    if (seen.has(repo)) continue;
+    seen.add(repo);
+    hits.push({
+      repo,
+      downloads: integerOr(raw.downloads, null),
+      likes: integerOr(raw.likes, null),
+      gated: raw.gated === true || typeof raw.gated === 'string',
+      isPrivate: raw.private === true,
+      lastModified: typeof raw.lastModified === 'string' ? raw.lastModified : null,
+      tags: Array.isArray(raw.tags) ? raw.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+    });
+  }
+
+  return hits;
+}
+
 /** Distinct, actionable messages — 401, 403 and 404 mean three different fixes. */
 function errorForStatus(status: number, repo: string, hasToken: boolean): HfError {
   switch (status) {

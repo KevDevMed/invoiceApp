@@ -113,6 +113,45 @@ export interface HfRepoView {
   readonly skippedSplitFiles: readonly string[];
 }
 
+/**
+ * One row of "models that run on this machine".
+ *
+ * `support` is null only for a file the run did not have a header-check budget
+ * for; its verdict is GREY and the row can still be checked individually.
+ */
+export interface DiscoveredVariantView {
+  readonly repo: string;
+  readonly filename: string;
+  readonly quant: string | null;
+  readonly sizeBytes: number | null;
+  readonly sha256: string | null;
+  readonly license: string | null;
+  readonly gated: boolean;
+  readonly isPrivate: boolean;
+  readonly downloads: number | null;
+  readonly likes: number | null;
+  readonly verdict: SupportVerdict;
+  readonly support: VariantSupportView | null;
+  readonly reason: string;
+}
+
+export interface DiscoveryView {
+  readonly query: string;
+  readonly contextSize: number | null;
+  readonly usableMemoryBytes: number | null;
+  readonly models: readonly DiscoveredVariantView[];
+  readonly reposFound: number;
+  readonly reposInspected: number;
+  readonly variantsFound: number;
+  readonly variantsTooBig: number;
+  readonly variantsDeduplicated: number;
+  readonly variantsProjectors: number;
+  readonly variantsChecked: number;
+  readonly variantsUnchecked: number;
+  readonly warnings: readonly string[];
+  readonly checkedAt: string;
+}
+
 export type SmokeTestVerdict = 'pass' | 'slow' | 'fail';
 
 export interface SmokeTestView {
@@ -139,6 +178,7 @@ interface CatalogOpResponse extends CatalogResponse {
   readonly systemInfo?: SystemInfoView;
   readonly support?: VariantSupportView;
   readonly hf?: HfRepoView;
+  readonly discovery?: DiscoveryView;
   readonly smokeTest?: SmokeTestView;
 }
 
@@ -183,6 +223,21 @@ export async function lookupHfRepo(repo: string): Promise<HfRepoView> {
   const response = await invokeOp({ op: 'hfLookup', repo });
   if (!response.hf) throw new Error('Main returned no repository information.');
   return response.hf;
+}
+
+export interface DiscoverArgs {
+  readonly query?: string;
+  readonly ctxSize?: number;
+  readonly maxRepos?: number;
+  readonly maxVariantsPerRepo?: number;
+  readonly maxChecks?: number;
+  readonly refresh?: boolean;
+}
+
+export async function discoverModels(args: DiscoverArgs = {}): Promise<DiscoveryView> {
+  const response = await invokeOp({ op: 'discover', ...args });
+  if (!response.discovery) throw new Error('Main returned no discovery result.');
+  return response.discovery;
 }
 
 export async function runSmokeTest(modelId: string): Promise<SmokeTestView> {

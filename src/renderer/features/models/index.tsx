@@ -3,7 +3,7 @@
  *
  * The flow this page implements, in order:
  *
- *   browse the catalog or paste a Hugging Face repo
+ *   browse the catalog, search for what this machine can run, or paste a repo
  *     -> a per-quant compatibility verdict, computed before anything downloads
  *     -> download, with progress / pause / resume / cancel
  *     -> the model appears under "Installed models"
@@ -35,6 +35,7 @@ import { Section } from '@astryxdesign/core/Section';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, VStack } from '@astryxdesign/core/Stack';
 import { StatusDot } from '@astryxdesign/core/StatusDot';
+import { Switch } from '@astryxdesign/core/Switch';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
@@ -49,7 +50,15 @@ import {
   type SupportVerdict,
   type VariantSupportView,
 } from './llmExtra';
-import { diskUsageBytes, smokeTestStatus, transferState, verdictStatus } from './modelRows';
+import {
+  countByFit,
+  diskUsageBytes,
+  fitsMachine,
+  groupDiscovered,
+  smokeTestStatus,
+  transferState,
+  verdictStatus,
+} from './modelRows';
 import {
   formatBytes,
   formatDuration,
@@ -121,6 +130,8 @@ export function ModelsPage(): React.JSX.Element {
       <InstalledSection models={models} />
 
       <CatalogSection models={models} localByFile={localByFile} onDownload={startDownload} />
+
+      <DiscoverSection models={models} localByFile={localByFile} onDownload={startDownload} />
 
       <RepoLookupSection models={models} localByFile={localByFile} onDownload={startDownload} />
 
@@ -506,6 +517,192 @@ function CatalogSection({ models, localByFile, onDownload }: DownloadableProps):
       )}
     </PageSection>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Discovery: what runs on this machine
+// ---------------------------------------------------------------------------
+
+/**
+ * The answer to "what can I actually run?", which is where most people start.
+ *
+ * Main does the ranking; this renders it and says plainly what was left out.
+ * Every count the sweep dropped — too big, extra quants of the same repo,
+ * unverified past the header-read ceiling — is printed, because a list that
+ * silently truncated would read as the complete answer.
+ */
+function DiscoverSection({ models, localByFile, onDownload }: DownloadableProps): React.JSX.Element {
+  const [query, setQuery] = useState('');
+  const [onlyFits, setOnlyFits] = useState(true);
+
+  const discovery = models.discovery;
+  const counts = discovery ? countByFit(discovery.models.map((model) => model.verdict)) : null;
+  const visible = discovery
+    ? discovery.models.filter((model) => !onlyFits || fitsMachine(model.verdict))
+    : [];
+  const groups = groupDiscovered(visible);
+
+  const submit = (): void => {
+    void models.discover(query.trim());
+  };
+
+  return (
+    <PageSection
+      title="Find models for this machine"
+      description="Searches Hugging Face for GGUF models, throws out anything too big for your memory, and reads the headers of what is left to size the KV cache. Leave the box empty for the most downloaded ones."
+    >
+      <VStack gap={3}>
+        <HStack gap={2} align="end" wrap="wrap">
+          <TextInput
+            label="What are you looking for"
+            value={query}
+            onChange={setQuery}
+            placeholder="qwen3 instruct"
+            hasClear
+            isLoading={models.isDiscovering}
+          />
+          <Button
+            label={models.isDiscovering ? 'Checking…' : 'Find models'}
+            variant="primary"
+            isLoading={models.isDiscovering}
+            onClick={submit}
+            tooltip="One search, a listing per repo, and a 4 MB header read per candidate"
+          />
+          {discovery ? (
+            <Button label="Clear" variant="ghost" onClick={models.clearDiscovery} />
+          ) : null}
+        </HStack>
+
+        {models.system && models.system.totalRamBytes === null ? (
+          <Banner
+            status="warning"
+            title="Hardware detection failed"
+            description="Memory could not be measured on this machine, so nothing can be ranked against it. Every result will say “not checked”."
+          />
+        ) : null}
+
+        {models.discoveryError ? (
+          <Banner
+            status="error"
+            title="Could not search Hugging Face"
+            description={models.discoveryError}
+          />
+        ) : null}
+
+        {models.isDiscovering ? (
+          <HStack gap={2} align="center">
+            <Spinner label="Searching Hugging Face" size="sm" />
+            <Text type="supporting">
+              Searching, listing repos and reading model headers. This takes a few seconds.
+            </Text>
+          </HStack>
+        ) : null}
+
+        {discovery && counts ? (
+          <VStack gap={2}>
+            <HStack gap={2} align="center" wrap="wrap">
+              <Badge
+                variant={counts.fits > 0 ? 'success' : 'neutral'}
+                label={`${counts.fits} run here`}
+              />
+              {counts.tooBig > 0 ? (
+                <Badge variant="neutral" label={`${counts.tooBig} too big`} />
+              ) : null}
+              {counts.unknown > 0 ? (
+                <Badge variant="neutral" label={`${counts.unknown} not checked`} />
+              ) : null}
+              <Switch
+                label="Only show what runs here"
+                value={onlyFits}
+                onChange={setOnlyFits}
+              />
+            </HStack>
+
+            <Text type="supporting" display="block">
+              Searched {discovery.reposFound} repo
+              {discovery.reposFound === 1 ? '' : 's'}, listed {discovery.reposInspected}, found{' '}
+              {discovery.variantsFound} file{discovery.variantsFound === 1 ? '' : 's'}, verified{' '}
+              {discovery.variantsChecked}
+              {discovery.usableMemoryBytes === null
+                ? '. Usable memory is unknown, so nothing was filtered by size.'
+                : ` against ${formatGiB(discovery.usableMemoryBytes)} of usable memory.`}
+              {discovery.variantsTooBig > 0
+                ? ` ${discovery.variantsTooBig} file${discovery.variantsTooBig === 1 ? ' was' : 's were'} bigger than that before any KV cache and never checked.`
+                : ''}
+              {discovery.variantsDeduplicated > 0
+                ? ` ${discovery.variantsDeduplicated} extra quant${discovery.variantsDeduplicated === 1 ? '' : 's'} of the same models were skipped — open the repo below to see them all.`
+                : ''}
+              {discovery.variantsProjectors > 0
+                ? ` ${discovery.variantsProjectors} mmproj file${discovery.variantsProjectors === 1 ? ' is a' : 's are'} multimodal projector${discovery.variantsProjectors === 1 ? '' : 's'}, not model${discovery.variantsProjectors === 1 ? '' : 's'}, and were left out.`
+                : ''}
+            </Text>
+
+            {discovery.warnings.map((warning) => (
+              <Text key={warning} type="supporting" display="block">
+                {warning}
+              </Text>
+            ))}
+          </VStack>
+        ) : null}
+
+        {discovery && groups.length === 0 && !models.isDiscovering ? (
+          <EmptyState
+            title={onlyFits ? 'Nothing here runs on this machine' : 'No GGUF models matched'}
+            description={
+              onlyFits && discovery.models.length > 0
+                ? 'Every result needs more memory than this machine has usable. Turn off the filter to see them, or search for a smaller model — try "1.5b" or "3b".'
+                : 'Try a different search, or paste a repo id below.'
+            }
+            headingLevel={3}
+            isCompact
+          />
+        ) : null}
+
+        {groups.map((group) => (
+          <VStack key={group.repo} gap={2} paddingBlock={2}>
+            <HStack gap={2} align="center" wrap="wrap">
+              <Text weight="semibold">{group.repo}</Text>
+              {group.license ? <Badge variant="neutral" label={group.license} /> : null}
+              {group.gated ? <Badge variant="warning" label="Gated" /> : null}
+              {group.isPrivate ? <Badge variant="warning" label="Private" /> : null}
+              {group.downloads !== null ? (
+                <Text type="supporting">{formatCount(group.downloads)} downloads</Text>
+              ) : null}
+            </HStack>
+
+            <List hasDividers density="compact">
+              {group.models.map((model) => {
+                const variant: Variant = {
+                  repo: model.repo,
+                  filename: model.filename,
+                  quant: model.quant,
+                  sizeBytes: model.sizeBytes,
+                  description: model.reason,
+                };
+                return (
+                  <VariantRow
+                    key={model.filename}
+                    models={models}
+                    variant={variant}
+                    record={localByFile.get(variantKey(model.repo, model.filename)) ?? null}
+                    onDownload={onDownload}
+                  />
+                );
+              })}
+            </List>
+            <Divider />
+          </VStack>
+        ))}
+      </VStack>
+    </PageSection>
+  );
+}
+
+/** Download counts run to seven figures; the exact number is noise. */
+function formatCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
 }
 
 // ---------------------------------------------------------------------------
