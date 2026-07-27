@@ -663,7 +663,14 @@ jobs:
           security set-keychain-settings -lut 3600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           # THE search-list call. Without it nothing below can find the identity.
-          security list-keychains -d user -s "${SEARCH_LIST[@]}" "$KEYCHAIN"
+          #
+          # `${SEARCH_LIST[@]+"${SEARCH_LIST[@]}"}` rather than a bare
+          # `"${SEARCH_LIST[@]}"`: GitHub's macOS runners ship Bash 3.2.57, where
+          # expanding an EMPTY array trips `set -u` as an unbound variable. That
+          # was fixed in Bash 4.4, which the runners do not have. The `+`
+          # alternate-value form expands to nothing when the array is unset or
+          # empty and to the quoted elements otherwise, on every Bash version.
+          security list-keychains -d user -s ${SEARCH_LIST[@]+"${SEARCH_LIST[@]}"} "$KEYCHAIN"
           echo "keychain search list is now:"
           security list-keychains -d user
 
@@ -865,14 +872,19 @@ jobs:
           SEARCH_LIST_FILE="$RUNNER_TEMP/keychain-search-list.txt"
           rm -f "$RUNNER_TEMP/dmg-signing.p12"
           if [ -f "$SEARCH_LIST_FILE" ]; then
+            # SEARCH_LIST_COUNT rather than `${#SEARCH_LIST[@]}`: same Bash 3.2
+            # empty-array/`set -u` defect as the signing step above. A plain
+            # counter is version-proof.
             SEARCH_LIST=()
+            SEARCH_LIST_COUNT=0
             while IFS= read -r KC; do
               if [ -n "$KC" ] && [ "$KC" != "$KEYCHAIN" ]; then
                 SEARCH_LIST+=("$KC")
+                SEARCH_LIST_COUNT=$((SEARCH_LIST_COUNT + 1))
               fi
             done < "$SEARCH_LIST_FILE"
-            if [ "${#SEARCH_LIST[@]}" -gt 0 ]; then
-              security list-keychains -d user -s "${SEARCH_LIST[@]}"
+            if [ "$SEARCH_LIST_COUNT" -gt 0 ]; then
+              security list-keychains -d user -s ${SEARCH_LIST[@]+"${SEARCH_LIST[@]}"}
             fi
             rm -f "$SEARCH_LIST_FILE"
           fi
