@@ -54,7 +54,7 @@ describe('document outline and metadata', () => {
   it('has a non-empty title', () => {
     const title = html.match(/<title>([\s\S]*?)<\/title>/i);
     expect(title).not.toBeNull();
-    expect(title?.[1].trim().length ?? 0).toBeGreaterThan(0);
+    expect(title?.[1]?.trim().length ?? 0).toBeGreaterThan(0);
   });
 
   it('has a non-empty meta description', () => {
@@ -100,7 +100,9 @@ describe('images', () => {
     expect(referenced.length).toBeGreaterThan(0);
 
     for (const name of referenced) {
-      const onDisk = path.join(landingDir, 'assets', name);
+      expect(name, 'the file name capture group should have matched').toBeDefined();
+      // `<unmatched>` can never exist on disk, so a missing capture still fails below.
+      const onDisk = path.join(landingDir, 'assets', name ?? '<unmatched>');
       expect(fs.existsSync(onDisk), `${name} should exist under preview/landing/assets/`).toBe(
         true,
       );
