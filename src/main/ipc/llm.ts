@@ -26,6 +26,7 @@ import {
   IPC_CONTRACT,
   type IpcEventChannel,
   type IpcEventPayload,
+  type IpcResponse,
 } from '../../shared/ipc-contract';
 import type { ChatMessage } from '../../shared/types';
 import {
@@ -35,6 +36,18 @@ import {
   resolveModelPath,
 } from '../llm/catalog';
 import { ModelDownloader, removeLocalModel, type DownloadProgress } from '../llm/downloader';
+import {
+  CatalogRequestSchema,
+  CheckSupportRequest,
+  HF_TOKEN_SETTING_KEY,
+  HfLookupRequest,
+  SmokeTestRequest,
+  opOf,
+} from '../llm/extra-channels';
+import { describeHardware, type HardwareProfile } from '../llm/hardware';
+import { lookupRepo, type HfRepoInfo } from '../llm/hf';
+import { SupportService, type VariantSupport } from '../llm/support-service';
+import { runSmokeTest, saveSmokeTest, type SmokeTestRecord } from '../llm/smoke-test';
 import {
   DEFAULT_CONTEXT_SIZE,
   FakeLlmRuntime,
@@ -143,18 +156,10 @@ const pendingToolCalls = new Map<string, ToolCall>();
 export function register(): void {
   reconcileModelsAgainstDisk();
 
-  registerHandler('llm:catalog', IPC_CONTRACT['llm:catalog'].request, () => ({
-    entries: CATALOG.map((entry) => ({
-      id: entry.id,
-      repo: entry.repo,
-      filename: entry.filename,
-      quant: entry.quant,
-      sizeBytes: entry.sizeBytes,
-      // The contract has no license/context/notes fields, so the one-line
-      // summary carries all three.
-      description: describeEntry(entry),
-    })),
-  }));
+  // `llm:catalog` carries an `op` discriminator so the four undeclarable
+  // channels (systemInfo, checkSupport, hfLookup, smokeTest) have somewhere to
+  // live. See `../llm/extra-channels.ts` and the piece report.
+  registerHandler('llm:catalog', CatalogRequestSchema, (payload) => handleCatalogOp(payload));
 
   registerHandler('llm:download', IPC_CONTRACT['llm:download'].request, (payload) => {
     const started = getDownloader().start({
@@ -230,6 +235,127 @@ export function register(): void {
     controller?.abort();
     return { requestId, cancelled: controller !== undefined };
   });
+}
+
+// ---------------------------------------------------------------------------
+// llm:catalog — the multiplexed channel
+// ---------------------------------------------------------------------------
+
+type CatalogResponse = IpcResponse<'llm:catalog'>;
+
+/**
+ * What actually goes over the wire for `llm:catalog`.
+ *
+ * `entries` is the contract's field and is always present (empty for the ops
+ * that are not a catalog listing). Everything else is the extra payload; the
+ * contract does not re-validate responses, so it arrives intact.
+ */
+export interface CatalogOpResponse {
+  readonly entries: CatalogResponse['entries'];
+  readonly systemInfo?: HardwareProfile & { readonly summary: string };
+  readonly support?: VariantSupport;
+  readonly hf?: HfRepoInfo;
+  readonly smokeTest?: SmokeTestRecord;
+}
+
+let supportService: SupportService | null = null;
+
+function getSupportService(): SupportService {
+  supportService ??= new SupportService({ token: readHfToken });
+  return supportService;
+}
+
+function readHfToken(): string | null {
+  try {
+    const row = getDatabase()
+      .prepare<[string], { value: string }>('SELECT value FROM settings WHERE key = ?')
+      .get(HF_TOKEN_SETTING_KEY);
+    const value = row?.value?.trim();
+    return value && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function catalogEntries(): CatalogResponse['entries'] {
+  return CATALOG.map((entry) => ({
+    id: entry.id,
+    repo: entry.repo,
+    filename: entry.filename,
+    quant: entry.quant,
+    sizeBytes: entry.sizeBytes,
+    // The contract has no license/context/notes fields, so the one-line
+    // summary carries all three.
+    description: describeEntry(entry),
+  }));
+}
+
+async function handleCatalogOp(payload: unknown): Promise<CatalogResponse> {
+  const op = opOf(payload);
+
+  switch (op) {
+    case 'catalog':
+      return { entries: catalogEntries() } satisfies CatalogOpResponse as CatalogResponse;
+
+    case 'systemInfo': {
+      const profile = await getSupportService().systemInfo();
+      return {
+        entries: [],
+        systemInfo: { ...profile, summary: describeHardware(profile) },
+      } satisfies CatalogOpResponse as CatalogResponse;
+    }
+
+    case 'checkSupport': {
+      const request = CheckSupportRequest.parse(payload);
+      const support = await getSupportService().check({
+        repo: request.repo,
+        filename: request.filename,
+        sizeBytes: request.sizeBytes ?? null,
+        ctxSize: request.ctxSize,
+        refresh: request.refresh,
+      });
+      return { entries: [], support } satisfies CatalogOpResponse as CatalogResponse;
+    }
+
+    case 'hfLookup': {
+      const request = HfLookupRequest.parse(payload);
+      const hf = await lookupRepo(request.repo, { token: readHfToken() });
+      return { entries: [], hf } satisfies CatalogOpResponse as CatalogResponse;
+    }
+
+    case 'smokeTest': {
+      const request = SmokeTestRequest.parse(payload);
+      const smokeTest = await performSmokeTest(request);
+      return { entries: [], smokeTest } satisfies CatalogOpResponse as CatalogResponse;
+    }
+  }
+}
+
+/**
+ * Run the real thing: load the downloaded weights, generate, measure, unload.
+ *
+ * The runtime holds one model at a time, so this necessarily evicts whatever was
+ * resident — `llm.activeModelId` is cleared to keep both pages honest about it.
+ */
+async function performSmokeTest(request: SmokeTestRequest): Promise<SmokeTestRecord> {
+  const db = getDatabase();
+  const record = getModel(db, request.modelId);
+  if (!record || record.status !== 'ready') {
+    throw new Error(`Model ${request.modelId} is not downloaded yet, so it cannot be tested.`);
+  }
+
+  const modelPath = resolveModelPath(modelsDir(), record.id, record.filename);
+  const result = await runSmokeTest({
+    runtime: getRuntime(),
+    modelId: record.id,
+    modelPath,
+    contextSize: request.contextSize,
+    maxTokens: request.maxTokens,
+  });
+
+  writeSetting(db, ACTIVE_MODEL_KEY, '');
+  saveSmokeTest(db, record.id, result);
+  return result;
 }
 
 /**
