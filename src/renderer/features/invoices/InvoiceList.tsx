@@ -307,7 +307,26 @@ export function InvoiceList(): React.JSX.Element {
             filters={filters}
             onChange={changeFilters}
             placeholder="Add filter"
-            hasClear
+            // The built-in clear-all reports itself as a single token removal
+            // (Tokenizer hands PowerSearch an empty array, PowerSearch throws it
+            // away and recomputes filters minus one index), so one click only
+            // ever drops one token. Own control, one click, every token.
+            hasClear={false}
+            endContent={
+              filters.length > 0 ? (
+                <Button
+                  label="Clear all"
+                  variant="ghost"
+                  size="sm"
+                  onClick={(event) => {
+                    // The tokenizer wrapper refocuses its input on any click
+                    // inside it; keep the click to this button.
+                    event.stopPropagation();
+                    changeFilters([]);
+                  }}
+                />
+              ) : undefined
+            }
             resultCount={invoices === null ? undefined : visible.length}
           />
         </StackItem>
