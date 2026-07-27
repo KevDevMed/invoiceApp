@@ -1,13 +1,19 @@
 /**
- * Invoices feature barrel.
- *
- * OWNER: replace this stub with the real page. Keep the exported name
- * `InvoicesPage` — `src/renderer/routes.tsx` is frozen and imports it from here.
- * Add as many files as you like inside this directory.
+ * Invoices feature barrel. The route table mounts this under `invoices/*`, so
+ * the list, the editor, and the new-invoice form are nested routes here.
  */
 
-import { Placeholder } from '../../pages/Placeholder';
+import { Route, Routes } from 'react-router';
+
+import { InvoiceEditor } from './InvoiceEditor';
+import { InvoiceList } from './InvoiceList';
 
 export function InvoicesPage(): React.JSX.Element {
-  return <Placeholder name="Invoices" />;
+  return (
+    <Routes>
+      <Route index element={<InvoiceList />} />
+      <Route path="new" element={<InvoiceEditor />} />
+      <Route path=":id" element={<InvoiceEditor />} />
+    </Routes>
+  );
 }
