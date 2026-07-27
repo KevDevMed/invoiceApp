@@ -384,6 +384,38 @@ describe('the page routes: landing at /, renderer at /app', () => {
     }
   });
 
+  it('400s an undecodable landing-asset path instead of throwing a 500', async () => {
+    for (const rawPath of ['/landing/assets/%', '/landing/assets/%zz', '/landing/assets/%E0%A4']) {
+      const raw = await rawGet(rawPath);
+
+      // The decisive part: `decodeURIComponent` throws URIError on all three, and
+      // that must land on the existing BAD_PATH branch, not the 500 catch-all.
+      expect(raw.split('\r\n')[0], rawPath).toBe('HTTP/1.1 400 Bad Request');
+      expect(raw.split('\r\n')[0], rawPath).not.toContain('500');
+      expect(raw, rawPath).toContain('application/json; charset=utf-8');
+
+      const body = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')) as Envelope;
+      expect(body.ok, rawPath).toBe(false);
+      expect(body.error?.code, rawPath).toBe('BAD_PATH');
+      expect(body.error?.message, rawPath).toBe('invalid path');
+    }
+  });
+
+  it('400s an undecodable path on the dist static branch too', async () => {
+    // No `/landing/assets/` prefix, no `/app` prefix — this one falls through to
+    // the second `resolveStaticPath` call site, rooted at preview/dist.
+    for (const rawPath of ['/%', '/%zz', '/assets/%E0%A4']) {
+      const raw = await rawGet(rawPath);
+
+      expect(raw.split('\r\n')[0], rawPath).toBe('HTTP/1.1 400 Bad Request');
+      expect(raw.split('\r\n')[0], rawPath).not.toContain('500');
+
+      const body = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')) as Envelope;
+      expect(body.ok, rawPath).toBe(false);
+      expect(body.error?.code, rawPath).toBe('BAD_PATH');
+    }
+  });
+
   it('404s an unmatched path instead of falling back to the renderer', async () => {
     const response = await fetch(`${origin}/nope`);
 

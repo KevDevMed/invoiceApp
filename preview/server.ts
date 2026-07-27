@@ -169,10 +169,20 @@ function sendFile(
 
 /**
  * Map a URL path to a file inside `root`, refusing anything that escapes it.
- * Returns null for a traversal attempt rather than reading the file.
+ * Returns null for a traversal attempt rather than reading the file, and also
+ * for a path that cannot be percent-decoded at all (`/%`, `/%zz`, a truncated
+ * `%E0%A4`) — those fail closed here rather than throwing out of the handler.
  */
 export function resolveStaticPath(root: string, urlPath: string): string | null {
-  const decoded = decodeURIComponent(urlPath);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(urlPath);
+  } catch (error: unknown) {
+    // Only a malformed escape sequence is refused; anything else is a bug and
+    // belongs on the unhandled-failure path.
+    if (error instanceof URIError) return null;
+    throw error;
+  }
   if (decoded.includes('\0')) return null;
   const candidate = path.resolve(root, `.${path.posix.normalize(decoded)}`);
   const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
