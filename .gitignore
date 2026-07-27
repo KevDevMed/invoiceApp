@@ -7,3 +7,13 @@ release/
 .env
 .env.*
 models/
+
+# Test / tooling output
+coverage/
+.vite/
+*.tsbuildinfo
+
+# SQLite working files (the database itself lives under the OS user-data dir)
+*.db
+*.db-shm
+*.db-wal
