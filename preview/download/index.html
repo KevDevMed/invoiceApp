@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Download InvoiceApp for macOS</title>
+    <meta
+      name="description"
+      content="InvoiceApp for macOS — offline-first invoicing with an on-device AI assistant. Free download."
+    />
+    <!--
+      Deliberately self-contained: no bundler, no React, no network font.
+
+      The colours, radii and type scale below are copied from
+      @astryxdesign/theme-neutral's generated theme.css so this page reads as the
+      same product as the app. Importing the component library into a static page
+      would mean shipping the whole renderer just to draw one button.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+
+        --font-body: Figtree, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica,
+          Arial, sans-serif;
+
+        --color-background-body: light-dark(#f1f1f1, #1b1b1b);
+        --color-background-surface: light-dark(#ffffff, #242424);
+        --color-text-primary: light-dark(#171717, #fafafa);
+        --color-text-secondary: light-dark(#737373, #a3a3a3);
+        --color-border: light-dark(#ebebeb, #ffffff1a);
+        --color-border-emphasized: light-dark(#d4d4d4, #525252);
+        --color-border-yellow: light-dark(#e4c279, #c0990e);
+        --color-background-yellow: light-dark(#fdf6e3, #3a2f10);
+        --color-border-green: light-dark(#b2d1ac, #69ad67);
+
+        --radius-inner: 0.375rem;
+        --radius-element: 0.625rem;
+        --radius-container: 0.75rem;
+        --radius-page: 1.75rem;
+
+        --spacing-2: 8px;
+        --spacing-3: 12px;
+        --spacing-4: 16px;
+        --spacing-6: 24px;
+        --spacing-8: 32px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: var(--spacing-8) var(--spacing-4) var(--spacing-8);
+        font-family: var(--font-body);
+        font-size: 1rem;
+        line-height: 1.5;
+        background: var(--color-background-body);
+        color: var(--color-text-primary);
+      }
+
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: var(--spacing-6);
+      }
+
+      h1 {
+        font-size: 2rem;
+        font-weight: 600;
+        line-height: 1.25;
+        margin: 0;
+      }
+
+      h2 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        margin: 0 0 var(--spacing-2);
+      }
+
+      p {
+        margin: 0 0 var(--spacing-3);
+      }
+
+      p:last-child {
+        margin-bottom: 0;
+      }
+
+      .lede {
+        font-size: 1.125rem;
+        color: var(--color-text-secondary);
+        margin: 0;
+      }
+
+      .card {
+        background: var(--color-background-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-container);
+        padding: var(--spacing-6);
+      }
+
+      .card--warning {
+        border-color: var(--color-border-yellow);
+        background: var(--color-background-yellow);
+      }
+
+      .card--privacy {
+        border-color: var(--color-border-green);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--spacing-4);
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.75rem 1.5rem;
+        border-radius: var(--radius-element);
+        border: 1px solid transparent;
+        font-size: 1rem;
+        font-weight: 600;
+        text-decoration: none;
+        background: var(--color-text-primary);
+        color: var(--color-background-surface);
+      }
+
+      .button:hover {
+        opacity: 0.9;
+      }
+
+      .button--secondary {
+        background: transparent;
+        color: var(--color-text-primary);
+        border-color: var(--color-border-emphasized);
+      }
+
+      code,
+      pre {
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+        font-size: 0.875rem;
+      }
+
+      pre {
+        margin: var(--spacing-3) 0 0;
+        padding: var(--spacing-3);
+        overflow-x: auto;
+        background: var(--color-background-surface);
+        border: 1px solid var(--color-border-emphasized);
+        border-radius: var(--radius-inner);
+      }
+
+      ol,
+      ul {
+        margin: 0;
+        padding-left: 1.25rem;
+      }
+
+      li + li {
+        margin-top: var(--spacing-2);
+      }
+
+      dl {
+        margin: 0;
+        display: grid;
+        grid-template-columns: minmax(9rem, auto) 1fr;
+        gap: var(--spacing-2) var(--spacing-4);
+      }
+
+      dt {
+        color: var(--color-text-secondary);
+      }
+
+      dd {
+        margin: 0;
+      }
+
+      footer {
+        color: var(--color-text-secondary);
+        font-size: 0.875rem;
+        text-align: center;
+      }
+
+      a {
+        color: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>InvoiceApp for macOS</h1>
+        <p class="lede">
+          An offline-first invoicing app: clients, invoices, PDF export and reports, stored in a
+          single SQLite file on your own Mac. It also runs a local AI assistant on your machine,
+          with no account and no server.
+        </p>
+      </header>
+
+      <div class="actions">
+        <a class="button" href="https://github.com/KevDevMed/invoiceApp/releases/latest">
+          Download for macOS
+        </a>
+        <a class="button button--secondary" href="/">Open the live browser preview</a>
+      </div>
+
+      <section class="card card--warning">
+        <h2>First launch: macOS will say the app is damaged or unidentified</h2>
+        <p>
+          <strong>This is expected, and the app is fine.</strong> The build is not signed with an
+          Apple Developer certificate, so Gatekeeper quarantines it. You have to let it through
+          once — after that it opens normally.
+        </p>
+        <ol>
+          <li>Drag <strong>InvoiceApp</strong> into your <strong>Applications</strong> folder.</li>
+          <li>
+            <strong>Right-click</strong> (or Control-click) the app icon and choose
+            <strong>Open</strong>. Do not double-click it — double-clicking gives you the dialog
+            with no way through.
+          </li>
+          <li>Click <strong>Open</strong> again in the dialog that appears.</li>
+        </ol>
+        <p style="margin-top: var(--spacing-4)">
+          If macOS still refuses, clear the quarantine flag from Terminal and open the app again:
+        </p>
+        <pre><code>xattr -dr com.apple.quarantine /Applications/InvoiceApp.app</code></pre>
+      </section>
+
+      <section class="card">
+        <h2>System requirements</h2>
+        <dl>
+          <dt>Operating system</dt>
+          <dd>macOS 11 Big Sur or later</dd>
+          <dt>Processor</dt>
+          <dd>Apple Silicon (M1 or newer) or Intel</dd>
+          <dt>Disk space</dt>
+          <dd>
+            About 8 GB free if you want to use the assistant — that is the model weights. The app
+            itself and your invoice database are a few hundred megabytes at most.
+          </dd>
+        </dl>
+      </section>
+
+      <section class="card card--privacy">
+        <h2>What runs where</h2>
+        <ul>
+          <li>
+            <strong>Your data never leaves the machine.</strong> Clients, invoices and settings live
+            in one SQLite file in your user data folder. There is no account, no sync and no
+            telemetry.
+          </li>
+          <li>
+            <strong>The assistant runs on-device.</strong> Model weights are downloaded once from
+            Hugging Face, then every prompt and reply is processed locally by the app's bundled
+            llama.cpp runtime. Nothing you type is sent anywhere.
+          </li>
+          <li>
+            <strong>The browser preview is a different thing.</strong> It is there so you can look
+            at the interface without installing anything. It uses throwaway demo data on the preview
+            server, and it cannot export PDFs or run a model — both need the desktop app.
+          </li>
+        </ul>
+      </section>
+
+      <footer>
+        <p>
+          Source and releases:
+          <a href="https://github.com/KevDevMed/invoiceApp">github.com/KevDevMed/invoiceApp</a>
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>

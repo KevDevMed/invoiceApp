@@ -1,0 +1,40 @@
+# Browser preview of InvoiceApp.
+#
+#   docker compose up --build      -> http://localhost:4300
+#                                     http://localhost:4300/download
+#
+# The same definition Dokploy builds from the repository.
+
+services:
+  preview:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: invoiceapp-preview:latest
+    restart: unless-stopped
+    ports:
+      - '4300:4300'
+    environment:
+      PREVIEW_HOST: '0.0.0.0'
+      PREVIEW_PORT: '4300'
+      PREVIEW_DB_PATH: '/app/preview-data/preview.db'
+      # Set to 1 for one run to wipe the demo data and reseed it.
+      PREVIEW_RESET: '0'
+    volumes:
+      # Demo data only. The desktop app's database is never mounted here.
+      - preview-data:/app/preview-data
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:4300/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  preview-data:
