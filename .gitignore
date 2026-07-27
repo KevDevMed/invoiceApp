@@ -6,4 +6,20 @@ release/
 .DS_Store
 .env
 .env.*
-models/
+# Downloaded GGUF weights only. Root-anchored on purpose — an unanchored
+# `models/` also matches src/renderer/features/models/ and silently drops source.
+/models/
+
+# Test / tooling output
+coverage/
+.vite/
+*.tsbuildinfo
+
+# SQLite working files (the database itself lives under the OS user-data dir)
+*.db
+*.db-shm
+*.db-wal
+
+# Browser preview: local database and Playwright screenshots
+preview-data/
+preview/.artifacts/

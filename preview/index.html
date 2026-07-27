@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InvoiceApp — browser preview</title>
+    <meta
+      name="description"
+      content="Browser preview of InvoiceApp. PDF export and local models are desktop-only."
+    />
+    <!--
+      Host page for the preview build of the real renderer.
+
+      The only difference from src/renderer/index.html is the first script tag.
+      Both are module scripts, so they are deferred and run in document order:
+      the shim installs window.api and the preview banner, and only then does the
+      renderer's entry module import React and mount. Nothing under src/ changes.
+    -->
+  </head>
+  <body>
+    <div id="root" class="app-root"></div>
+    <script type="module" src="./web-shim.ts"></script>
+    <script type="module" src="../src/renderer/main.tsx"></script>
+  </body>
+</html>
