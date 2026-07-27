@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { barPath, niceMax } from '../chartScale';
+import { barPath, bucketLabels, labelStep, niceMax } from '../chartScale';
 
 describe('niceMax', () => {
   it('returns 100 for zero and negative input', () => {
@@ -27,6 +27,57 @@ describe('niceMax', () => {
     for (const value of [1, 3, 7, 42, 99, 550, 1234, 987654]) {
       expect(niceMax(value)).toBeGreaterThanOrEqual(value);
     }
+  });
+});
+
+describe('bucketLabels', () => {
+  it('renders month buckets as "Mon YYYY" when every bucket is a first-of-month', () => {
+    expect(bucketLabels(['2025-07-01', '2025-08-01', '2026-01-01'])).toEqual([
+      'Jul 2025',
+      'Aug 2025',
+      'Jan 2026',
+    ]);
+  });
+
+  it('renders week buckets as "D Mon YY" when any bucket is mid-month', () => {
+    expect(bucketLabels(['2025-06-30', '2025-07-07'])).toEqual(['30 Jun 25', '7 Jul 25']);
+  });
+
+  it('treats a Monday-the-1st week among other weeks as a week, not a month', () => {
+    expect(bucketLabels(['2025-09-01', '2025-09-08'])).toEqual(['1 Sep 25', '8 Sep 25']);
+  });
+
+  it('passes non-ISO strings through unchanged', () => {
+    expect(bucketLabels(['total', '2025-13-01'])).toEqual(['total', '2025-13-01']);
+  });
+
+  it('returns an empty list for no buckets', () => {
+    expect(bucketLabels([])).toEqual([]);
+  });
+});
+
+describe('labelStep', () => {
+  it('keeps every label while they all fit', () => {
+    expect(labelStep(8, 640, 64)).toBe(1);
+    expect(labelStep(10, 640, 64)).toBe(1);
+  });
+
+  it('thins labels once they would collide', () => {
+    expect(labelStep(13, 640, 64)).toBe(2);
+    expect(labelStep(60, 640, 64)).toBe(6);
+  });
+
+  it('never draws more labels than fit, at any count', () => {
+    for (const count of [1, 13, 26, 52, 120, 500]) {
+      const step = labelStep(count, 640, 64);
+      expect(Math.ceil(count / step)).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it('falls back to every label on degenerate input', () => {
+    expect(labelStep(0, 640, 64)).toBe(1);
+    expect(labelStep(5, 0, 64)).toBe(1);
+    expect(labelStep(5, 640, 0)).toBe(1);
   });
 });
 
