@@ -17,6 +17,7 @@ import { Card } from '@astryxdesign/core/Card';
 import { DateInput } from '@astryxdesign/core/DateInput';
 import { Divider } from '@astryxdesign/core/Divider';
 import { Heading } from '@astryxdesign/core/Heading';
+import { Icon } from '@astryxdesign/core/Icon';
 import { IconButton } from '@astryxdesign/core/IconButton';
 import { NumberInput } from '@astryxdesign/core/NumberInput';
 import { Selector } from '@astryxdesign/core/Selector';
@@ -35,6 +36,7 @@ import {
 } from '../../../shared/money';
 import type { Client, InvoiceItemInput, InvoiceStatus } from '../../../shared/types';
 import { SETTINGS_KEYS } from '../../../shared/types';
+import { Page, PageHeader } from '../../ui/Page';
 import { STATUS_OPTIONS, money, todayIso } from './format';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
@@ -262,42 +264,51 @@ export function InvoiceEditor(): React.JSX.Element {
 
   if (isLoading) {
     return (
-      <VStack gap={2} align="center" padding={6}>
-        <Spinner size="lg" label="Loading invoice" />
-      </VStack>
+      <Page maxWidth={960}>
+        <VStack gap={2} align="center" padding={6}>
+          <Spinner size="lg" label="Loading invoice" />
+        </VStack>
+      </Page>
     );
   }
   if (loadError) {
     return (
-      <VStack gap={4} padding={4}>
+      <Page maxWidth={960}>
         <Banner status="error" title={loadError} />
         <HStack gap={2}>
           <Button label="Back to invoices" onClick={() => void navigate('/invoices')} />
         </HStack>
-      </VStack>
+      </Page>
     );
   }
 
   return (
-    <VStack gap={4} padding={4} maxWidth={960} isScrollable>
-      <HStack gap={2} align="center" justify="between">
-        <Heading level={1}>{isNew ? 'New invoice' : (invoiceNumber ?? 'Invoice')}</Heading>
-        <HStack gap={2}>
-          {!isNew ? (
-            <Selector
-              label="Status"
-              isLabelHidden
-              options={STATUS_OPTIONS}
-              value={status}
-              onChange={(value) => {
-                void changeStatus(value as InvoiceStatus);
-              }}
-            />
-          ) : null}
-          {!isNew ? <Button label="Export PDF" onClick={() => void exportPdf()} /> : null}
-          <Button label="Back" variant="ghost" onClick={() => void navigate('/invoices')} />
-        </HStack>
-      </HStack>
+    <Page maxWidth={960}>
+      <PageHeader
+        title={isNew ? 'New invoice' : (invoiceNumber ?? 'Invoice')}
+        description={
+          isNew
+            ? 'Pick a client, add line items, and the totals follow along.'
+            : 'Edit the invoice, change its status, or export it as a PDF.'
+        }
+        actions={
+          <>
+            <Button label="Back" variant="ghost" onClick={() => void navigate('/invoices')} />
+            {!isNew ? (
+              <Selector
+                label="Status"
+                isLabelHidden
+                options={STATUS_OPTIONS}
+                value={status}
+                onChange={(value) => {
+                  void changeStatus(value as InvoiceStatus);
+                }}
+              />
+            ) : null}
+            {!isNew ? <Button label="Export PDF" onClick={() => void exportPdf()} /> : null}
+          </>
+        }
+      />
 
       {actionError ? <Banner status="error" title={actionError} isDismissable /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable /> : null}
@@ -401,21 +412,21 @@ export function InvoiceEditor(): React.JSX.Element {
                 <Text type="supporting">{amount}</Text>
                 <IconButton
                   label={`Move line ${index + 1} up`}
-                  icon={<span aria-hidden>↑</span>}
+                  icon={<Icon icon="arrowUp" size="sm" />}
                   size="sm"
                   isDisabled={index === 0}
                   onClick={() => moveLine(index, -1)}
                 />
                 <IconButton
                   label={`Move line ${index + 1} down`}
-                  icon={<span aria-hidden>↓</span>}
+                  icon={<Icon icon="arrowDown" size="sm" />}
                   size="sm"
                   isDisabled={index === lines.length - 1}
                   onClick={() => moveLine(index, 1)}
                 />
                 <IconButton
                   label={`Remove line ${index + 1}`}
-                  icon={<span aria-hidden>✕</span>}
+                  icon={<Icon icon="close" size="sm" />}
                   size="sm"
                   variant="ghost"
                   isDisabled={lines.length === 1}
@@ -452,6 +463,6 @@ export function InvoiceEditor(): React.JSX.Element {
           }}
         />
       </HStack>
-    </VStack>
+    </Page>
   );
 }

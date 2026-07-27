@@ -2,18 +2,19 @@
  * Revenue-by-period chart: grouped columns, two series (invoiced / paid),
  * dependency-free inline SVG.
  *
- * Built to the dataviz method: categorical slots 1 (blue) and 2 (orange) from
- * the validated reference palette (validated for both modes with
- * validate_palette.js), thin marks with 4px rounded data-ends square at the
- * baseline, a 2px surface gap between touching bars, solid hairline gridlines,
- * text in ink tokens (never series colors), a legend (two series), a hover
- * tooltip listing both series at the hovered bucket, and a table-view twin
- * rendered by the parent page so no value is gated behind hover.
+ * Restyled to the app's neutral hairline language: all colours come from
+ * astryx tokens (which are light-dark aware, so no per-mode overrides), thin
+ * marks with 4px rounded data-ends square at the baseline, a 2px surface gap
+ * between touching bars, hairline gridlines, text in ink tokens (never series
+ * colors), a legend, a hover tooltip listing both series at the hovered
+ * bucket, and a table-view twin rendered by the parent page so no value is
+ * gated behind hover.
  */
 
 import { useMemo, useState } from 'react';
 
 import { formatMoney } from '../../../shared/money';
+import { barPath, bucketLabels, labelStep, niceMax } from './chartScale';
 
 export interface RevenueChartBucket {
   readonly bucket: string;
@@ -26,100 +27,51 @@ export interface RevenueChartProps {
   readonly currency: string;
 }
 
-// Reference dataviz palette, categorical slots 1-2, light + dark steps.
+// Everything on semantic tokens. Series 1 is the neutral context ink; series 2
+// is the one blue accent. The accent uses icon-blue in light mode but
+// border-blue in dark, where icon-blue sits too close to the gray for
+// colour-blind (and full-colour) separation from series 1.
 const CHART_STYLE = `
 .revenue-chart {
-  color-scheme: light;
-  --chart-surface: #fcfcfb;
-  --chart-ink: #0b0b0b;
-  --chart-ink-secondary: #52514e;
-  --chart-muted: #898781;
-  --chart-grid: #e1e0d9;
-  --chart-baseline: #c3c2b7;
-  --chart-series-1: #2a78d6;
-  --chart-series-2: #eb6834;
+  --chart-grid: var(--color-border);
+  --chart-baseline: var(--color-border-emphasized);
+  --chart-series-1: var(--color-icon-secondary);
+  --chart-series-2: light-dark(var(--color-icon-blue), var(--color-border-blue));
   position: relative;
-  background: var(--chart-surface);
-  border-radius: 8px;
-}
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme='light'])) .revenue-chart {
-    color-scheme: dark;
-    --chart-surface: #1a1a19;
-    --chart-ink: #ffffff;
-    --chart-ink-secondary: #c3c2b7;
-    --chart-muted: #898781;
-    --chart-grid: #2c2c2a;
-    --chart-baseline: #383835;
-    --chart-series-1: #3987e5;
-    --chart-series-2: #d95926;
-  }
-}
-:root[data-theme='dark'] .revenue-chart {
-  color-scheme: dark;
-  --chart-surface: #1a1a19;
-  --chart-ink: #ffffff;
-  --chart-ink-secondary: #c3c2b7;
-  --chart-muted: #898781;
-  --chart-grid: #2c2c2a;
-  --chart-baseline: #383835;
-  --chart-series-1: #3987e5;
-  --chart-series-2: #d95926;
+  background: var(--color-background-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-element);
 }
 .revenue-chart__tooltip {
   position: absolute;
   pointer-events: none;
-  background: var(--chart-surface);
-  border: 1px solid var(--chart-grid);
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--chart-ink);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  background: var(--color-background-popover);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-inner);
+  padding: var(--spacing-1-5) var(--spacing-2);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-low);
   white-space: nowrap;
   z-index: 2;
 }
 .revenue-chart__legend {
   display: flex;
-  gap: 16px;
-  padding: 8px 12px 0;
-  font-size: 12px;
-  color: var(--chart-ink-secondary);
+  gap: var(--spacing-4);
+  padding: var(--spacing-2) var(--spacing-3) 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
   align-items: center;
 }
 .revenue-chart__swatch {
   display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-  margin-right: 6px;
-  vertical-align: -1px;
+  width: var(--spacing-2);
+  height: var(--spacing-2);
+  border-radius: var(--spacing-0-5);
+  margin-right: var(--spacing-1-5);
+  vertical-align: middle;
 }
 `;
-
-/** Round up to a clean 1/2/5 x 10^n axis maximum. */
-function niceMax(value: number): number {
-  if (value <= 0) return 100;
-  const magnitude = 10 ** Math.floor(Math.log10(value));
-  for (const step of [1, 2, 5, 10]) {
-    if (value <= step * magnitude) return step * magnitude;
-  }
-  return 10 * magnitude;
-}
-
-/** Column with a 4px rounded data-end, square at the baseline. */
-function barPath(x: number, y: number, width: number, baseline: number): string {
-  const r = Math.min(4, width / 2, Math.max(0, baseline - y));
-  return [
-    `M ${x} ${baseline}`,
-    `L ${x} ${y + r}`,
-    `Q ${x} ${y} ${x + r} ${y}`,
-    `L ${x + width - r} ${y}`,
-    `Q ${x + width} ${y} ${x + width} ${y + r}`,
-    `L ${x + width} ${baseline}`,
-    'Z',
-  ].join(' ');
-}
 
 const WIDTH = 720;
 const HEIGHT = 260;
@@ -139,6 +91,11 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
   // Two bars per band, 2px surface gap between them, capped at 24px each.
   const barWidth = Math.max(2, Math.min(24, (bandWidth - 2) * 0.35));
   const yFor = (cents: number): number => baseline - (cents / maxCents) * plotHeight;
+
+  // Short axis labels ("Jul 2025" / "7 Jul 25"), thinned to every Nth so they
+  // stay legible at any bucket count. Bars are never dropped, only label text.
+  const labels = useMemo(() => bucketLabels(buckets.map((b) => b.bucket)), [buckets]);
+  const step = labelStep(buckets.length, plotWidth, 64);
 
   const hoveredBucket = hovered !== null ? buckets[hovered] : undefined;
   const hoveredCenter = hovered !== null ? MARGIN.left + bandWidth * (hovered + 0.5) : 0;
@@ -178,7 +135,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
               y={yFor(tick) + 4}
               textAnchor="end"
               fontSize={11}
-              fill="var(--chart-muted)"
+              fill="var(--color-text-secondary)"
               style={{ fontVariantNumeric: 'tabular-nums' }}
             >
               {formatMoney(tick, currency)}
@@ -198,15 +155,17 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
               {bucket.paidCents > 0 ? (
                 <path d={barPath(x2, yFor(bucket.paidCents), barWidth, baseline)} fill="var(--chart-series-2)" />
               ) : null}
-              <text
-                x={center}
-                y={HEIGHT - 8}
-                textAnchor="middle"
-                fontSize={11}
-                fill="var(--chart-muted)"
-              >
-                {bucket.bucket}
-              </text>
+              {index % step === 0 ? (
+                <text
+                  x={center}
+                  y={HEIGHT - 8}
+                  textAnchor="middle"
+                  fontSize={11}
+                  fill="var(--color-text-secondary)"
+                >
+                  {labels[index]}
+                </text>
+              ) : null}
               {/* full-band hit target: bigger than the marks, per interaction spec */}
               <rect
                 x={MARGIN.left + bandWidth * index}
@@ -218,7 +177,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
                 onFocus={() => setHovered(index)}
                 onBlur={() => setHovered(null)}
                 tabIndex={0}
-                aria-label={`${bucket.bucket}: invoiced ${formatMoney(bucket.totalCents, currency)}, paid ${formatMoney(bucket.paidCents, currency)}`}
+                aria-label={`${labels[index]}: invoiced ${formatMoney(bucket.totalCents, currency)}, paid ${formatMoney(bucket.paidCents, currency)}`}
               />
             </g>
           );
@@ -230,12 +189,12 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
           className="revenue-chart__tooltip"
           style={{
             left: `${(hoveredCenter / WIDTH) * 100}%`,
-            top: 24,
+            top: 'var(--spacing-6)',
             transform: 'translateX(-50%)',
           }}
         >
-          <div style={{ color: 'var(--chart-ink-secondary)', marginBottom: 2 }}>
-            {hoveredBucket.bucket}
+          <div style={{ color: 'var(--color-text-secondary)', marginBottom: 'var(--spacing-0-5)' }}>
+            {hovered !== null ? labels[hovered] : ''}
           </div>
           <div>
             <span
@@ -243,7 +202,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
               style={{ background: 'var(--chart-series-1)' }}
             />
             <strong>{formatMoney(hoveredBucket.totalCents, currency)}</strong>
-            <span style={{ color: 'var(--chart-ink-secondary)' }}> invoiced</span>
+            <span style={{ color: 'var(--color-text-secondary)' }}> invoiced</span>
           </div>
           <div>
             <span
@@ -251,7 +210,7 @@ export function RevenueChart({ buckets, currency }: RevenueChartProps): React.JS
               style={{ background: 'var(--chart-series-2)' }}
             />
             <strong>{formatMoney(hoveredBucket.paidCents, currency)}</strong>
-            <span style={{ color: 'var(--chart-ink-secondary)' }}> paid</span>
+            <span style={{ color: 'var(--color-text-secondary)' }}> paid</span>
           </div>
         </div>
       ) : null}
