@@ -2,7 +2,7 @@
  * Clients feature barrel: searchable table, create/edit dialog, guarded delete.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { AlertDialog } from '@astryxdesign/core/AlertDialog';
 import { Avatar } from '@astryxdesign/core/Avatar';
@@ -34,16 +34,31 @@ export function ClientsPage(): React.JSX.Element {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
 
+  const loadToken = useRef(0);
+
   const load = useCallback(async (term: string): Promise<void> => {
+    const token = ++loadToken.current;
     setError(null);
     try {
-      const result = await window.api.invoke('clients:list', {
-        search: term.trim() === '' ? undefined : term.trim(),
-        limit: 200,
-        offset: 0,
-      });
-      setClients(result.items);
+      // Page through the full matching set so the footer total is the true
+      // count, not wherever a single capped fetch happened to stop.
+      const search = term.trim() === '' ? undefined : term.trim();
+      const items: Client[] = [];
+      let total = 0;
+      do {
+        const result = await window.api.invoke('clients:list', {
+          search,
+          limit: 200,
+          offset: items.length,
+        });
+        if (result.items.length === 0) break;
+        items.push(...result.items);
+        total = result.total;
+      } while (items.length < total);
+      if (token !== loadToken.current) return;
+      setClients(items);
     } catch (cause) {
+      if (token !== loadToken.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
       setClients([]);
     }
