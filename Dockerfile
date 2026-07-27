@@ -81,6 +81,7 @@ COPY src/db ./src/db
 COPY preview/server.ts preview/handlers.ts preview/seed.ts ./preview/
 COPY preview/raw-loader.mjs preview/register-raw.mjs ./preview/
 COPY preview/download ./preview/download
+COPY preview/landing ./preview/landing
 COPY --from=builder /app/preview/dist ./preview/dist
 
 # `node` (uid 1000) ships with the official image; the app never runs as root.

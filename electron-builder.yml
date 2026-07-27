@@ -21,6 +21,12 @@ npmRebuild: true
 
 mac:
   category: public.app-category.finance
+  # Version-less on purpose. The landing and download pages link straight at
+  # GitHub's `releases/latest/download/<asset>` endpoint, which needs the asset
+  # name to be identical from one release to the next; the default
+  # `${productName}-${version}-${arch}.${ext}` would break every link on release
+  # day. Expands to InvoiceApp-mac-arm64.dmg / -x64.dmg and the matching .zips.
+  artifactName: InvoiceApp-mac-${arch}.${ext}
   target:
     - target: dmg
       arch:
