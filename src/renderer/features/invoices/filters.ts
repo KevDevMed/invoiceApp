@@ -6,7 +6,9 @@
  * understands `search`, a single `status`, a single `clientId` and an
  * `issuedBetween` date range. Everything else (amount comparisons,
  * invoice-number contains, multi-value status) is applied client-side over the
- * fetched page. Sorting is client-side too.
+ * complete matching set — the view pages `invoices:list` until it holds every
+ * row the backend filter matched, so a client-side filter never judges a mere
+ * prefix. Sorting is client-side too.
  *
  * Splitting it this way keeps every decision testable without a DOM or an
  * Electron bridge.
