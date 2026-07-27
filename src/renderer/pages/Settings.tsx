@@ -3,25 +3,32 @@
  *
  * Lifted out of routes.tsx so the route table has no page bodies in it and can
  * stay a file that nobody needs to edit again.
+ *
+ * Layout is the shared page language: grouped rows of `label + control` under a
+ * section heading, hairline separators between rows, controls right-aligned.
+ * No card per setting.
  */
 
 import { useCallback, useEffect, useState } from 'react';
 
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
-import { Card } from '@astryxdesign/core/Card';
-import { FormLayout } from '@astryxdesign/core/FormLayout';
+import { Divider } from '@astryxdesign/core/Divider';
 import { Heading } from '@astryxdesign/core/Heading';
 import { NumberInput } from '@astryxdesign/core/NumberInput';
 import { Selector } from '@astryxdesign/core/Selector';
-import { HStack, VStack } from '@astryxdesign/core/Stack';
+import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 import { TextArea } from '@astryxdesign/core/TextArea';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
 import { SETTINGS_KEYS } from '../../shared/types';
+import { Page, PageHeader } from '../ui/Page';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
+
+/** Width of the control column, so every row's control lines up. */
+const CONTROL_WIDTH = 340;
 
 /**
  * Settings key the model downloader reads its Hugging Face token from.
@@ -139,19 +146,30 @@ export function SettingsPage(): React.JSX.Element {
   }, [settings]);
 
   return (
-    <VStack gap={4} padding={4} maxWidth={720} isScrollable>
-      <Heading level={1}>Settings</Heading>
-      <Text type="supporting">
-        These values are the defaults every new invoice starts from. They are stored locally in the
-        app database.
-      </Text>
+    <Page maxWidth={860}>
+      <PageHeader
+        title="Settings"
+        description="These values are the defaults every new invoice starts from. They are stored locally in the app database."
+        actions={
+          <Button
+            label="Save settings"
+            variant="primary"
+            isDisabled={isLoading}
+            isLoading={isSaving}
+            onClick={() => {
+              void save();
+            }}
+          />
+        }
+      />
 
       {status ? <Banner status={status.kind} title={status.message} isDismissable /> : null}
 
-      <Card padding={4}>
-        <FormLayout>
+      <SettingsGroup title="Business">
+        <SettingsRow label="Business name" description="Printed at the top of every invoice.">
           <TextInput
             label="Business name"
+            isLabelHidden
             value={settings.businessName}
             isDisabled={isLoading}
             placeholder="Acme Consulting LLC"
@@ -159,8 +177,15 @@ export function SettingsPage(): React.JSX.Element {
               setSettings((prev) => ({ ...prev, businessName: value }));
             }}
           />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Business address"
+          description="Free text, one line per line. Printed under the business name."
+        >
           <TextArea
             label="Business address"
+            isLabelHidden
             value={settings.businessAddress}
             isDisabled={isLoading}
             rows={4}
@@ -169,8 +194,14 @@ export function SettingsPage(): React.JSX.Element {
               setSettings((prev) => ({ ...prev, businessAddress: value }));
             }}
           />
+        </SettingsRow>
+      </SettingsGroup>
+
+      <SettingsGroup title="Invoice defaults">
+        <SettingsRow label="Default currency" description="Every new invoice starts here.">
           <Selector
             label="Default currency"
+            isLabelHidden
             options={CURRENCIES}
             value={settings.defaultCurrency}
             isDisabled={isLoading}
@@ -178,9 +209,15 @@ export function SettingsPage(): React.JSX.Element {
               setSettings((prev) => ({ ...prev, defaultCurrency: value }));
             }}
           />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Default tax rate"
+          description="Basis points — 825 means 8.25%. Stored as an integer so tax math never uses floats."
+        >
           <NumberInput
             label="Default tax rate"
-            description="Basis points — 825 means 8.25%. Stored as an integer so tax math never uses floats."
+            isLabelHidden
             value={settings.defaultTaxRateBps}
             min={0}
             max={1000000}
@@ -190,26 +227,40 @@ export function SettingsPage(): React.JSX.Element {
               setSettings((prev) => ({ ...prev, defaultTaxRateBps: Math.trunc(value) }));
             }}
           />
+        </SettingsRow>
+
+        <SettingsRow
+          label="Invoice number prefix"
+          description="Prepended to generated invoice numbers, e.g. INV-0001."
+        >
           <TextInput
             label="Invoice number prefix"
-            description="Prepended to generated invoice numbers, e.g. INV-0001."
+            isLabelHidden
             value={settings.invoiceNumberPrefix}
             isDisabled={isLoading}
             onChange={(value) => {
               setSettings((prev) => ({ ...prev, invoiceNumberPrefix: value }));
             }}
           />
-          {/*
-            Optional on purpose: every model in the catalog downloads without a
-            token. This is only for gated or private repos, where Hugging Face
-            answers 401/403 until a token from an account that accepted the
-            licence is sent.
-          */}
+        </SettingsRow>
+      </SettingsGroup>
+
+      <SettingsGroup title="Model downloads">
+        {/*
+          Optional on purpose: every model in the catalog downloads without a
+          token. This is only for gated or private repos, where Hugging Face
+          answers 401/403 until a token from an account that accepted the
+          licence is sent.
+        */}
+        <SettingsRow
+          label="Hugging Face access token"
+          description="Only needed for gated or private model repos. Leave empty otherwise. Stored locally in the app database, in plain text."
+        >
           <TextInput
             label="Hugging Face access token"
+            isLabelHidden
             type="password"
             isOptional
-            description="Only needed for gated or private model repos. Leave empty otherwise. Stored locally in the app database, in plain text."
             placeholder="hf_..."
             value={settings.hfToken}
             isDisabled={isLoading}
@@ -217,20 +268,60 @@ export function SettingsPage(): React.JSX.Element {
               setSettings((prev) => ({ ...prev, hfToken: value }));
             }}
           />
-        </FormLayout>
-      </Card>
+        </SettingsRow>
+      </SettingsGroup>
+    </Page>
+  );
+}
 
-      <HStack gap={2}>
-        <Button
-          label="Save settings"
-          variant="primary"
-          isDisabled={isLoading}
-          isLoading={isSaving}
-          onClick={() => {
-            void save();
-          }}
-        />
+// ---------------------------------------------------------------------------
+
+/** A muted section label over a hairline-separated stack of setting rows. */
+function SettingsGroup({
+  title,
+  children,
+}: {
+  readonly title: string;
+  readonly children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <VStack gap={2}>
+      {/* Visually quiet, semantically the page's h2 — see the Models page. */}
+      <Heading level={3} accessibilityLevel={2}>
+        {title}
+      </Heading>
+      <Divider />
+      {children}
+    </VStack>
+  );
+}
+
+/** One row: label and supporting copy on the left, the control on the right. */
+function SettingsRow({
+  label,
+  description,
+  children,
+}: {
+  readonly label: string;
+  readonly description: string;
+  readonly children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <VStack gap={0}>
+      <HStack gap={4} justify="between" align="start" paddingBlock={3} wrap="wrap">
+        <StackItem size="fill">
+          <VStack gap={0.5}>
+            <Text weight="medium">{label}</Text>
+            <Text type="supporting" display="block">
+              {description}
+            </Text>
+          </VStack>
+        </StackItem>
+        <VStack width={CONTROL_WIDTH} maxWidth="100%">
+          {children}
+        </VStack>
       </HStack>
+      <Divider />
     </VStack>
   );
 }

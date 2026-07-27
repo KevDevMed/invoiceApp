@@ -5,6 +5,10 @@
  * directory is ours. The page is deliberately blunt about the safety model: a
  * mutating tool call is rendered as an approval card with the exact action
  * spelled out, and nothing runs until the user presses Approve.
+ *
+ * Layout: a hairline-separated thread rail, then the chat column carrying the
+ * shared `PageHeader`. `ChatLayout` owns the scroll region and the docked
+ * composer so the message rhythm is the design system's, not ours.
  */
 
 import { useState } from 'react';
@@ -14,17 +18,29 @@ import { Badge } from '@astryxdesign/core/Badge';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import { Card } from '@astryxdesign/core/Card';
-import { ChatComposer, ChatMessage as ChatMessageRow, ChatMessageList } from '@astryxdesign/core/Chat';
+import {
+  ChatComposer,
+  ChatLayout,
+  ChatMessage as ChatMessageRow,
+  ChatMessageBubble,
+  ChatMessageList,
+} from '@astryxdesign/core/Chat';
+import { Divider } from '@astryxdesign/core/Divider';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
-import { Heading } from '@astryxdesign/core/Heading';
+import { List, ListItem } from '@astryxdesign/core/List';
+import { Section } from '@astryxdesign/core/Section';
 import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 
 import type { ChatMessage } from '../../../shared/types';
+import { Page, PageHeader } from '../../ui/Page';
 import { describeSmokeTest, readSmokeTest } from '../models/llmExtra';
 import { parseToolCalls, useAssistant, type ToolCallRecord } from './useAssistant';
+
+const DESCRIPTION =
+  'Reads your invoices and clients locally. Any change it wants to make needs your approval.';
 
 export function AssistantPage(): React.JSX.Element {
   const assistant = useAssistant();
@@ -32,7 +48,7 @@ export function AssistantPage(): React.JSX.Element {
 
   if (assistant.isLoading) {
     return (
-      <VStack gap={4} padding={4} height="100%" vAlign="center" hAlign="center">
+      <VStack gap={4} padding={6} height="100%" vAlign="center" hAlign="center">
         <Spinner label="Loading the assistant" />
       </VStack>
     );
@@ -40,8 +56,8 @@ export function AssistantPage(): React.JSX.Element {
 
   if (assistant.readyModels.length === 0) {
     return (
-      <VStack gap={4} padding={4} height="100%">
-        <Heading level={1}>Assistant</Heading>
+      <Page>
+        <PageHeader title="Assistant" description={DESCRIPTION} />
         <EmptyState
           title="No model downloaded yet"
           description="The assistant runs a local model on this machine. Download one to get started."
@@ -52,7 +68,7 @@ export function AssistantPage(): React.JSX.Element {
             </RouterLink>
           }
         />
-      </VStack>
+      </Page>
     );
   }
 
@@ -64,35 +80,34 @@ export function AssistantPage(): React.JSX.Element {
   return (
     <HStack gap={0} height="100%">
       <ThreadSidebar assistant={assistant} />
+      <Divider orientation="vertical" />
 
       <StackItem size="fill">
-        <VStack gap={3} padding={4} height="100%">
-          <HStack gap={3} hAlign="between" vAlign="center" wrap="wrap">
-            <VStack gap={0.5}>
-              <Heading level={1}>Assistant</Heading>
-              <Text type="supporting">
-                Reads your invoices and clients locally. Any change it wants to make needs your approval.
-              </Text>
-            </VStack>
-            {/*
-              An untested model is still selectable — the smoke test is advice,
-              not a gate — but the label says so, because "it loaded" and "it
-              generates tokens at a usable speed" are different claims.
-            */}
-            <Selector
-              label="Model"
-              isLabelHidden
-              placeholder="Choose a model"
-              options={assistant.readyModels.map((record) => ({
-                value: record.id,
-                label: `${record.id} · ${describeSmokeTest(readSmokeTest(record))}`,
-              }))}
-              value={assistant.activeModelId ?? undefined}
-              onChange={(value) => {
-                void assistant.selectModel(value);
-              }}
-            />
-          </HStack>
+        <VStack gap={5} paddingInline={6} paddingBlock={5} height="100%">
+          <PageHeader
+            title="Assistant"
+            description={DESCRIPTION}
+            actions={
+              /*
+                An untested model is still selectable — the smoke test is advice,
+                not a gate — but the label says so, because "it loaded" and "it
+                generates tokens at a usable speed" are different claims.
+              */
+              <Selector
+                label="Model"
+                isLabelHidden
+                placeholder="Choose a model"
+                options={assistant.readyModels.map((record) => ({
+                  value: record.id,
+                  label: `${record.id} · ${describeSmokeTest(readSmokeTest(record))}`,
+                }))}
+                value={assistant.activeModelId ?? undefined}
+                onChange={(value) => {
+                  void assistant.selectModel(value);
+                }}
+              />
+            }
+          />
 
           {assistant.error ? (
             <Banner
@@ -128,24 +143,38 @@ export function AssistantPage(): React.JSX.Element {
             />
           ) : null}
 
-          <StackItem size="fill" isScrollable>
-            <Transcript assistant={assistant} />
+          <StackItem size="fill">
+            <ChatLayout
+              emptyState={
+                <EmptyState
+                  title="Ask the assistant something"
+                  description={
+                    'Try: "Which invoices are overdue?" or "Create a client called Acme Consulting".'
+                  }
+                  headingLevel={2}
+                  isCompact
+                />
+              }
+              composer={
+                <ChatComposer
+                  value={draft}
+                  onChange={setDraft}
+                  placeholder="Ask about invoices, clients, or totals…"
+                  isDisabled={!hasModel}
+                  isStopShown={assistant.isStreaming}
+                  onStop={() => {
+                    void assistant.stop();
+                  }}
+                  onSubmit={(value) => {
+                    setDraft('');
+                    void assistant.send(value);
+                  }}
+                />
+              }
+            >
+              <Transcript assistant={assistant} />
+            </ChatLayout>
           </StackItem>
-
-          <ChatComposer
-            value={draft}
-            onChange={setDraft}
-            placeholder="Ask about invoices, clients, or totals…"
-            isDisabled={!hasModel}
-            isStopShown={assistant.isStreaming}
-            onStop={() => {
-              void assistant.stop();
-            }}
-            onSubmit={(value) => {
-              setDraft('');
-              void assistant.send(value);
-            }}
-          />
         </VStack>
       </StackItem>
     </HStack>
@@ -160,7 +189,7 @@ interface AssistantProps {
 
 function ThreadSidebar({ assistant }: AssistantProps): React.JSX.Element {
   return (
-    <VStack gap={2} padding={3} width={240} isScrollable>
+    <VStack gap={3} paddingInline={4} paddingBlock={5} width={260} isScrollable>
       <Button
         label="New conversation"
         variant="secondary"
@@ -171,47 +200,44 @@ function ThreadSidebar({ assistant }: AssistantProps): React.JSX.Element {
       />
 
       {assistant.threads.length === 0 ? (
-        <Text type="supporting">No conversations yet.</Text>
+        <Text type="supporting" display="block">
+          No conversations yet.
+        </Text>
       ) : (
-        assistant.threads.map((thread) => (
-          <Button
-            key={thread.id}
-            label={thread.title ?? 'Untitled conversation'}
-            variant={assistant.threadId === thread.id ? 'primary' : 'ghost'}
-            width="100%"
-            onClick={() => {
-              assistant.selectThread(thread.id);
-            }}
-          />
-        ))
+        <List density="compact">
+          {assistant.threads.map((thread) => (
+            <ListItem
+              key={thread.id}
+              label={thread.title ?? 'Untitled conversation'}
+              isSelected={assistant.threadId === thread.id}
+              onClick={() => {
+                assistant.selectThread(thread.id);
+              }}
+            />
+          ))}
+        </List>
       )}
     </VStack>
   );
 }
 
-function Transcript({ assistant }: AssistantProps): React.JSX.Element {
+function Transcript({ assistant }: AssistantProps): React.JSX.Element | null {
   const visible = assistant.messages.filter((message) => message.role !== 'system');
 
-  if (visible.length === 0 && !assistant.isStreaming) {
-    return (
-      <EmptyState
-        title="Ask the assistant something"
-        description={'Try: "Which invoices are overdue?" or "Create a client called Acme Consulting".'}
-        headingLevel={2}
-        isCompact
-      />
-    );
-  }
+  // Null hands the empty state back to ChatLayout, which centres it for us.
+  if (visible.length === 0 && !assistant.isStreaming) return null;
 
   return (
-    <ChatMessageList isStreaming={assistant.isStreaming}>
+    <ChatMessageList isStreaming={assistant.isStreaming} density="spacious">
       {visible.map((message) => (
         <MessageRow key={message.id} message={message} assistant={assistant} />
       ))}
 
       {assistant.isStreaming ? (
-        <ChatMessageRow sender="assistant" name="Assistant">
-          <Text>{assistant.streamingText.length > 0 ? assistant.streamingText : 'Thinking…'}</Text>
+        <ChatMessageRow sender="assistant">
+          <ChatMessageBubble variant="ghost" name="Assistant">
+            <Text>{assistant.streamingText.length > 0 ? assistant.streamingText : 'Thinking…'}</Text>
+          </ChatMessageBubble>
         </ChatMessageRow>
       ) : null}
     </ChatMessageList>
@@ -230,24 +256,33 @@ function MessageRow({
   if (message.role === 'tool') {
     return (
       <ChatMessageRow sender="system">
-        <Card padding={2} variant="muted">
+        <Section variant="muted" padding={2}>
           <VStack gap={1}>
-            <Text type="supporting">Tool result</Text>
+            <Text type="supporting" display="block">
+              Tool result
+            </Text>
             <Text type="code" maxLines={6}>
               {message.content}
             </Text>
           </VStack>
-        </Card>
+        </Section>
       </ChatMessageRow>
     );
   }
 
-  const sender = message.role === 'user' ? 'user' : 'assistant';
+  const isUser = message.role === 'user';
 
   return (
-    <ChatMessageRow sender={sender} name={message.role === 'user' ? 'You' : 'Assistant'}>
+    <ChatMessageRow sender={isUser ? 'user' : 'assistant'}>
       <VStack gap={2}>
-        {message.content.length > 0 ? <Text>{message.content}</Text> : null}
+        {message.content.length > 0 ? (
+          <ChatMessageBubble
+            variant={isUser ? 'filled' : 'ghost'}
+            name={isUser ? 'You' : 'Assistant'}
+          >
+            <Text>{message.content}</Text>
+          </ChatMessageBubble>
+        ) : null}
         {calls.map((call) => (
           <ToolCallCard
             key={call.id}
@@ -287,14 +322,18 @@ function ToolCallCard({
   return (
     <Card padding={3} variant={isPending ? 'default' : 'muted'}>
       <VStack gap={2}>
-        <HStack gap={2} vAlign="center" wrap="wrap">
+        <HStack gap={2} align="center" wrap="wrap">
           <Badge variant={badge.variant} label={badge.label} />
           <Text weight="semibold">{call.name}</Text>
         </HStack>
 
         <Text>{call.summary}</Text>
 
-        {call.error ? <Text type="supporting">{call.error}</Text> : null}
+        {call.error ? (
+          <Text type="supporting" display="block">
+            {call.error}
+          </Text>
+        ) : null}
 
         <Text type="code" maxLines={4}>
           {JSON.stringify(call.arguments)}
