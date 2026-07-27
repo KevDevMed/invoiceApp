@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const landingDir = path.resolve(here, '..', 'landing');
+const assetsDir = path.resolve(landingDir, 'assets');
 const html = fs.readFileSync(path.join(landingDir, 'index.html'), 'utf8');
 
 const ARM_DMG =
@@ -51,6 +52,16 @@ describe('document outline and metadata', () => {
     expect(html.match(/<h1[\s>]/gi) ?? []).toHaveLength(1);
   });
 
+  it('skips no heading level', () => {
+    const levels = [...html.matchAll(/<h([1-6])[\s>]/gi)].map((m) => Number(m[1]));
+    expect(levels[0]).toBe(1);
+    for (let i = 1; i < levels.length; i += 1) {
+      const previous = levels[i - 1] ?? 0;
+      const current = levels[i] ?? 0;
+      expect(current, `h${previous} is followed by h${current}`).toBeLessThanOrEqual(previous + 1);
+    }
+  });
+
   it('has a non-empty title', () => {
     const title = html.match(/<title>([\s\S]*?)<\/title>/i);
     expect(title).not.toBeNull();
@@ -68,6 +79,23 @@ describe('document outline and metadata', () => {
     for (const property of ['og:title', 'og:description', 'og:type']) {
       expect(html).toContain(`property="${property}"`);
     }
+  });
+});
+
+describe('claims about the build', () => {
+  it('states the Electron 38 minimum of macOS 12 and never the dropped macOS 11', () => {
+    expect(html).toContain('macOS 12 Monterey or later');
+    expect(html).not.toMatch(/macOS 11/i);
+    expect(html).not.toMatch(/Big Sur/i);
+  });
+
+  it('does not tell the reader to back up the SQLite file on its own', () => {
+    // The database runs in WAL mode (src/db/client.ts), so committed rows can
+    // live only in the -wal sidecar until a checkpoint.
+    expect(html).not.toMatch(/Back it up by copying it/i);
+    expect(html).toContain('-wal');
+    expect(html).toContain('-shm');
+    expect(html).toMatch(/quit the app first/i);
   });
 });
 
@@ -95,14 +123,20 @@ describe('images', () => {
     expect(imgTags().length).toBeGreaterThan(0);
   });
 
-  it('resolves every /landing/assets/ image to a file on disk', () => {
+  it('resolves every /landing/assets/ image to a file inside the assets directory', () => {
     const referenced = [...html.matchAll(/src="\/landing\/assets\/([^"]+)"/g)].map((m) => m[1]);
     expect(referenced.length).toBeGreaterThan(0);
 
     for (const name of referenced) {
       expect(name, 'the file name capture group should have matched').toBeDefined();
       // `<unmatched>` can never exist on disk, so a missing capture still fails below.
-      const onDisk = path.join(landingDir, 'assets', name ?? '<unmatched>');
+      const onDisk = path.resolve(assetsDir, name ?? '<unmatched>');
+      // Existence alone would pass for `../../../package.json`, which the browser
+      // would refuse to serve, so the path has to stay inside the assets folder.
+      expect(
+        onDisk === assetsDir || onDisk.startsWith(assetsDir + path.sep),
+        `${name} should resolve inside preview/landing/assets/, got ${onDisk}`,
+      ).toBe(true);
       expect(fs.existsSync(onDisk), `${name} should exist under preview/landing/assets/`).toBe(
         true,
       );

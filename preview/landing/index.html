@@ -342,6 +342,19 @@
 
       /* ---------- features ---------- */
 
+      /* Keeps a heading in the outline for screen readers without drawing it. */
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
+      }
+
       .features {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
@@ -684,7 +697,8 @@
           </div>
         </div>
 
-        <section class="features" id="features" aria-label="Features">
+        <section class="features" id="features" aria-labelledby="features-heading">
+          <h2 class="visually-hidden" id="features-heading">Features</h2>
           <div class="feature">
             <span class="tile" aria-hidden="true">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
@@ -788,7 +802,9 @@
               <dt>One local file</dt>
               <dd>
                 Clients, invoices and settings live in a single SQLite database in your macOS user
-                data folder. Back it up by copying it.
+                data folder. To back it up, quit the app first, then copy the
+                <code>.db</code> file along with its <code>-wal</code> and <code>-shm</code>
+                siblings.
               </dd>
             </div>
             <div class="fact">
@@ -808,7 +824,7 @@
             <div class="fact">
               <dt>Requirements</dt>
               <dd>
-                macOS 11 Big Sur or later, Apple Silicon or Intel. Around 8 GB free disk space if
+                macOS 12 Monterey or later, Apple Silicon or Intel. Around 8 GB free disk space if
                 you want the assistant.
               </dd>
             </div>
@@ -833,7 +849,7 @@
         <section class="download" id="download" aria-labelledby="download-heading">
           <h2 id="download-heading">Download InvoiceApp</h2>
           <p class="hero-sub">
-            Free, MIT-licensed, and yours to keep. macOS 11 Big Sur or later.
+            Free, MIT-licensed, and yours to keep. macOS 12 Monterey or later.
           </p>
           <div class="hero-actions">
             <a
