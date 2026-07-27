@@ -4,10 +4,13 @@
  * The filter bar is a `PowerSearch`; everything it produces is interpreted by
  * the pure helpers in ./filters — the part the backend understands goes into
  * the `invoices:list` request, the rest is applied over the fetched set here.
+ * That fetched set is the *whole* matching set: `load` pages `invoices:list`
+ * until it holds `total` rows, so the client-side filters and the footer count
+ * both speak for every invoice, not for the first window of them.
  * Paging is client-side over that filtered set via the shared helpers.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 
 import { Avatar } from '@astryxdesign/core/Avatar';
@@ -52,8 +55,16 @@ import {
 } from './filters';
 import type { InvoiceSortKey } from './filters';
 
-/** How many invoices we pull before filtering and paging in the renderer. */
-const FETCH_LIMIT = 200;
+/**
+ * Rows per `invoices:list` request. The contract caps `limit` at 500
+ * (src/shared/ipc-contract.ts, `Pagination`), so this is one round trip per 500
+ * matching invoices — the whole matching set is pulled, never a prefix of it.
+ * The database is local SQLite on the user's own machine, so this is cheap, and
+ * it is the only way the footer count and the renderer-side filters can be
+ * true: a filter that only sees the first page silently loses every match past
+ * it, while the footer still prints an exact "of N".
+ */
+const PAGE_LIMIT = 500;
 
 // The semantic icon set ships no person / money / hash glyph, and the Icon docs
 // sanction passing an SVG component directly. These follow the same conventions
@@ -234,20 +245,41 @@ export function InvoiceList(): React.JSX.Element {
   const [clients, setClients] = useState<Client[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  // Every load takes a ticket; only the newest one is allowed to write state.
+  // Paging is several awaits long, so a load started by an earlier search term
+  // can finish after a later one and would otherwise overwrite it.
+  const loadTicket = useRef(0);
+
   const load = useCallback(async (term: string, active: readonly PowerSearchFilter[]) => {
+    const ticket = ++loadTicket.current;
+    const isStale = (): boolean => ticket !== loadTicket.current;
     setError(null);
     try {
-      const [invoiceResult, clientResult] = await Promise.all([
-        window.api.invoke(
-          'invoices:list',
-          toListRequest(active, { search: term, limit: FETCH_LIMIT, offset: 0 }),
-        ),
+      const request = (offset: number): ReturnType<typeof toListRequest> =>
+        toListRequest(active, { search: term, limit: PAGE_LIMIT, offset });
+
+      const [firstPage, clientResult] = await Promise.all([
+        window.api.invoke('invoices:list', request(0)),
         // The list response carries clientId only — join names client-side.
         window.api.invoke('clients:list', { limit: 500, offset: 0 }),
       ]);
-      setInvoices(invoiceResult.items);
+      if (isStale()) return;
+
+      // `total` is the size of the set the backend filter matched. Keep asking
+      // for the next window until we hold all of it; an empty page ends the
+      // loop too, so a shrinking table cannot spin here.
+      const collected = [...firstPage.items];
+      while (collected.length < firstPage.total) {
+        const next = await window.api.invoke('invoices:list', request(collected.length));
+        if (isStale()) return;
+        if (next.items.length === 0) break;
+        collected.push(...next.items);
+      }
+
+      setInvoices(collected);
       setClients(clientResult.items);
     } catch (cause) {
+      if (isStale()) return;
       setError(cause instanceof Error ? cause.message : String(cause));
       setInvoices([]);
     }
