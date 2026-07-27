@@ -14,6 +14,21 @@
  */
 
 import type { IpcRequest, IpcResponse } from '../../../shared/ipc-contract';
+import type { ModelRecord } from '../../../shared/types';
+
+/**
+ * A model row as main actually sends it.
+ *
+ * `ModelRecord` is declared in the frozen contract, and responses are not
+ * re-validated on the way out, so the columns migration 002 added arrive
+ * alongside it. `smokeTest` is the test result — it used to be squeezed into
+ * `error`, which meant a passing test could render as a failed download — and
+ * `verifiedSha256` is null for weights this machine never hashed.
+ */
+export interface LocalModel extends ModelRecord {
+  readonly smokeTest?: string | null;
+  readonly verifiedSha256?: string | null;
+}
 
 export type SupportVerdict = 'RED' | 'YELLOW' | 'GREEN' | 'LOADING' | 'GREY';
 
@@ -185,25 +200,16 @@ export function variantKey(repo: string, filename: string): string {
   return `${repo}/${filename}`;
 }
 
-/**
- * Decode the smoke-test record out of `ModelRecord.error`.
- *
- * The schema is frozen and has no column for it, so a passing test and a failed
- * download share one column. Everything that reads `record.error` must go
- * through this pair or a passing test renders as a download failure.
- */
-export function readSmokeTest(error: string | null): SmokeTestView | null {
-  if (error === null || error.length === 0 || !error.startsWith('{')) return null;
+/** Decode the smoke-test record stored against a model, if it has one. */
+export function readSmokeTest(record: Pick<LocalModel, 'smokeTest'> | null): SmokeTestView | null {
+  const raw = record?.smokeTest;
+  if (typeof raw !== 'string' || raw.length === 0 || !raw.startsWith('{')) return null;
   try {
-    const parsed = JSON.parse(error) as Partial<SmokeTestView>;
+    const parsed = JSON.parse(raw) as Partial<SmokeTestView>;
     return parsed.kind === 'smokeTest' ? (parsed as SmokeTestView) : null;
   } catch {
     return null;
   }
-}
-
-export function downloadErrorOf(error: string | null): string | null {
-  return readSmokeTest(error) === null ? error : null;
 }
 
 export function describeSmokeTest(record: SmokeTestView | null): string {

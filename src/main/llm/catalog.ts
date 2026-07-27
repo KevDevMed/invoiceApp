@@ -15,6 +15,7 @@
  * Electron so it can be unit-tested directly.
  */
 
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export interface CatalogEntry {
@@ -150,8 +151,13 @@ export function catalogEntryUrl(entry: CatalogEntry): string {
 }
 
 /**
- * Downloads only ever go over TLS. The downloader calls this on the final URL
- * as well as on every redirect target it is handed.
+ * Downloads only ever go over TLS.
+ *
+ * The downloader follows redirects itself (`redirect: 'manual'`) and calls this
+ * on the initial URL and on every `Location` before that hop is requested, so no
+ * plaintext request is ever issued. `fetch(..., { redirect: 'follow' })` cannot
+ * give that guarantee: it walks an https-to-http redirect silently and only then
+ * hands back a response to inspect.
  */
 export function assertHttpsUrl(value: string): string {
   let url: URL;
@@ -267,12 +273,25 @@ export function findCatalogEntryByFile(repo: string, filename: string): CatalogE
   return CATALOG.find((entry) => entry.repo === repo && entry.filename === filename);
 }
 
+/** Length of the disambiguating hash appended to a derived id. */
+const ID_HASH_CHARS = 10;
+/** Readable part of a derived id: 64 total, minus the hash and its separator. */
+const ID_SLUG_CHARS = 64 - ID_HASH_CHARS - 1;
+
 /**
  * Derive a safe local id for a repo/file pair that is not in the catalog.
  *
  * `llm:download` takes a repo and a filename rather than a catalog id, so the
  * renderer can in principle ask for something we never curated. The id it gets
  * is squeezed through the same allow-list every other id is.
+ *
+ * The slug alone is not injective — it maps every non-alphanumeric run to `-`
+ * and then truncates, so `("a/b-c", "x.gguf")` and `("a/b", "c-x.gguf")` both
+ * reduce to `a-b-c-x`. Two models sharing an id share a directory and a row, and
+ * the second download overwrites the first's weights. The appended hash is taken
+ * over the exact pair joined by a NUL, which neither half can contain, so distinct
+ * inputs cannot collide on it; the slug survives only to keep the id
+ * readable.
  */
 export function deriveModelId(repo: string, filename: string): string {
   const known = findCatalogEntryByFile(repo, filename);
@@ -282,9 +301,17 @@ export function deriveModelId(repo: string, filename: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 64);
+    .slice(0, ID_SLUG_CHARS)
+    .replace(/-+$/, '');
 
-  return assertSafeModelId(slug);
+  const hash = createHash('sha256')
+    .update(`${repo} ${filename}`)
+    .digest('hex')
+    .slice(0, ID_HASH_CHARS);
+
+  // A slug that slugified away to nothing (or started with a `-`) still has to
+  // produce an id the allow-list accepts, so the hash carries it alone.
+  return assertSafeModelId(slug.length > 0 && /^[a-z0-9]/.test(slug) ? `${slug}-${hash}` : `m-${hash}`);
 }
 
 /** One-line summary used wherever the contract only gives us a `description` field. */

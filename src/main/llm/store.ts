@@ -31,11 +31,31 @@ interface ModelRow {
   status: string;
   downloaded_bytes: number;
   error: string | null;
+  smoke_test: string | null;
+  verified_sha256: string | null;
   created_at: string;
   updated_at: string;
 }
 
-function toRecord(row: ModelRow): ModelRecord {
+/**
+ * A model row with the two columns migration 002 added.
+ *
+ * `ModelRecord` lives in the frozen contract and cannot grow fields, so the
+ * extra ones ride alongside it. Responses are not re-validated on the way out,
+ * so both reach the renderer; anything typed as `ModelRecord` simply ignores
+ * them.
+ */
+export interface StoredModel extends ModelRecord {
+  /** JSON-encoded smoke-test record, or null when the model was never tested. */
+  readonly smokeTest: string | null;
+  /**
+   * The digest this machine computed over the bytes on disk, after they matched
+   * the expected one. Null means these bytes were never verified.
+   */
+  readonly verifiedSha256: string | null;
+}
+
+function toRecord(row: ModelRow): StoredModel {
   return {
     id: row.id,
     repo: row.repo,
@@ -47,6 +67,8 @@ function toRecord(row: ModelRow): ModelRecord {
     status: row.status as ModelStatus,
     downloadedBytes: row.downloaded_bytes,
     error: row.error,
+    smokeTest: row.smoke_test,
+    verifiedSha256: row.verified_sha256,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -71,7 +93,7 @@ export interface UpsertModelInput {
  * metadata we know about it. Never downgrades a `ready` row: a model already on
  * disk stays ready even if the renderer asks for it again.
  */
-export function upsertModel(db: Db, input: UpsertModelInput): ModelRecord {
+export function upsertModel(db: Db, input: UpsertModelInput): StoredModel {
   assertSafeModelId(input.id);
   assertSafeModelFilename(input.filename);
 
@@ -116,25 +138,25 @@ export function upsertModel(db: Db, input: UpsertModelInput): ModelRecord {
   return requireModel(db, input.id);
 }
 
-export function getModel(db: Db, id: string): ModelRecord | null {
+export function getModel(db: Db, id: string): StoredModel | null {
   const row = db.prepare<[string], ModelRow>('SELECT * FROM models WHERE id = ?').get(id);
   return row ? toRecord(row) : null;
 }
 
-export function requireModel(db: Db, id: string): ModelRecord {
+export function requireModel(db: Db, id: string): StoredModel {
   const record = getModel(db, id);
   if (!record) throw new Error(`No such model: ${id}`);
   return record;
 }
 
-export function listModels(db: Db): ModelRecord[] {
+export function listModels(db: Db): StoredModel[] {
   return db
     .prepare<[], ModelRow>('SELECT * FROM models ORDER BY created_at ASC, id ASC')
     .all()
     .map(toRecord);
 }
 
-export function markDownloading(db: Db, id: string, downloadedBytes: number): ModelRecord {
+export function markDownloading(db: Db, id: string, downloadedBytes: number): StoredModel {
   db.prepare(
     `UPDATE models
         SET status = 'downloading', downloaded_bytes = ?, error = NULL, updated_at = ?
@@ -155,16 +177,44 @@ export function recordProgress(db: Db, id: string, downloadedBytes: number): voi
   );
 }
 
-export function markReady(db: Db, id: string, localPath: string, sizeBytes: number): ModelRecord {
+/**
+ * Promote a model to `ready`.
+ *
+ * `verifiedSha256` is the digest computed over the bytes now sitting at
+ * `localPath`, and it is not optional: a `ready` row without one is exactly the
+ * state that let an unverified GGUF reach the native parser. The only caller
+ * allowed to pass a digest is the one that just hashed the file.
+ */
+export function markReady(
+  db: Db,
+  id: string,
+  localPath: string,
+  sizeBytes: number,
+  verifiedSha256: string,
+): StoredModel {
   db.prepare(
     `UPDATE models
-        SET status = 'ready', local_path = ?, size_bytes = ?, downloaded_bytes = ?, error = NULL, updated_at = ?
+        SET status = 'ready', local_path = ?, size_bytes = ?, downloaded_bytes = ?,
+            error = NULL, verified_sha256 = ?, updated_at = ?
       WHERE id = ?`,
-  ).run(localPath, sizeBytes, sizeBytes, nowIso(), id);
+  ).run(localPath, sizeBytes, sizeBytes, verifiedSha256, nowIso(), id);
   return requireModel(db, id);
 }
 
-export function markError(db: Db, id: string, message: string): ModelRecord {
+/** Drop a stored smoke-test record. The weights it described are gone or replaced. */
+export function clearSmokeTestRecord(db: Db, id: string): void {
+  db.prepare('UPDATE models SET smoke_test = NULL, updated_at = ? WHERE id = ?').run(nowIso(), id);
+}
+
+/** Forget that a model's bytes were ever verified — used when they are replaced. */
+export function clearVerification(db: Db, id: string): void {
+  db.prepare('UPDATE models SET verified_sha256 = NULL, updated_at = ? WHERE id = ?').run(
+    nowIso(),
+    id,
+  );
+}
+
+export function markError(db: Db, id: string, message: string): StoredModel {
   db.prepare(
     `UPDATE models SET status = 'error', local_path = NULL, error = ?, updated_at = ? WHERE id = ?`,
   ).run(message.slice(0, 4000), nowIso(), id);
@@ -175,7 +225,7 @@ export function markError(db: Db, id: string, message: string): ModelRecord {
  * A cancelled or interrupted download is `available`, not `error`: nothing went
  * wrong, and the retained byte count is what makes the next attempt resumable.
  */
-export function markInterrupted(db: Db, id: string, downloadedBytes: number): ModelRecord {
+export function markInterrupted(db: Db, id: string, downloadedBytes: number): StoredModel {
   db.prepare(
     `UPDATE models
         SET status = 'available', local_path = NULL, downloaded_bytes = ?, error = NULL, updated_at = ?
@@ -246,6 +296,8 @@ function sizeOrNull(filePath: string): number | null {
 export interface ReconcileResult {
   readonly promotedToReady: string[];
   readonly resetToAvailable: string[];
+  /** Rows demoted purely because their bytes were never checksum-verified. */
+  readonly unverified: string[];
 }
 
 /**
@@ -254,31 +306,45 @@ export interface ReconcileResult {
  * A row stuck in `downloading` means the app died mid-transfer — no writer
  * exists any more, so the row is a lie until we fix it. A `ready` row whose
  * file has been deleted behind our back is equally a lie.
+ *
+ * Size is never enough to promote a row. A file this machine has not hashed
+ * against a known digest stays out of `ready`, however plausible its size is:
+ * `llm:load` hands `ready` files straight to llama.cpp's C++ GGUF parser, so
+ * "the byte count looks right" is not a standard that file gets to meet. The
+ * downloader re-verifies such a file in place and promotes it without
+ * re-downloading when the hash matches.
  */
 export function reconcileOnBoot(db: Db, probe: DiskProbe): ReconcileResult {
   const promotedToReady: string[] = [];
   const resetToAvailable: string[] = [];
+  const unverified: string[] = [];
 
   for (const record of listModels(db)) {
     if (record.status !== 'downloading' && record.status !== 'ready') continue;
 
     const { finalPath, finalBytes, partBytes } = probe(record);
+    const sizeMatches =
+      finalPath !== null &&
+      finalBytes !== null &&
+      (record.sizeBytes === null || finalBytes === record.sizeBytes);
 
-    if (finalPath !== null && finalBytes !== null && (record.sizeBytes === null || finalBytes === record.sizeBytes)) {
+    if (sizeMatches && record.verifiedSha256 !== null && finalPath !== null && finalBytes !== null) {
       if (record.status !== 'ready' || record.downloadedBytes !== finalBytes || record.localPath !== finalPath) {
-        markReady(db, record.id, finalPath, finalBytes);
+        markReady(db, record.id, finalPath, finalBytes, record.verifiedSha256);
         if (record.status !== 'ready') promotedToReady.push(record.id);
       }
       continue;
     }
 
-    // Either there is no final file, or it is the wrong size — in both cases the
-    // resumable `.part` (if any) is what we carry forward.
+    if (sizeMatches) unverified.push(record.id);
+
+    // No final file, wrong size, or never verified — in every case the resumable
+    // `.part` (if any) is what we carry forward, and the row is not `ready`.
     markInterrupted(db, record.id, partBytes ?? 0);
     resetToAvailable.push(record.id);
   }
 
-  return { promotedToReady, resetToAvailable };
+  return { promotedToReady, resetToAvailable, unverified };
 }
 
 // ---------------------------------------------------------------------------

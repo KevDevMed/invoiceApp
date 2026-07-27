@@ -4,7 +4,14 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { HfError, isSplitFile, lookupRepo, normaliseRepoInput, parseQuant } from '../hf';
+import {
+  HfError,
+  isSplitFile,
+  lookupFileDigest,
+  lookupRepo,
+  normaliseRepoInput,
+  parseQuant,
+} from '../hf';
 
 function jsonServer(payload: unknown, status = 200) {
   const doFetch = vi.fn(
@@ -205,5 +212,40 @@ describe('lookupRepo', () => {
       code: 'INVALID_REPO',
     });
     expect(server.calls).not.toHaveBeenCalled();
+  });
+});
+
+describe('blob digests', () => {
+  const DIGEST = 'a'.repeat(64);
+
+  const WITH_DIGESTS = {
+    siblings: [
+      { rfilename: 'good.gguf', lfs: { size: 100, oid: DIGEST } },
+      { rfilename: 'no-digest.gguf', lfs: { size: 100 } },
+      { rfilename: 'bad-digest.gguf', lfs: { size: 100, oid: 'not-a-sha' } },
+    ],
+  };
+
+  it('carries the Hub blob digest through to each variant', async () => {
+    const server = jsonServer(WITH_DIGESTS);
+    const info = await lookupRepo('a/b', { fetch: server.fetch });
+
+    const byName = new Map(info.variants.map((variant) => [variant.filename, variant]));
+    expect(byName.get('good.gguf')?.sha256).toBe(DIGEST);
+    // "No digest" and "a digest that is not one" are both null, never a guess.
+    expect(byName.get('no-digest.gguf')?.sha256).toBeNull();
+    expect(byName.get('bad-digest.gguf')?.sha256).toBeNull();
+  });
+
+  it('looks up the digest for one file, and reports null when there is none', async () => {
+    expect(
+      await lookupFileDigest('a/b', 'good.gguf', { fetch: jsonServer(WITH_DIGESTS).fetch }),
+    ).toBe(DIGEST);
+    expect(
+      await lookupFileDigest('a/b', 'no-digest.gguf', { fetch: jsonServer(WITH_DIGESTS).fetch }),
+    ).toBeNull();
+    expect(
+      await lookupFileDigest('a/b', 'absent.gguf', { fetch: jsonServer(WITH_DIGESTS).fetch }),
+    ).toBeNull();
   });
 });

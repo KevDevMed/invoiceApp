@@ -221,6 +221,45 @@ export interface SupportQuery {
   readonly ctxSize?: number;
 }
 
+export interface MemoryBudget {
+  readonly hasDiscreteGpu: boolean;
+  readonly totalSystemMemoryBytes: number;
+  readonly totalVramBytes: number;
+  readonly usableVramBytes: number;
+  readonly usableTotalMemoryBytes: number;
+}
+
+/**
+ * What this machine can actually give a model, after `RESERVE_BYTES`.
+ *
+ * Split out of the verdict so the load path can size a context against the same
+ * numbers the verdict was computed from, rather than a second opinion.
+ */
+export function memoryBudget(hardware: CompatibilityHardware): MemoryBudget {
+  const totalRam = hardware.totalRamBytes ?? 0;
+  const hasDiscreteGpu = hardware.gpus.length > 0;
+
+  // On a unified-memory machine there is no discrete GPU, so system RAM is not
+  // counted separately — it is already the VRAM pool.
+  const totalSystemMemoryBytes = hasDiscreteGpu ? totalRam : 0;
+  const totalVramBytes = hasDiscreteGpu
+    ? hardware.gpus.reduce((sum, gpu) => sum + gpu.totalMemoryBytes, 0)
+    : totalRam;
+
+  const usableVramBytes = Math.max(0, totalVramBytes - RESERVE_BYTES);
+  const usableTotalMemoryBytes =
+    (totalSystemMemoryBytes > RESERVE_BYTES ? totalSystemMemoryBytes - RESERVE_BYTES : 0) +
+    usableVramBytes;
+
+  return {
+    hasDiscreteGpu,
+    totalSystemMemoryBytes,
+    totalVramBytes,
+    usableVramBytes,
+    usableTotalMemoryBytes,
+  };
+}
+
 function greyBreakdown(
   modelSizeBytes: number,
   contextSize: number,
@@ -270,19 +309,8 @@ export function checkModelSupport(query: SupportQuery): SupportBreakdown {
   }
 
   const totalRequiredBytes = query.modelSizeBytes + kvCache.kvCacheBytes;
-  const hasDiscreteGpu = query.hardware.gpus.length > 0;
-
-  // On a unified-memory machine there is no discrete GPU, so system RAM is not
-  // counted separately — it is already the VRAM pool.
-  const totalSystemMemoryBytes = hasDiscreteGpu ? query.hardware.totalRamBytes : 0;
-  const totalVramBytes = hasDiscreteGpu
-    ? query.hardware.gpus.reduce((sum, gpu) => sum + gpu.totalMemoryBytes, 0)
-    : query.hardware.totalRamBytes;
-
-  const usableVramBytes = Math.max(0, totalVramBytes - RESERVE_BYTES);
-  const usableTotalMemoryBytes =
-    (totalSystemMemoryBytes > RESERVE_BYTES ? totalSystemMemoryBytes - RESERVE_BYTES : 0) +
-    usableVramBytes;
+  const { hasDiscreteGpu, totalSystemMemoryBytes, totalVramBytes, usableVramBytes, usableTotalMemoryBytes } =
+    memoryBudget(query.hardware);
 
   const shared = {
     modelSizeBytes: query.modelSizeBytes,

@@ -44,8 +44,12 @@ import {
   SmokeTestRequest,
   opOf,
 } from '../llm/extra-channels';
-import { describeHardware, type HardwareProfile } from '../llm/hardware';
+import type { CompatibilityHardware } from '../llm/compatibility';
+import { clampContextSize } from '../llm/context-clamp';
+import { readLocalGgufMetadata } from '../llm/gguf';
+import { describeHardware, toCompatibilityHardware, type HardwareProfile } from '../llm/hardware';
 import { lookupRepo, type HfRepoInfo } from '../llm/hf';
+import { PendingToolCalls } from '../llm/pending-tool-calls';
 import { SupportService, type VariantSupport } from '../llm/support-service';
 import { runSmokeTest, saveSmokeTest, type SmokeTestRecord } from '../llm/smoke-test';
 import {
@@ -128,6 +132,9 @@ function getDownloader(): ModelDownloader {
     modelsRoot: () => modelsDir(),
     fetch: (url, init) => fetch(url, init),
     emit: emitDownloadProgress,
+    // Non-catalog downloads get their expected digest from the Hub, using the
+    // same token the repo lookup uses so gated repos still resolve.
+    hfToken: readHfToken,
   });
   return downloader;
 }
@@ -146,8 +153,14 @@ function getRuntime(): LlmRuntime {
 /** Chat generations that can still be cancelled, keyed by `requestId`. */
 const activeChats = new Map<string, AbortController>();
 
-/** Mutating tool calls waiting on the user, keyed by call id. */
-const pendingToolCalls = new Map<string, ToolCall>();
+/**
+ * Mutating tool calls waiting on the user, keyed by call id.
+ *
+ * Bounded by TTL and by count: the model can propose one of these every turn and
+ * the user is never obliged to answer, so an unbounded map would grow for the
+ * life of the process on model output alone.
+ */
+const pendingToolCalls = new PendingToolCalls<ToolCall>();
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -203,23 +216,45 @@ export function register(): void {
     if (!record || record.status !== 'ready' || !record.localPath) {
       throw new Error(`Model ${payload.modelId} is not downloaded yet.`);
     }
+    if (record.verifiedSha256 === null) {
+      // Belt and braces: `reconcileOnBoot` already refuses to promote unverified
+      // bytes, and this is the last gate before llama.cpp's native GGUF parser.
+      throw new Error(
+        `Model ${payload.modelId} has not been checksum-verified on this machine. Download it again before loading it.`,
+      );
+    }
 
     // Re-derive the path rather than trusting the stored one: the row survives
     // upgrades, the allow-list is the thing that has to hold.
     const modelPath = resolveModelPath(modelsDir(), record.id, record.filename);
     const entry = findCatalogEntry(record.id);
-    const contextSize =
-      payload.contextSize ?? entry?.defaultContextSize ?? DEFAULT_CONTEXT_SIZE;
+    const requested = payload.contextSize ?? entry?.defaultContextSize ?? DEFAULT_CONTEXT_SIZE;
+
+    const clamp = await clampRequestedContext({
+      requested,
+      modelPath,
+      modelSizeBytes: record.sizeBytes,
+      fallbackMax: entry?.defaultContextSize ?? DEFAULT_CONTEXT_SIZE,
+    });
 
     const loaded = await getRuntime().load({
       modelId: record.id,
       modelPath,
-      contextSize,
+      contextSize: clamp.contextSize,
       gpuLayers: payload.gpuLayers,
     });
 
     writeSetting(db, ACTIVE_MODEL_KEY, loaded.modelId);
-    return { modelId: loaded.modelId, loaded: true, contextSize: loaded.contextSize };
+    // `contextSize` is the contract's field and reports what was actually
+    // allocated. The clamp fields ride alongside so the UI can say why.
+    return {
+      modelId: loaded.modelId,
+      loaded: true,
+      contextSize: loaded.contextSize,
+      requestedContextSize: clamp.requestedContextSize,
+      contextClamped: clamp.clamped,
+      contextClampReason: clamp.reason,
+    };
   });
 
   registerHandler('llm:unload', IPC_CONTRACT['llm:unload'].request, async () => {
@@ -655,13 +690,58 @@ function writeSetting(db: ReturnType<typeof getDatabase>, key: string, value: st
 // Shutdown
 // ---------------------------------------------------------------------------
 
+/**
+ * Bound a requested context by the model's own header and this machine's memory.
+ *
+ * Reading the local header costs one small read; a failure is not fatal, it just
+ * leaves the clamp working from the fallback.
+ */
+async function clampRequestedContext(input: {
+  requested: number;
+  modelPath: string;
+  modelSizeBytes: number | null;
+  fallbackMax: number;
+}): Promise<ReturnType<typeof clampContextSize>> {
+  let meta: Awaited<ReturnType<typeof readLocalGgufMetadata>> | null = null;
+  try {
+    meta = await readLocalGgufMetadata(input.modelPath);
+  } catch (error) {
+    console.warn('[llm] could not read GGUF metadata for the context clamp:', error);
+  }
+
+  let hardware: CompatibilityHardware = { totalRamBytes: null, gpus: [] };
+  try {
+    hardware = toCompatibilityHardware(await getSupportService().systemInfo());
+  } catch (error) {
+    console.warn('[llm] could not detect hardware for the context clamp:', error);
+  }
+
+  return clampContextSize({
+    requested: input.requested,
+    meta,
+    modelSizeBytes: input.modelSizeBytes,
+    hardware,
+    fallbackMax: input.fallbackMax,
+  });
+}
+
 /** Cancel everything in flight. Exported for the app's `will-quit` path. */
 export async function shutdownLlm(): Promise<void> {
   for (const controller of activeChats.values()) controller.abort();
   activeChats.clear();
+  pendingToolCalls.clear();
   for (const id of getDownloader().activeDownloadIds()) {
     getDownloader().cancel(id);
     markInterrupted(getDatabase(), id, 0);
   }
   await getRuntime().dispose();
+}
+
+/**
+ * The teardown `registry.ts` drains on `before-quit`, before the database closes.
+ *
+ * Discovered by name, like `register()` — nothing has to list it anywhere.
+ */
+export async function shutdown(): Promise<void> {
+  await shutdownLlm();
 }

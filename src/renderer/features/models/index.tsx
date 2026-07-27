@@ -33,13 +33,12 @@ import { HStack, VStack } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
-import type { ModelRecord } from '../../../shared/types';
 import {
   describeSmokeTest,
-  downloadErrorOf,
   presentVerdict,
   readSmokeTest,
   variantKey,
+  type LocalModel,
   type SupportVerdict,
   type VariantSupportView,
 } from './llmExtra';
@@ -66,7 +65,7 @@ export function ModelsPage(): React.JSX.Element {
   const models = useModels();
   const [pendingRed, setPendingRed] = useState<Variant | null>(null);
 
-  const localByFile = new Map<string, ModelRecord>(
+  const localByFile = new Map<string, LocalModel>(
     models.local.map((record) => [variantKey(record.repo, record.filename), record]),
   );
 
@@ -276,7 +275,7 @@ function SystemPanel({ models }: { readonly models: ModelsState }): React.JSX.El
 
 interface RepoLookupProps {
   readonly models: ModelsState;
-  readonly localByFile: Map<string, ModelRecord>;
+  readonly localByFile: Map<string, LocalModel>;
   readonly onDownload: (variant: Variant, verdict: SupportVerdict) => void;
 }
 
@@ -367,7 +366,7 @@ function RepoLookup({ models, localByFile, onDownload }: RepoLookupProps): React
 interface VariantRowProps {
   readonly models: ModelsState;
   readonly variant: Variant;
-  readonly record: ModelRecord | null;
+  readonly record: LocalModel | null;
   readonly onDownload: (variant: Variant, verdict: SupportVerdict) => void;
 }
 
@@ -380,7 +379,8 @@ function VariantRow({ models, variant, record, onDownload }: VariantRowProps): R
   // The event stream is ahead of the table between two refreshes, so it wins.
   const isDownloading = progress?.status === 'downloading' || record?.status === 'downloading';
   const isReady = progress?.status === 'ready' || (record?.status === 'ready' && !isDownloading);
-  const failure = progress?.status === 'error' ? progress.error : downloadErrorOf(record?.error ?? null);
+  // `error` means only "the download failed" now that the smoke test has its own column.
+  const failure = progress?.status === 'error' ? progress.error : (record?.error ?? null);
 
   const received = progress?.receivedBytes ?? record?.downloadedBytes ?? 0;
   const total = progress?.totalBytes ?? record?.sizeBytes ?? variant.sizeBytes ?? null;
@@ -620,9 +620,9 @@ function LocalModelCard({
   record,
 }: {
   readonly models: ModelsState;
-  readonly record: ModelRecord;
+  readonly record: LocalModel;
 }): React.JSX.Element {
-  const smokeTest = readSmokeTest(record.error);
+  const smokeTest = readSmokeTest(record);
   const isActive = models.activeModelId === record.id;
   const isTesting = models.testingId === record.id;
   const isBusy = models.busyId === record.id;

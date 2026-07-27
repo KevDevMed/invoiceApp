@@ -12,6 +12,7 @@
  */
 
 import init001 from './migrations/001_init.sql?raw';
+import diagnostics002 from './migrations/002_model_diagnostics.sql?raw';
 import type { Db } from './client';
 
 export interface Migration {
@@ -20,7 +21,10 @@ export interface Migration {
   readonly sql: string;
 }
 
-export const MIGRATIONS: readonly Migration[] = [{ id: '001_init', sql: init001 }];
+export const MIGRATIONS: readonly Migration[] = [
+  { id: '001_init', sql: init001 },
+  { id: '002_model_diagnostics', sql: diagnostics002 },
+];
 
 const CREATE_MIGRATIONS_TABLE = `
   CREATE TABLE IF NOT EXISTS _migrations (

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { openDatabase, type Db } from '../../../db/client';
 import { migrate } from '../../../db/migrate';
-import { UnsafeModelPathError } from '../catalog';
+import { deriveModelId, UnsafeModelPathError } from '../catalog';
 import { ModelDownloader, type DownloadProgress, type FetchLike } from '../downloader';
 import { getModel, PART_SUFFIX, upsertModel } from '../store';
 
@@ -19,7 +19,8 @@ import { getModel, PART_SUFFIX, upsertModel } from '../store';
 
 const REPO = 'test-owner/test-repo';
 const FILENAME = 'test-model.gguf';
-const MODEL_ID = 'test-owner-test-repo-test-model';
+// Derived, not hand-written: ids now carry a hash of the exact repo/file pair.
+const MODEL_ID = deriveModelId(REPO, FILENAME);
 
 function sha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
@@ -65,12 +66,15 @@ describe('ModelDownloader', () => {
   let db: Db;
   let root: string;
   let events: DownloadProgress[];
+  /** The digest a non-catalog download resolves to. Null means "none published". */
+  let publishedDigest: string | null;
 
   beforeEach(() => {
     db = openDatabase(':memory:');
     migrate(db);
     root = mkdtempSync(path.join(tmpdir(), 'invoiceapp-models-'));
     events = [];
+    publishedDigest = null;
   });
 
   afterEach(() => {
@@ -83,6 +87,8 @@ describe('ModelDownloader', () => {
     now?: () => number;
     freeDiskBytes?: (dir: string) => Promise<number | null>;
     throttleMs?: number;
+    resolveDigest?: (repo: string, filename: string) => Promise<string | null>;
+    maxConcurrentDownloads?: number;
   }): ModelDownloader {
     return new ModelDownloader({
       db: () => db,
@@ -92,6 +98,9 @@ describe('ModelDownloader', () => {
       now: options.now,
       freeDiskBytes: options.freeDiskBytes ?? (async () => 1_000_000_000),
       throttleMs: options.throttleMs ?? 0,
+      // Stands in for the Hub blob API. The tests never reach the network.
+      resolveDigest: options.resolveDigest ?? (async () => publishedDigest),
+      maxConcurrentDownloads: options.maxConcurrentDownloads,
     });
   }
 
@@ -101,6 +110,7 @@ describe('ModelDownloader', () => {
 
   it('downloads to a .part file and renames it into place', async () => {
     const payload = Buffer.from('the weights, such as they are');
+    publishedDigest = sha256(payload);
     const downloader = build({ fetch: async () => stubResponse({ chunks: [payload] }) });
 
     const { modelId, completion } = downloader.start({ repo: REPO, filename: FILENAME });
@@ -115,12 +125,15 @@ describe('ModelDownloader', () => {
     expect(record?.status).toBe('ready');
     expect(record?.downloadedBytes).toBe(payload.byteLength);
     expect(record?.localPath).toBe(finalPath());
+    // The digest is persisted, so a later boot can tell verified bytes apart.
+    expect(record?.verifiedSha256).toBe(publishedDigest);
     expect(events.at(-1)?.status).toBe('ready');
   });
 
   it('resumes with a Range header and appends rather than truncating', async () => {
     const head = Buffer.from('AAAAAAAAAA');
     const tail = Buffer.from('BBBBBBBBBB');
+    publishedDigest = sha256(Buffer.concat([head, tail]));
 
     mkdirSync(path.join(root, MODEL_ID), { recursive: true });
     writeFileSync(`${finalPath()}${PART_SUFFIX}`, head);
@@ -151,6 +164,7 @@ describe('ModelDownloader', () => {
     writeFileSync(`${finalPath()}${PART_SUFFIX}`, Buffer.from('STALEBYTES'));
 
     const whole = Buffer.from('the whole file');
+    publishedDigest = sha256(whole);
     const downloader = build({ fetch: async () => stubResponse({ status: 200, chunks: [whole] }) });
 
     const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
@@ -161,6 +175,7 @@ describe('ModelDownloader', () => {
 
   it('leaves a resumable .part behind when cancelled, and no final file', async () => {
     const chunks = [Buffer.from('0123456789'), Buffer.from('abcdefghij'), Buffer.from('never sent')];
+    publishedDigest = sha256(Buffer.concat(chunks));
     let cancelNow: (() => void) | null = null;
 
     const downloader = build({
@@ -229,7 +244,10 @@ describe('ModelDownloader', () => {
 
     expect(outcome.status).toBe('error');
     expect(outcome.error).toContain('Checksum mismatch');
+    // Neither name survives: the mismatch is caught while the file is a `.part`,
+    // so the final name never exists at any point.
     expect(existsSync(path.join(root, 'qwen3-0-6b-q8-0', catalogFile))).toBe(false);
+    expect(existsSync(path.join(root, 'qwen3-0-6b-q8-0', `${catalogFile}${PART_SUFFIX}`))).toBe(false);
 
     const record = getModel(db, 'qwen3-0-6b-q8-0');
     expect(record?.status).toBe('error');
@@ -257,6 +275,7 @@ describe('ModelDownloader', () => {
 
   it('throttles progress events instead of emitting one per chunk', async () => {
     const chunks = Array.from({ length: 40 }, (_, index) => Buffer.from(`chunk-${index}-`));
+    publishedDigest = sha256(Buffer.concat(chunks));
     let clock = 0;
     // 10ms of simulated time per chunk against a 250ms throttle: 40 chunks span
     // 400ms, so at most a couple of interim events may escape.
@@ -280,6 +299,7 @@ describe('ModelDownloader', () => {
 
   it('reports a transfer rate and an ETA while downloading', async () => {
     const chunks = Array.from({ length: 20 }, () => Buffer.alloc(1000, 1));
+    publishedDigest = sha256(Buffer.concat(chunks));
     let clock = 0;
     const downloader = build({
       fetch: async () => stubResponse({ chunks }),
@@ -314,6 +334,7 @@ describe('ModelDownloader', () => {
   });
 
   it('refuses a second concurrent download of the same model', async () => {
+    publishedDigest = sha256(Buffer.from('bytes'));
     const gate = vi.fn();
     const downloader = build({
       fetch: async () => {
@@ -331,7 +352,248 @@ describe('ModelDownloader', () => {
     expect(downloader.isDownloading(MODEL_ID)).toBe(false);
   });
 
+
+  // -------------------------------------------------------------------------
+  // Integrity: nothing is fetched, and nothing is promoted, without a digest
+  // -------------------------------------------------------------------------
+
+  it('refuses a non-catalog download when no digest can be obtained', async () => {
+    publishedDigest = null;
+    const fetched = vi.fn();
+    const downloader = build({
+      fetch: async (url) => {
+        fetched(url);
+        return stubResponse({ chunks: [Buffer.from('unverifiable weights')] });
+      },
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('error');
+    expect(outcome.error).toContain('No SHA-256 is published');
+    // Refused before a single byte was requested.
+    expect(fetched).not.toHaveBeenCalled();
+    expect(existsSync(finalPath())).toBe(false);
+
+    const record = getModel(db, MODEL_ID);
+    expect(record?.status).toBe('error');
+    expect(record?.verifiedSha256).toBeNull();
+  });
+
+  it('refuses the download when the digest lookup itself fails', async () => {
+    const downloader = build({
+      fetch: async () => {
+        throw new Error('fetch should never be called');
+      },
+      resolveDigest: async () => {
+        throw new Error('Hugging Face returned HTTP 500');
+      },
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('error');
+    expect(outcome.error).toContain('Could not obtain a SHA-256');
+    expect(getModel(db, MODEL_ID)?.status).toBe('error');
+  });
+
+  it('catches a checksum mismatch while the file is still a .part', async () => {
+    publishedDigest = sha256(Buffer.from('what we asked for'));
+    const downloader = build({
+      fetch: async () => stubResponse({ chunks: [Buffer.from('what we actually got')] }),
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('error');
+    expect(outcome.error).toContain('Checksum mismatch');
+    // The final name never existed, so no crash window can leave one behind.
+    expect(existsSync(finalPath())).toBe(false);
+    expect(existsSync(`${finalPath()}${PART_SUFFIX}`)).toBe(false);
+
+    const record = getModel(db, MODEL_ID);
+    expect(record?.status).toBe('error');
+    expect(record?.verifiedSha256).toBeNull();
+  });
+
+  it('verifies an existing final file in place rather than downloading it again', async () => {
+    const payload = Buffer.from('weights that survived a demotion');
+    publishedDigest = sha256(payload);
+    mkdirSync(path.join(root, MODEL_ID), { recursive: true });
+    writeFileSync(finalPath(), payload);
+
+    const fetched = vi.fn();
+    const downloader = build({
+      fetch: async (url) => {
+        fetched(url);
+        return stubResponse({ chunks: [payload] });
+      },
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('ready');
+    expect(fetched).not.toHaveBeenCalled();
+    expect(getModel(db, MODEL_ID)?.verifiedSha256).toBe(publishedDigest);
+  });
+
+  // -------------------------------------------------------------------------
+  // Transport: https on every hop
+  // -------------------------------------------------------------------------
+
+  it('rejects an http hop before issuing a single plaintext request', async () => {
+    publishedDigest = sha256(Buffer.from('never delivered'));
+    const requested: string[] = [];
+
+    const downloader = build({
+      fetch: async (url) => {
+        requested.push(url);
+        if (url.startsWith('https://huggingface.co/')) {
+          return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            url,
+            headers: new Headers({ location: 'http://cdn.example.test/weights.gguf' }),
+            body: null,
+          } as unknown as Response;
+        }
+        return stubResponse({ chunks: [Buffer.from('never delivered')], url });
+      },
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('error');
+    expect(outcome.error).toContain('Refusing non-https download URL');
+    // The only request that ever went out is the https one we started with.
+    expect(requested).toHaveLength(1);
+    expect(requested[0]?.startsWith('https://')).toBe(true);
+    expect(requested.some((url) => url.startsWith('http://'))).toBe(false);
+  });
+
+  it('follows an https redirect chain and refuses to loop forever', async () => {
+    const payload = Buffer.from('redirected weights');
+    publishedDigest = sha256(payload);
+    const requested: string[] = [];
+
+    const downloader = build({
+      fetch: async (url) => {
+        requested.push(url);
+        if (url.startsWith('https://huggingface.co/')) {
+          return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            url,
+            headers: new Headers({ location: 'https://cdn.example.test/weights.gguf' }),
+            body: null,
+          } as unknown as Response;
+        }
+        return stubResponse({ chunks: [payload], url });
+      },
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+
+    expect(outcome.status).toBe('ready');
+    expect(requested).toHaveLength(2);
+    expect(requested[1]).toBe('https://cdn.example.test/weights.gguf');
+  });
+
+  it('gives up on a redirect loop', async () => {
+    publishedDigest = sha256(Buffer.from('nothing'));
+    const downloader = build({
+      fetch: async (url) =>
+        ({
+          ok: false,
+          status: 307,
+          statusText: 'Temporary Redirect',
+          url,
+          headers: new Headers({ location: 'https://cdn.example.test/a.gguf' }),
+          body: null,
+        }) as unknown as Response,
+    });
+
+    const outcome = await downloader.start({ repo: REPO, filename: FILENAME }).completion;
+    expect(outcome.status).toBe('error');
+    expect(outcome.error).toMatch(/Redirect loop|Gave up after/);
+  });
+
+  // -------------------------------------------------------------------------
+  // Concurrency and disk space
+  // -------------------------------------------------------------------------
+
+  it('runs two downloads at a time and queues the third', async () => {
+    const payload = Buffer.from('shared payload');
+    publishedDigest = sha256(payload);
+
+    const release: Array<() => void> = [];
+    const downloader = build({
+      fetch: async () => {
+        await new Promise<void>((resolve) => release.push(resolve));
+        return stubResponse({ chunks: [payload] });
+      },
+      maxConcurrentDownloads: 2,
+    });
+
+    const started = [
+      downloader.start({ repo: 'owner/one', filename: 'one.gguf' }),
+      downloader.start({ repo: 'owner/two', filename: 'two.gguf' }),
+      downloader.start({ repo: 'owner/three', filename: 'three.gguf' }),
+    ];
+
+    // Let the two slots fill.
+    await vi.waitFor(() => {
+      expect(release).toHaveLength(2);
+    });
+    expect(downloader.runningCount()).toBe(2);
+    expect(downloader.queuedCount()).toBe(1);
+
+    release.forEach((resolve) => resolve());
+    await vi.waitFor(() => {
+      expect(release).toHaveLength(3);
+    });
+    release.forEach((resolve) => resolve());
+
+    const outcomes = await Promise.all(started.map((start) => start.completion));
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(['ready', 'ready', 'ready']);
+    expect(downloader.runningCount()).toBe(0);
+    expect(downloader.queuedCount()).toBe(0);
+  });
+
+  it('counts the bytes other in-flight downloads have committed when checking free space', async () => {
+    // Two catalog models: 639 MB and 1.10 GB, against 1.2 GB of free space.
+    // Each fits on its own; together they do not.
+    const first = { repo: 'Qwen/Qwen3-0.6B-GGUF', filename: 'Qwen3-0.6B-Q8_0.gguf' };
+    const second = { repo: 'unsloth/Qwen3-1.7B-GGUF', filename: 'Qwen3-1.7B-Q4_K_M.gguf' };
+
+    const release: Array<() => void> = [];
+    const downloader = build({
+      fetch: async () => {
+        await new Promise<void>((resolve) => release.push(resolve));
+        return stubResponse({ chunks: [Buffer.from('x')] });
+      },
+      freeDiskBytes: async () => 1_200_000_000,
+    });
+
+    const firstStart = downloader.start(first);
+    await vi.waitFor(() => {
+      expect(release).toHaveLength(1);
+    });
+
+    const secondOutcome = await downloader.start(second).completion;
+
+    expect(secondOutcome.status).toBe('error');
+    expect(secondOutcome.error).toContain('Not enough free disk space');
+    expect(secondOutcome.error).toContain('already committed by other downloads');
+
+    release.forEach((resolve) => resolve());
+    await firstStart.completion;
+  });
+
   it('surfaces an HTTP error as a failed download', async () => {
+    publishedDigest = sha256(Buffer.from('anything'));
     const downloader = build({
       fetch: async () =>
         ({
