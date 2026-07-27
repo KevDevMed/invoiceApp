@@ -1,7 +1,17 @@
-# Build the macOS app on a real macOS runner.
+# Build the macOS app on real macOS runners — one runner per architecture.
 #
 # electron-builder cannot produce a mac target from Linux, so this is the only
 # way to get an installable .dmg without a Mac in hand.
+#
+# Each arch is built natively (macos-13 = Intel/x64, macos-14 = Apple Silicon/
+# arm64) because node-llama-cpp's backend packages are optional dependencies
+# gated on `cpu`. A cross-arch build installs only the host's backend, so an x64
+# .dmg packaged on an arm64 runner ships without @node-llama-cpp/mac-x64 and the
+# assistant dies with NoBinaryFoundError on a real Intel Mac.
+#
+# Runner labels are pinned on purpose. `macos-latest` silently moved from x64 to
+# arm64 once already; a retired explicit label fails the job loudly instead of
+# quietly producing a mismatched binary.
 #
 # Unsigned by default. macOS quarantines an unsigned download, so the first
 # launch needs right-click > Open, or:
@@ -28,13 +38,101 @@ on:
         description: 'Attach the build to a GitHub release'
         type: boolean
         default: false
+      tag:
+        description: 'Tag to publish the release under (required when release is checked, e.g. v1.2.3)'
+        type: string
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  # Runs first and costs seconds, so a manual dispatch that could never publish
+  # fails before two macOS runners are spent on it.
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      # softprops/action-gh-release@v2 resolves the tag as
+      # normalizeTagName(inputs.tag_name) || (isTag(github.ref) ? ref_name : '')
+      # (src/util.ts, parseConfig) and then refuses to continue with an empty
+      # tag ("GitHub Releases requires a tag", src/main.ts). On a manual
+      # dispatch github.ref is refs/heads/<branch>, so without an explicit tag
+      # the release step can only fail — fail here instead, with a message that
+      # says what to do.
+      - name: Resolve release tag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          WANT_RELEASE: ${{ inputs.release }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            # Only tags matching v* trigger this workflow, so ref_name is the tag.
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "Tag push: publishing release $REF_NAME"
+            exit 0
+          fi
+
+          if [ "$WANT_RELEASE" != "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "Manual run without release: artifacts only, no release."
+            exit 0
+          fi
+
+          TAG=$(printf '%s' "${TAG_INPUT:-}" | tr -d '[:space:]')
+          if [ -z "$TAG" ]; then
+            echo "::error::'release' was checked but no 'tag' was given. A manual run cannot infer a tag (github.ref is a branch here), and the release would fail with 'GitHub Releases requires a tag'. Re-run and set the 'tag' input, e.g. v1.2.3."
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Manual run: publishing release $TAG from ${{ github.sha }}"
+
+  # One verification pass gates packaging for both arches. It is arch-neutral
+  # (typecheck / lint / unit tests), so running it twice would buy nothing.
+  verify:
+    needs: [validate]
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          npm_config_foreground_scripts: 'true'
+
+      - name: Verify
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run test:run
+
   build:
-    runs-on: macos-latest
+    needs: [verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13   # Intel / x86_64
+            arch: x64
+            expected_uname: x86_64
+          - runner: macos-14   # Apple Silicon
+            arch: arm64
+            expected_uname: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
 
     # `secrets` is not one of the contexts available to a step-level `if:`
@@ -45,6 +143,22 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.MAC_CERT_P12 != '' && 'true' || 'false' }}
 
     steps:
+      # If a pinned label is ever retired or repointed, stop here rather than
+      # ship a .dmg whose native modules do not match its advertised arch.
+      - name: Confirm runner architecture
+        env:
+          EXPECTED: ${{ matrix.expected_uname }}
+          ARCH: ${{ matrix.arch }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(uname -m)
+          echo "runner=$RUNNER_LABEL arch=$ARCH uname=$ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Runner '$RUNNER_LABEL' reports uname -m '$ACTUAL', expected '$EXPECTED'. Refusing to build the $ARCH artifacts on a mismatched host — the node-llama-cpp backend would not match."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -52,20 +166,13 @@ jobs:
           node-version: '22'
           cache: npm
 
-      # node-llama-cpp fetches a llama.cpp backend matched to the host in its
-      # postinstall. On an Apple Silicon runner that is the Metal backend, which
-      # is the whole point of building here — skipping it would ship CPU-only
-      # inference to a machine that can do far better.
+      # node-llama-cpp's backends are optional dependencies gated on `cpu`, so
+      # this installs the backend for THIS runner only — Metal on arm64, the x64
+      # build on Intel. That is precisely why each arch is built on its own host.
       - name: Install dependencies
         run: npm ci
         env:
           npm_config_foreground_scripts: 'true'
-
-      - name: Verify before packaging
-        run: |
-          npm run typecheck
-          npm run lint
-          npm run test:run
 
       - name: Import signing certificate
         if: env.HAS_SIGNING_CERT == 'true'
@@ -85,46 +192,95 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           rm -f /tmp/cert.p12
 
+      # `--mac dmg:<arch> zip:<arch>` overrides electron-builder.yml's target
+      # list for this run: a target list carrying explicit types short-circuits
+      # computeArchToTargetNamesMap (app-builder-lib/out/targets/targetFactory.js)
+      # before the config's arch arrays are merged in, so only this arch builds.
+      # artifactName still comes from the config, so the filenames are unchanged.
+      # (The bare `--x64`/`--arm64` boolean flags would NOT be enough — the
+      # config's per-target `arch:` lists get added on top of them.)
+      #
       # CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder from hunting for
       # an identity that is not there and failing the whole build over it.
-      - name: Package
+      - name: Package ${{ matrix.arch }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.HAS_SIGNING_CERT }}
           GH_TOKEN: ${{ github.token }}
-        run: npm run package:mac -- --publish never
+        run: npm run package:mac -- --mac dmg:${{ matrix.arch }} zip:${{ matrix.arch }} --publish never
 
       - name: Show what was produced
-        run: ls -lh release/ || ls -lh dist/ || true
+        run: ls -lh release/
 
+      # The download pages hard-code these names; a rename must fail the build,
+      # not silently publish a release the site cannot link to.
+      - name: Check artifact names
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          for f in "release/InvoiceApp-mac-$ARCH.dmg" "release/InvoiceApp-mac-$ARCH.zip"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Expected $f was not produced."
+              exit 1
+            fi
+          done
+
+      # v4 artifacts are immutable and names must be unique per job, so each
+      # matrix leg uploads under its own arch-suffixed name.
       - uses: actions/upload-artifact@v4
         with:
-          name: invoiceapp-macos
+          name: invoiceapp-macos-${{ matrix.arch }}
           path: |
-            release/*.dmg
-            release/*.zip
-            dist/*.dmg
-            dist/*.zip
+            release/InvoiceApp-mac-${{ matrix.arch }}.dmg
+            release/InvoiceApp-mac-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.release
+  # Publishing happens exactly once, after every matrix leg has finished. Running
+  # the release step per matrix leg would race two jobs to create one release.
+  release:
+    needs: [validate, build]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts from every arch
+        uses: actions/download-artifact@v4
+        with:
+          pattern: invoiceapp-macos-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Confirm all four assets are present
+        run: |
+          set -euo pipefail
+          ls -lh release-assets/
+          for f in InvoiceApp-mac-arm64.dmg InvoiceApp-mac-x64.dmg \
+                   InvoiceApp-mac-arm64.zip InvoiceApp-mac-x64.zip; do
+            if [ ! -f "release-assets/$f" ]; then
+              echo "::error::Missing $f — refusing to publish a partial release."
+              exit 1
+            fi
+          done
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          # Resolved by the validate job: the pushed tag, or the tag typed into
+          # the manual dispatch. Never empty here.
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           # Must publish, not draft. Every download button on the site points at
           # `releases/latest/download/InvoiceApp-mac-<arch>.dmg`, and that
           # endpoint ignores drafts — a drafted release means every link 404s.
           draft: false
           make_latest: 'true'
           generate_release_notes: true
-          # electron-builder writes InvoiceApp-mac-arm64.dmg / -x64.dmg and the
-          # matching .zips into release/ (see artifactName in
-          # electron-builder.yml); these globs pick them up unchanged.
+          fail_on_unmatched_files: true
           files: |
-            release/*.dmg
-            release/*.zip
-            dist/*.dmg
-            dist/*.zip
+            release-assets/InvoiceApp-mac-arm64.dmg
+            release-assets/InvoiceApp-mac-x64.dmg
+            release-assets/InvoiceApp-mac-arm64.zip
+            release-assets/InvoiceApp-mac-x64.zip
