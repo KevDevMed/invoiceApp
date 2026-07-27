@@ -166,10 +166,11 @@ export function SettingsPage(): React.JSX.Element {
       {status ? <Banner status={status.kind} title={status.message} isDismissable /> : null}
 
       <SettingsGroup title="Business">
-        <SettingsRow label="Business name" description="Printed at the top of every invoice.">
+        <SettingsRow label="Business name">
           <TextInput
             label="Business name"
             isLabelHidden
+            description="Printed at the top of every invoice."
             value={settings.businessName}
             isDisabled={isLoading}
             placeholder="Acme Consulting LLC"
@@ -179,13 +180,11 @@ export function SettingsPage(): React.JSX.Element {
           />
         </SettingsRow>
 
-        <SettingsRow
-          label="Business address"
-          description="Free text, one line per line. Printed under the business name."
-        >
+        <SettingsRow label="Business address">
           <TextArea
             label="Business address"
             isLabelHidden
+            description="Free text, one line per line. Printed under the business name."
             value={settings.businessAddress}
             isDisabled={isLoading}
             rows={4}
@@ -198,10 +197,11 @@ export function SettingsPage(): React.JSX.Element {
       </SettingsGroup>
 
       <SettingsGroup title="Invoice defaults">
-        <SettingsRow label="Default currency" description="Every new invoice starts here.">
+        <SettingsRow label="Default currency">
           <Selector
             label="Default currency"
             isLabelHidden
+            description="Every new invoice starts here."
             options={CURRENCIES}
             value={settings.defaultCurrency}
             isDisabled={isLoading}
@@ -211,13 +211,11 @@ export function SettingsPage(): React.JSX.Element {
           />
         </SettingsRow>
 
-        <SettingsRow
-          label="Default tax rate"
-          description="Basis points — 825 means 8.25%. Stored as an integer so tax math never uses floats."
-        >
+        <SettingsRow label="Default tax rate">
           <NumberInput
             label="Default tax rate"
             isLabelHidden
+            description="Basis points — 825 means 8.25%. Stored as an integer so tax math never uses floats."
             value={settings.defaultTaxRateBps}
             min={0}
             max={1000000}
@@ -229,13 +227,11 @@ export function SettingsPage(): React.JSX.Element {
           />
         </SettingsRow>
 
-        <SettingsRow
-          label="Invoice number prefix"
-          description="Prepended to generated invoice numbers, e.g. INV-0001."
-        >
+        <SettingsRow label="Invoice number prefix">
           <TextInput
             label="Invoice number prefix"
             isLabelHidden
+            description="Prepended to generated invoice numbers, e.g. INV-0001."
             value={settings.invoiceNumberPrefix}
             isDisabled={isLoading}
             onChange={(value) => {
@@ -252,13 +248,11 @@ export function SettingsPage(): React.JSX.Element {
           answers 401/403 until a token from an account that accepted the
           licence is sent.
         */}
-        <SettingsRow
-          label="Hugging Face access token"
-          description="Only needed for gated or private model repos. Leave empty otherwise. Stored locally in the app database, in plain text."
-        >
+        <SettingsRow label="Hugging Face access token">
           <TextInput
             label="Hugging Face access token"
             isLabelHidden
+            description="Only needed for gated or private model repos. Leave empty otherwise. Stored locally in the app database, in plain text."
             type="password"
             isOptional
             placeholder="hf_..."
@@ -296,26 +290,26 @@ function SettingsGroup({
   );
 }
 
-/** One row: label and supporting copy on the left, the control on the right. */
+/**
+ * One row: the label on the left, the control on the right.
+ *
+ * Supporting copy is deliberately NOT a prop here. It goes to the control's own
+ * `description` prop, which renders it and wires `aria-describedby` to the
+ * input; a `Text` sitting next to the control looks the same but tells assistive
+ * technology nothing.
+ */
 function SettingsRow({
   label,
-  description,
   children,
 }: {
   readonly label: string;
-  readonly description: string;
   readonly children: React.ReactNode;
 }): React.JSX.Element {
   return (
     <VStack gap={0}>
       <HStack gap={4} justify="between" align="start" paddingBlock={3} wrap="wrap">
         <StackItem size="fill">
-          <VStack gap={0.5}>
-            <Text weight="medium">{label}</Text>
-            <Text type="supporting" display="block">
-              {description}
-            </Text>
-          </VStack>
+          <Text weight="medium">{label}</Text>
         </StackItem>
         <VStack width={CONTROL_WIDTH} maxWidth="100%">
           {children}
