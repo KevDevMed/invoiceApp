@@ -25,16 +25,55 @@ import {
   type IpcResponse,
 } from '../../shared/ipc-contract';
 
+/**
+ * `event` is `undefined` when the channel is called in-process rather than from
+ * the renderer — see `invokeChannel`. Handlers that need the sender must handle
+ * that case.
+ */
 export type Handler<C extends IpcChannel> = (
   payload: IpcRequest<C>,
-  event: IpcMainInvokeEvent,
+  event: IpcMainInvokeEvent | undefined,
 ) => IpcResponse<C> | Promise<IpcResponse<C>>;
 
 const registered = new Set<IpcChannel>();
+const dispatchers = new Map<IpcChannel, (raw: unknown, event?: IpcMainInvokeEvent) => Promise<unknown>>();
 
 /** Channels that currently have a live handler. Useful for diagnostics and tests. */
 export function registeredChannels(): IpcChannel[] {
   return [...registered];
+}
+
+/** Whether a channel has a live handler right now. */
+export function hasHandler(channel: IpcChannel): boolean {
+  return registered.has(channel);
+}
+
+/** Thrown by `invokeChannel` when the owning handler module is not present. */
+export class ChannelUnavailableError extends Error {
+  readonly code = 'CHANNEL_UNAVAILABLE';
+  constructor(readonly channel: string) {
+    super(`No handler registered for IPC channel: ${channel}`);
+    this.name = 'ChannelUnavailableError';
+  }
+}
+
+/**
+ * Call a registered channel from inside the main process, with the same zod
+ * validation and error wrapping the renderer path gets.
+ *
+ * This exists so the assistant's tool dispatcher can drive real app actions
+ * without importing another piece's modules. Throws `ChannelUnavailableError`
+ * if nothing has registered the channel.
+ */
+export async function invokeChannel<C extends IpcChannel>(
+  channel: C,
+  payload: IpcRequest<C>,
+): Promise<IpcResponse<C>> {
+  const dispatch = dispatchers.get(channel);
+  if (!dispatch) {
+    throw new ChannelUnavailableError(channel);
+  }
+  return (await dispatch(payload)) as IpcResponse<C>;
 }
 
 /**
@@ -57,7 +96,7 @@ export function registerHandler<C extends IpcChannel>(
   }
   registered.add(channel);
 
-  ipcMain.handle(channel, async (event, rawPayload: unknown) => {
+  const dispatch = async (rawPayload: unknown, event?: IpcMainInvokeEvent): Promise<unknown> => {
     const parsed = requestSchema.safeParse(rawPayload);
     if (!parsed.success) {
       const detail = parsed.error.issues
@@ -73,7 +112,10 @@ export function registerHandler<C extends IpcChannel>(
       console.error(`[ipc] ${channel} failed:`, error);
       throw new Error(`${channel} failed: ${message}`);
     }
-  });
+  };
+
+  dispatchers.set(channel, dispatch);
+  ipcMain.handle(channel, (event, rawPayload: unknown) => dispatch(rawPayload, event));
 }
 
 // ---------------------------------------------------------------------------
