@@ -123,3 +123,43 @@ npx astryx docs icons
 The semantic icon registry has no invoicing-domain icons, so the sidebar is
 deliberately text-only. A feature that wants icons should pass SVG components
 directly or call `registerIcons()`.
+
+## Browser preview
+
+`preview/` serves the **real renderer** over HTTP so the app can be reviewed
+without a signed macOS build. It is a preview, not a second product: the same
+`src/renderer` entry, the same Astryx CSS, and the same `src/domain`
+repositories. Nothing under `src/` changes to support it — the seam is
+`window.api`, which `preview/web-shim.ts` reimplements on top of
+`POST /api/invoke` instead of Electron IPC.
+
+```bash
+npm run preview:build   # build the web bundle into preview/dist
+npm run preview:serve   # http://0.0.0.0:4300
+npm run preview:dev     # both
+npm run preview:test    # the preview's own vitest suite
+```
+
+Environment: `PREVIEW_HOST`, `PREVIEW_PORT` (default `0.0.0.0:4300`),
+`PREVIEW_DB_PATH` (default `./preview-data/preview.db`), and `PREVIEW_RESET=1`
+to wipe and reseed the demo data. The preview database is created and migrated
+on boot and is entirely separate from the desktop app's user-data directory.
+
+`POST /api/invoke` takes `{ channel, payload }` and answers `{ ok: true, data }`
+or `{ ok: false, error: { code, message } }`. Every payload is validated with
+`IPC_CONTRACT[channel].request` — the contract's own zod schema, exactly as
+`src/main/ipc/registry.ts` does it — and undeclared channels are refused.
+
+`settings:*`, `app:version`, `clients:*`, `invoices:*` (except `exportPdf`) and
+`reports:*` run for real. `invoices:exportPdf` and every `llm:*` channel return
+a `DESKTOP_ONLY` error rather than fake data: PDF export needs Electron's
+`printToPDF` and local models need the native llama.cpp runtime. A fixed banner
+says so in the UI, and `/download` explains how to get the macOS build.
+
+Docker (the Dokploy target) builds the bundle and runs the server as a non-root
+user on port 4300, with `/healthz` for the healthcheck and a named volume for
+`preview-data`:
+
+```bash
+docker compose up --build
+```

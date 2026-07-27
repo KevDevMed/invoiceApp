@@ -5,7 +5,16 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['node_modules/**', 'out/**', 'dist/**', 'release/**', 'coverage/**'],
+    // `dist/**` is root-anchored, so the browser preview's bundle needs its own
+    // entry — otherwise `eslint .` lints minified rollup output.
+    ignores: [
+      'node_modules/**',
+      'out/**',
+      'dist/**',
+      'preview/dist/**',
+      'release/**',
+      'coverage/**',
+    ],
   },
   js.configs.recommended,
   tseslint.configs.recommended,
@@ -49,6 +58,14 @@ export default tseslint.config(
     files: ['**/*.config.ts', 'eslint.config.js'],
     languageOptions: {
       globals: { ...globals.node },
+    },
+  },
+  {
+    // The browser preview spans both environments in one directory: server.ts is
+    // node, web-shim.ts runs in the page.
+    files: ['preview/**/*.{ts,mjs}'],
+    languageOptions: {
+      globals: { ...globals.node, ...globals.browser },
     },
   },
 );

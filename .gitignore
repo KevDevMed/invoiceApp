@@ -19,3 +19,7 @@ coverage/
 *.db
 *.db-shm
 *.db-wal
+
+# Browser preview: local database and Playwright screenshots
+preview-data/
+preview/.artifacts/

@@ -17,6 +17,10 @@
     "lint": "eslint .",
     "test": "vitest",
     "test:run": "vitest run",
+    "preview:build": "tsc --noEmit -p preview/tsconfig.json && vite build --config preview/vite.config.ts",
+    "preview:serve": "node --import tsx --import ./preview/register-raw.mjs preview/server.ts",
+    "preview:dev": "npm run preview:build && npm run preview:serve",
+    "preview:test": "vitest run --config preview/vitest.config.ts",
     "package:mac": "npm run build && electron-builder --mac --config electron-builder.yml",
     "postinstall": "npm rebuild better-sqlite3 && node -e \"const f=require('node:fs');f.mkdirSync('node_modules/better-sqlite3/build/node-abi',{recursive:true});f.copyFileSync('node_modules/better-sqlite3/build/Release/better_sqlite3.node','node_modules/better-sqlite3/build/node-abi/better_sqlite3.node')\" && electron-rebuild -f -w better-sqlite3 -m ."
   },
@@ -46,6 +50,7 @@
     "eslint-plugin-react-hooks": "^6.1.1",
     "globals": "^16.5.0",
     "playwright": "^1.56.1",
+    "tsx": "^4.23.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.46.0",
     "vite": "^7.1.9",
