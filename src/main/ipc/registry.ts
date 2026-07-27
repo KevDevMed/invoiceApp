@@ -37,6 +37,29 @@ export type Handler<C extends IpcChannel> = (
 
 const registered = new Set<IpcChannel>();
 const dispatchers = new Map<IpcChannel, (raw: unknown, event?: IpcMainInvokeEvent) => Promise<unknown>>();
+const shutdownHooks: Array<{ source: string; run: () => void | Promise<void> }> = [];
+
+/**
+ * Decide what a failing handler is allowed to tell the renderer.
+ *
+ * Domain errors carry a `code` and a message written for a user, so they pass
+ * through — the UI needs them to say "that client still has invoices". Anything
+ * else is an unplanned failure whose message may quote SQL, schema, or a file
+ * path, so the renderer gets a generic string and the detail stays in the main
+ * process log.
+ */
+function describeForRenderer(error: unknown): string {
+  if (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code: unknown }).code === 'string' &&
+    error instanceof Error
+  ) {
+    return error.message;
+  }
+  return 'an internal error occurred';
+}
 
 /** Channels that currently have a live handler. Useful for diagnostics and tests. */
 export function registeredChannels(): IpcChannel[] {
@@ -108,9 +131,8 @@ export function registerHandler<C extends IpcChannel>(
     try {
       return await handler(parsed.data, event);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       console.error(`[ipc] ${channel} failed:`, error);
-      throw new Error(`${channel} failed: ${message}`);
+      throw new Error(`${channel} failed: ${describeForRenderer(error)}`);
     }
   };
 
@@ -158,6 +180,25 @@ function registerAppHandlers(): void {
 interface HandlerModule {
   register?: () => void | Promise<void>;
   default?: () => void | Promise<void>;
+  /** Optional teardown, awaited on quit before the database closes. */
+  shutdown?: () => void | Promise<void>;
+}
+
+/**
+ * Run every handler module's `shutdown()` before the app tears down.
+ *
+ * Modules holding OS resources — a loaded model, an in-flight download — need a
+ * chance to release them while the database is still open, because their
+ * teardown writes final state. Failures are logged and never block the quit.
+ */
+export async function runShutdownHooks(): Promise<void> {
+  for (const hook of shutdownHooks) {
+    try {
+      await hook.run();
+    } catch (error) {
+      console.error(`[ipc] shutdown hook from ${hook.source} failed:`, error);
+    }
+  }
 }
 
 /**
@@ -178,6 +219,9 @@ export async function registerAll(): Promise<void> {
       const register = module.register ?? module.default;
       if (typeof register === 'function') {
         await register();
+        if (typeof module.shutdown === 'function') {
+          shutdownHooks.push({ source: modulePath, run: module.shutdown });
+        }
       } else {
         console.warn(
           `[ipc] ${modulePath} exports no register() function — assuming it self-registered on import.`,

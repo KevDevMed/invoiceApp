@@ -13,7 +13,7 @@ import { app, BrowserWindow } from 'electron';
 
 import { closeDatabase, openDatabase, setDatabase } from '../db/client';
 import { migrate } from '../db/migrate';
-import { registerAll } from './ipc/registry';
+import { registerAll, runShutdownHooks } from './ipc/registry';
 import { databasePath, ensureDir } from './paths';
 import { createMainWindow, hardenWebContents, installContentSecurityPolicy } from './window';
 
@@ -69,6 +69,25 @@ app
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Teardown is two-phase on purpose. Handler modules may hold a loaded model or
+// an in-flight download whose cleanup still needs to write state, so their
+// shutdown hooks run to completion while the database is open. Only then does
+// the real quit proceed and `will-quit` close it.
+let shuttingDown = false;
+
+app.on('before-quit', (event) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  event.preventDefault();
+  void runShutdownHooks()
+    .catch((error: unknown) => {
+      console.error('[app] shutdown hooks failed:', error);
+    })
+    .finally(() => {
+      app.quit();
+    });
 });
 
 app.on('will-quit', () => {
