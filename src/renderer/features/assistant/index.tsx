@@ -37,6 +37,7 @@ import { Text } from '@astryxdesign/core/Text';
 import type { ChatMessage } from '../../../shared/types';
 import { Page, PageHeader } from '../../ui/Page';
 import { describeSmokeTest, readSmokeTest } from '../models/llmExtra';
+import { hasTranscriptContent, visibleMessages } from './transcript';
 import { parseToolCalls, useAssistant, type ToolCallRecord } from './useAssistant';
 
 const DESCRIPTION =
@@ -73,6 +74,12 @@ export function AssistantPage(): React.JSX.Element {
   }
 
   const hasModel = assistant.activeModelId !== null;
+  /*
+    Decided here, not inside `<Transcript/>`: `ChatLayout` renders its empty
+    state only when `children` is `null`, and an element that returns `null`
+    is still an element. See `transcript.ts`.
+  */
+  const hasTranscript = hasTranscriptContent(assistant.messages, assistant.isStreaming);
   const activeRecord =
     assistant.readyModels.find((record) => record.id === assistant.activeModelId) ?? null;
   const activeSmokeTest = activeRecord ? readSmokeTest(activeRecord) : null;
@@ -172,7 +179,7 @@ export function AssistantPage(): React.JSX.Element {
                 />
               }
             >
-              <Transcript assistant={assistant} />
+              {hasTranscript ? <Transcript assistant={assistant} /> : null}
             </ChatLayout>
           </StackItem>
         </VStack>
@@ -221,11 +228,9 @@ function ThreadSidebar({ assistant }: AssistantProps): React.JSX.Element {
   );
 }
 
-function Transcript({ assistant }: AssistantProps): React.JSX.Element | null {
-  const visible = assistant.messages.filter((message) => message.role !== 'system');
-
-  // Null hands the empty state back to ChatLayout, which centres it for us.
-  if (visible.length === 0 && !assistant.isStreaming) return null;
+/** Only mounted when there is something to draw — see `AssistantPage`. */
+function Transcript({ assistant }: AssistantProps): React.JSX.Element {
+  const visible = visibleMessages(assistant.messages);
 
   return (
     <ChatMessageList isStreaming={assistant.isStreaming} density="spacious">
