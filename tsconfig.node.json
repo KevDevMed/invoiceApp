@@ -24,6 +24,7 @@
     "noUncheckedIndexedAccess": true
   },
   "include": [
+    "src/domain/**/*.ts",
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
     "src/db/**/*.ts",
