@@ -228,11 +228,12 @@
       </div>
 
       <section class="card card--warning">
-        <h2>First launch: macOS will say the app is damaged or unidentified</h2>
+        <h2>If macOS says the app is damaged or from an unidentified developer</h2>
         <p>
-          <strong>This is expected, and the app is fine.</strong> The build is not signed with an
-          Apple Developer certificate, so Gatekeeper quarantines it. You have to let it through
-          once — after that it opens normally.
+          <strong>The app is fine.</strong> This dialog appears when the build you downloaded is not
+          signed with an Apple Developer certificate, so Gatekeeper quarantines it. If it appears,
+          let the app through once — after that it opens normally. If the app opens without any
+          warning, you have a signed build and can skip this section.
         </p>
         <ol>
           <li>Drag <strong>InvoiceApp</strong> into your <strong>Applications</strong> folder.</li>
@@ -253,7 +254,7 @@
         <h2>System requirements</h2>
         <dl>
           <dt>Operating system</dt>
-          <dd>macOS 11 Big Sur or later</dd>
+          <dd>macOS 12 Monterey or later</dd>
           <dt>Processor</dt>
           <dd>
             Apple Silicon (M1 or newer) &mdash; use the <code>arm64</code> download above; Intel
