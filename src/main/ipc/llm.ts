@@ -39,16 +39,18 @@ import { ModelDownloader, removeLocalModel, type DownloadProgress } from '../llm
 import {
   CatalogRequestSchema,
   CheckSupportRequest,
+  DiscoverRequest,
   HF_TOKEN_SETTING_KEY,
   HfLookupRequest,
   SmokeTestRequest,
   opOf,
 } from '../llm/extra-channels';
+import { discoverModels, type DiscoveryResult } from '../llm/discovery';
 import type { CompatibilityHardware } from '../llm/compatibility';
 import { clampContextSize } from '../llm/context-clamp';
 import { readLocalGgufMetadata } from '../llm/gguf';
 import { describeHardware, toCompatibilityHardware, type HardwareProfile } from '../llm/hardware';
-import { lookupRepo, type HfRepoInfo } from '../llm/hf';
+import { lookupRepo, searchRepos, type HfRepoInfo } from '../llm/hf';
 import { PendingToolCalls } from '../llm/pending-tool-calls';
 import { SupportService, type VariantSupport } from '../llm/support-service';
 import { runSmokeTest, saveSmokeTest, type SmokeTestRecord } from '../llm/smoke-test';
@@ -291,6 +293,7 @@ export interface CatalogOpResponse {
   readonly systemInfo?: HardwareProfile & { readonly summary: string };
   readonly support?: VariantSupport;
   readonly hf?: HfRepoInfo;
+  readonly discovery?: DiscoveryResult;
   readonly smokeTest?: SmokeTestRecord;
 }
 
@@ -357,6 +360,27 @@ async function handleCatalogOp(payload: unknown): Promise<CatalogResponse> {
       const request = HfLookupRequest.parse(payload);
       const hf = await lookupRepo(request.repo, { token: readHfToken() });
       return { entries: [], hf } satisfies CatalogOpResponse as CatalogResponse;
+    }
+
+    case 'discover': {
+      const request = DiscoverRequest.parse(payload);
+      const token = readHfToken();
+      const discovery = await discoverModels(
+        {
+          support: getSupportService(),
+          search: (query, limit) => searchRepos(query, { limit, token }),
+          lookup: (repo) => lookupRepo(repo, { token }),
+        },
+        {
+          query: request.query,
+          ctxSize: request.ctxSize,
+          maxRepos: request.maxRepos,
+          maxVariantsPerRepo: request.maxVariantsPerRepo,
+          maxChecks: request.maxChecks,
+          refresh: request.refresh,
+        },
+      );
+      return { entries: [], discovery } satisfies CatalogOpResponse as CatalogResponse;
     }
 
     case 'smokeTest': {

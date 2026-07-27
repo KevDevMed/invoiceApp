@@ -10,7 +10,13 @@
  * say "could not check" and let the user download anyway if they insist.
  */
 
-import { checkModelSupport, DEFAULT_VERDICT_CONTEXT_SIZE, type SupportBreakdown } from './compatibility';
+import {
+  checkModelSupport,
+  DEFAULT_VERDICT_CONTEXT_SIZE,
+  memoryBudget,
+  type MemoryBudget,
+  type SupportBreakdown,
+} from './compatibility';
 import { downloadUrl } from './catalog';
 import { GgufError, headFileSize, readRemoteGgufHeader, type GgufHeader } from './gguf';
 import { detectHardware, toCompatibilityHardware, type HardwareProfile } from './hardware';
@@ -42,6 +48,9 @@ export interface SupportServiceDeps {
   /** Hugging Face token for gated repos, read fresh each call. */
   readonly token?: () => string | null;
 }
+
+/** Range reads in flight at once during a batch check. */
+export const DEFAULT_CHECK_CONCURRENCY = 4;
 
 export interface CheckRequest {
   readonly repo: string;
@@ -118,6 +127,58 @@ export class SupportService {
   /** Drop cached verdicts, e.g. after the hardware panel is refreshed. */
   clear(): void {
     this.cache.clear();
+  }
+
+  /**
+   * What this machine can give a model, from the same numbers the verdict uses.
+   *
+   * Discovery leans on this to throw out models whose weights alone exceed the
+   * budget before spending a range request on their header.
+   */
+  async budget(): Promise<MemoryBudget> {
+    return memoryBudget(toCompatibilityHardware(await this.systemInfo()));
+  }
+
+  /**
+   * Check a batch, at most `concurrency` in flight.
+   *
+   * Each check is a 4 MB range read, so an unbounded fan-out over a search
+   * result is tens of requests and hundreds of megabytes at once. Results come
+   * back in request order regardless of completion order, and a check that
+   * throws becomes a GREY entry rather than failing the batch — one unreachable
+   * repo must not blank the other nine.
+   */
+  async checkMany(
+    requests: readonly CheckRequest[],
+    options: { concurrency?: number } = {},
+  ): Promise<VariantSupport[]> {
+    const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_CHECK_CONCURRENCY, 8));
+    const results = new Array<VariantSupport>(requests.length);
+    let next = 0;
+
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        if (index >= requests.length) return;
+        const request = requests[index]!;
+        try {
+          results[index] = await this.check(request);
+        } catch (error) {
+          results[index] = greyFor(
+            request,
+            request.ctxSize ?? DEFAULT_VERDICT_CONTEXT_SIZE,
+            messageOf(error),
+            request.sizeBytes ?? null,
+          );
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, requests.length) }, () => worker()),
+    );
+    return results;
   }
 
   async check(request: CheckRequest): Promise<VariantSupport> {

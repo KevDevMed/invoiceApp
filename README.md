@@ -178,8 +178,8 @@ or `{ ok: false, error: { code, message } }`. Every payload is validated with
 `settings:*`, `app:version`, `clients:*`, `invoices:*` (except `exportPdf`) and
 `reports:*` run for real. `invoices:exportPdf` and every `llm:*` channel return
 a `DESKTOP_ONLY` error rather than fake data: PDF export needs Electron's
-`printToPDF` and local models need the native llama.cpp runtime. A fixed banner
-says so in the UI, and `/download` explains how to get the macOS build.
+`printToPDF` and local models need the native llama.cpp runtime. `/download`
+explains how to get the macOS build.
 
 Docker (the Dokploy target) builds the bundle and runs the server as a non-root
 user on port 4300, with `/healthz` for the healthcheck and a named volume for

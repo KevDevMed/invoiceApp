@@ -343,20 +343,6 @@ async function removeFilterToken(page, label) {
 }
 
 /**
- * Clicks a control that may sit under the fixed preview banner at the bottom of
- * the window — the table footer does, once a page holds 25 rows. The banner is
- * preview chrome rather than app UI, so its overlap is not a finding, but it
- * does swallow pointer events; dispatching the click on the element itself
- * still exercises the component's real handler.
- */
-async function clickThroughBanner(locator) {
-  await locator.scrollIntoViewIfNeeded();
-  await locator.evaluate((element) => {
-    element.click();
-  });
-}
-
-/**
  * Reads the two colours dark mode has to change: the document body, and the
  * background of the widest painted element inside the page — the app shell,
  * which is what carries the white top bar, sidebar and rows in light mode.
@@ -458,33 +444,25 @@ async function main() {
   check('first row is the newest invoice', await firstRowNumber(page), expected.numbersInOrder[0]);
   await shoot(page, 'invoices');
 
-  // The banner must be visible on the app itself, not just on one route.
-  const bannerText = await page.locator('#preview-banner').innerText();
-  checkTrue(
-    'preview banner explains the desktop-only limits',
-    bannerText.includes('PDF export and local models need the desktop app'),
-    JSON.stringify(bannerText.replace(/\n/g, ' ')),
-  );
-
   // --- Pagination ----------------------------------------------------------
   console.log('\nPagination');
-  await clickThroughBanner(page.getByRole('button', { name: 'Go to next page' }));
+  await page.getByRole('button', { name: 'Go to next page' }).click();
   await page.waitForTimeout(400);
   check('page 2 range label', await rangeLabel(page), `11-20 of ${expected.listTotal}`);
   check('page 2 starts at the 11th invoice', await firstRowNumber(page), expected.numbersInOrder[10]);
   check('page 2 still renders ten rows', await bodyRows(page).count(), 10);
 
-  await clickThroughBanner(page.getByRole('button', { name: 'Go to previous page' }));
+  await page.getByRole('button', { name: 'Go to previous page' }).click();
   await page.waitForTimeout(400);
   check('back on page 1', await rangeLabel(page), `1-10 of ${expected.listTotal}`);
 
-  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('combobox', { name: 'Results per page' }).click();
   await page.getByRole('option', { name: '25', exact: true }).click();
   await page.waitForTimeout(400);
   check('25 per page renders 25 rows', await bodyRows(page).count(), 25);
   check('25 per page range label', await rangeLabel(page), `1-25 of ${expected.listTotal}`);
 
-  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('combobox', { name: 'Results per page' }).click();
   await page.getByRole('option', { name: '10', exact: true }).click();
   await page.waitForTimeout(400);
   check('back to 10 per page', await bodyRows(page).count(), 10);
@@ -661,11 +639,11 @@ async function main() {
   await page.waitForTimeout(300);
   check('contract baseline: ten rows selected before paging', await checkedRowCount(page), 10);
 
-  await clickThroughBanner(page.getByRole('button', { name: 'Go to next page' }));
+  await page.getByRole('button', { name: 'Go to next page' }).click();
   await page.waitForTimeout(400);
   check('paging moved the list on', await rangeLabel(page), `11-20 of ${expected.listTotal}`);
 
-  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('combobox', { name: 'Results per page' }).click();
   await page.getByRole('option', { name: '25', exact: true }).click();
   await page.waitForTimeout(400);
   check('page-size change shows the first page again', await rangeLabel(page), `1-25 of ${expected.listTotal}`);
@@ -677,7 +655,7 @@ async function main() {
   );
 
   // Back to the state the rest of the run expects: ten per page, nothing selected.
-  await clickThroughBanner(page.getByRole('combobox', { name: 'Results per page' }));
+  await page.getByRole('combobox', { name: 'Results per page' }).click();
   await page.getByRole('option', { name: '10', exact: true }).click();
   await page.waitForTimeout(400);
   if (!(await headerBox.isChecked())) await headerBox.check();
