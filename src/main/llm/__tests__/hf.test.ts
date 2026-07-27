@@ -11,6 +11,7 @@ import {
   lookupRepo,
   normaliseRepoInput,
   parseQuant,
+  searchRepos,
 } from '../hf';
 
 function jsonServer(payload: unknown, status = 200) {
@@ -247,5 +248,95 @@ describe('blob digests', () => {
     expect(
       await lookupFileDigest('a/b', 'absent.gguf', { fetch: jsonServer(WITH_DIGESTS).fetch }),
     ).toBeNull();
+  });
+});
+
+describe('searchRepos', () => {
+  const RESULTS = [
+    { id: 'Qwen/Qwen3-4B-GGUF', downloads: 120_000, likes: 300, gated: false, private: false, lastModified: '2025-05-01T00:00:00.000Z', tags: ['gguf', 'text-generation'] },
+    { id: 'meta/gated-GGUF', downloads: 9000, likes: 12, gated: 'manual', private: false, tags: ['gguf'] },
+    { id: 'not a repo id', downloads: 1 },
+    { downloads: 5 },
+  ];
+
+  it('asks the Hub for GGUF repos, most downloaded first', async () => {
+    const server = jsonServer(RESULTS);
+    await searchRepos('qwen3', { fetch: server.fetch, limit: 5 });
+
+    const url = new URL(server.calls.mock.calls[0]![0] as string);
+    expect(url.pathname).toBe('/api/models');
+    expect(url.searchParams.get('search')).toBe('qwen3');
+    expect(url.searchParams.getAll('filter')).toEqual(['gguf']);
+    // Without this the top GGUF repos by downloads are embedding models.
+    expect(url.searchParams.get('pipeline_tag')).toBe('text-generation');
+    expect(url.searchParams.get('sort')).toBe('downloads');
+    expect(url.searchParams.get('direction')).toBe('-1');
+    expect(url.searchParams.get('limit')).toBe('5');
+  });
+
+  it('omits the search term entirely when the query is empty', async () => {
+    const server = jsonServer(RESULTS);
+    await searchRepos('   ', { fetch: server.fetch });
+
+    const url = new URL(server.calls.mock.calls[0]![0] as string);
+    expect(url.searchParams.has('search')).toBe(false);
+    expect(url.searchParams.getAll('filter')).toEqual(['gguf']);
+  });
+
+  it('ANDs extra tag filters with gguf', async () => {
+    const server = jsonServer(RESULTS);
+    await searchRepos('qwen', { fetch: server.fetch, tags: ['text-generation'] });
+
+    const url = new URL(server.calls.mock.calls[0]![0] as string);
+    expect(url.searchParams.getAll('filter')).toEqual(['gguf', 'text-generation']);
+  });
+
+  it('drops entries whose id our own allow-list would refuse', async () => {
+    const hits = await searchRepos('qwen3', { fetch: jsonServer(RESULTS).fetch });
+
+    expect(hits.map((entry) => entry.repo)).toEqual(['Qwen/Qwen3-4B-GGUF', 'meta/gated-GGUF']);
+    expect(hits[0]!.downloads).toBe(120_000);
+    // A string `gated` is the Hub's "gated, with a mode" and still means gated.
+    expect(hits[1]!.gated).toBe(true);
+    expect(hits[1]!.lastModified).toBeNull();
+  });
+
+  it('drops the pipeline filter only when explicitly asked to', async () => {
+    const server = jsonServer(RESULTS);
+    await searchRepos('qwen', { fetch: server.fetch, pipelineTag: null });
+
+    const url = new URL(server.calls.mock.calls[0]![0] as string);
+    expect(url.searchParams.has('pipeline_tag')).toBe(false);
+  });
+
+  it('returns a repo once even when the Hub repeats it', async () => {
+    const hits = await searchRepos('q', {
+      fetch: jsonServer([
+        { id: 'Qwen/Qwen3-8B-GGUF', downloads: 10 },
+        { id: 'Qwen/Qwen3-8B-GGUF', downloads: 10 },
+      ]).fetch,
+    });
+
+    expect(hits.map((entry) => entry.repo)).toEqual(['Qwen/Qwen3-8B-GGUF']);
+  });
+
+  it('clamps the limit rather than forwarding whatever it is given', async () => {
+    const server = jsonServer(RESULTS);
+    await searchRepos('q', { fetch: server.fetch, limit: 5000 });
+
+    const url = new URL(server.calls.mock.calls[0]![0] as string);
+    expect(url.searchParams.get('limit')).toBe('100');
+  });
+
+  it('turns a rate-limited search into an actionable error', async () => {
+    await expect(searchRepos('q', { fetch: jsonServer([], 429).fetch })).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+    });
+  });
+
+  it('refuses a response that is not a list', async () => {
+    await expect(
+      searchRepos('q', { fetch: jsonServer({ models: [] }).fetch }),
+    ).rejects.toMatchObject({ code: 'BAD_RESPONSE' });
   });
 });

@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import type { LocalModel, SmokeTestView } from '../llmExtra';
+import type { DiscoveredVariantView, LocalModel, SmokeTestView } from '../llmExtra';
 import {
+  countByFit,
   diskUsageBytes,
+  fitsMachine,
+  groupDiscovered,
   smokeTestStatus,
   transferState,
   verdictStatus,
@@ -162,5 +165,62 @@ describe('diskUsageBytes', () => {
       { status: 'ready', sizeBytes: null, downloadedBytes: 7 },
     ] satisfies Pick<LocalModel, 'status' | 'sizeBytes' | 'downloadedBytes'>[];
     expect(diskUsageBytes(local)).toBe(132);
+  });
+});
+
+describe('fitsMachine', () => {
+  it('counts yellow as runnable and grey as not', () => {
+    expect(fitsMachine('GREEN')).toBe(true);
+    // Split across CPU and GPU is still "it runs", and it is the common case
+    // on a machine with no discrete GPU.
+    expect(fitsMachine('YELLOW')).toBe(true);
+    expect(fitsMachine('RED')).toBe(false);
+    expect(fitsMachine('GREY')).toBe(false);
+    expect(fitsMachine('LOADING')).toBe(false);
+  });
+});
+
+describe('countByFit', () => {
+  it('splits verdicts into runs / too big / unknown', () => {
+    expect(countByFit(['GREEN', 'YELLOW', 'RED', 'GREY', 'LOADING'])).toEqual({
+      fits: 2,
+      tooBig: 1,
+      unknown: 2,
+    });
+  });
+});
+
+describe('groupDiscovered', () => {
+  const model = (repo: string, filename: string): DiscoveredVariantView => ({
+    repo,
+    filename,
+    quant: 'Q4_K_M',
+    sizeBytes: 1000,
+    sha256: null,
+    license: 'apache-2.0',
+    gated: false,
+    isPrivate: false,
+    downloads: 42,
+    likes: null,
+    verdict: 'GREEN',
+    support: null,
+    reason: '',
+  });
+
+  it('keeps repos in the order main ranked them and collects their files', () => {
+    const groups = groupDiscovered([
+      model('acme/b', 'b1.gguf'),
+      model('acme/a', 'a1.gguf'),
+      model('acme/b', 'b2.gguf'),
+    ]);
+
+    expect(groups.map((group) => group.repo)).toEqual(['acme/b', 'acme/a']);
+    expect(groups[0]!.models.map((entry) => entry.filename)).toEqual(['b1.gguf', 'b2.gguf']);
+    expect(groups[0]!.license).toBe('apache-2.0');
+    expect(groups[0]!.downloads).toBe(42);
+  });
+
+  it('returns nothing for nothing', () => {
+    expect(groupDiscovered([])).toEqual([]);
   });
 });

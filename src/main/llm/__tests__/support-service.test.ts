@@ -192,3 +192,60 @@ describe('SupportService', () => {
     expect(result.breakdown.reason).toMatch(/detection failed/);
   });
 });
+
+describe('checkMany', () => {
+  it('runs at most `concurrency` range reads at once', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const readHeader = vi.fn(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return HEADER;
+    });
+    const { instance } = service({ readHeader });
+
+    const requests = Array.from({ length: 9 }, (_, index) => ({
+      repo: 'a/b',
+      filename: `m-${index}.gguf`,
+      sizeBytes: 800_000_000,
+    }));
+    const results = await instance.checkMany(requests, { concurrency: 3 });
+
+    expect(peak).toBe(3);
+    expect(results).toHaveLength(9);
+    // Results are in request order, not completion order.
+    expect(results.map((result) => result.filename)).toEqual(
+      requests.map((request) => request.filename),
+    );
+  });
+
+  it('turns one failing check into a grey row rather than failing the batch', async () => {
+    const readHeader = vi.fn(async (url: string) => {
+      if (url.includes('bad')) throw new Error('connection reset');
+      return HEADER;
+    });
+    const { instance } = service({ readHeader });
+
+    const results = await instance.checkMany([
+      { repo: 'a/b', filename: 'good.gguf', sizeBytes: 800_000_000 },
+      { repo: 'a/b', filename: 'bad.gguf', sizeBytes: 800_000_000 },
+    ]);
+
+    expect(results[0]!.breakdown.verdict).not.toBe('GREY');
+    expect(results[1]!.breakdown.verdict).toBe('GREY');
+    expect(results[1]!.error).toContain('connection reset');
+  });
+});
+
+describe('budget', () => {
+  it('reports the same usable memory the verdict is computed against', async () => {
+    const { instance } = service();
+    const budget = await instance.budget();
+
+    expect(budget.hasDiscreteGpu).toBe(false);
+    // Unified memory: RAM is the VRAM pool, counted once, less the reserve.
+    expect(budget.usableTotalMemoryBytes).toBe(17_179_869_184 - 2_288_490_189);
+  });
+});

@@ -15,11 +15,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   checkSupport as checkSupportCall,
+  discoverModels as discoverModelsCall,
   fetchCatalog,
   fetchSystemInfo,
   lookupHfRepo,
   runSmokeTest as runSmokeTestCall,
   variantKey,
+  type DiscoveryView,
   type HfRepoView,
   type LocalModel,
   type SmokeTestView,
@@ -84,6 +86,11 @@ export interface ModelsState {
   readonly hfError: string | null;
   readonly isHfLoading: boolean;
 
+  /** Last "what runs here" sweep, or null before one has been asked for. */
+  readonly discovery: DiscoveryView | null;
+  readonly discoveryError: string | null;
+  readonly isDiscovering: boolean;
+
   /** Model id whose smoke test is running right now. */
   readonly testingId: string | null;
   readonly lastSmokeTest: SmokeTestView | null;
@@ -94,6 +101,9 @@ export interface ModelsState {
   verdictFor(repo: string, filename: string): SupportVerdict;
   lookupRepo(input: string): Promise<void>;
   clearRepo(): void;
+  /** Search the Hub and rank the results against this machine. */
+  discover(query: string): Promise<void>;
+  clearDiscovery(): void;
   download(entry: { repo: string; filename: string; quant?: string | null }): Promise<void>;
   /** Stop the transfer, keeping the partial file so it can be resumed. */
   pause(modelId: string): Promise<void>;
@@ -129,6 +139,10 @@ export function useModels(): ModelsState {
   const [hfRepo, setHfRepo] = useState<HfRepoView | null>(null);
   const [hfError, setHfError] = useState<string | null>(null);
   const [isHfLoading, setIsHfLoading] = useState(false);
+
+  const [discovery, setDiscovery] = useState<DiscoveryView | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [isDiscovering, setIsDiscovering] = useState(false);
 
   const [testingId, setTestingId] = useState<string | null>(null);
   const [lastSmokeTest, setLastSmokeTest] = useState<SmokeTestView | null>(null);
@@ -296,6 +310,44 @@ export function useModels(): ModelsState {
     setHfError(null);
   }, []);
 
+  /**
+   * Sweep the Hub for models this machine can run.
+   *
+   * The verdicts that come back are folded into the same `support` map the
+   * catalog rows read, and their keys are marked as requested, so a discovered
+   * row that is also in the catalog renders its verdict immediately and does not
+   * spend a second range request on a header main has already read.
+   */
+  const discover = useCallback(async (query: string) => {
+    setIsDiscovering(true);
+    setDiscoveryError(null);
+    try {
+      const result = await discoverModelsCall({ query });
+      setDiscovery(result);
+
+      const found: Record<string, VariantSupportView> = {};
+      for (const model of result.models) {
+        if (model.support === null || model.support.error !== null) continue;
+        const key = variantKey(model.repo, model.filename);
+        found[key] = model.support;
+        requested.current.add(key);
+      }
+      if (Object.keys(found).length > 0) {
+        setSupport((current) => ({ ...current, ...found }));
+      }
+    } catch (caught) {
+      setDiscovery(null);
+      setDiscoveryError(message(caught));
+    } finally {
+      setIsDiscovering(false);
+    }
+  }, []);
+
+  const clearDiscovery = useCallback(() => {
+    setDiscovery(null);
+    setDiscoveryError(null);
+  }, []);
+
   const download = useCallback(
     async (entry: { repo: string; filename: string; quant?: string | null }) => {
       await run(variantKey(entry.repo, entry.filename), () =>
@@ -385,6 +437,9 @@ export function useModels(): ModelsState {
       hfRepo,
       hfError,
       isHfLoading,
+      discovery,
+      discoveryError,
+      isDiscovering,
       testingId,
       lastSmokeTest,
       refresh,
@@ -393,6 +448,8 @@ export function useModels(): ModelsState {
       verdictFor,
       lookupRepo,
       clearRepo,
+      discover,
+      clearDiscovery,
       download,
       pause,
       cancel,
@@ -419,6 +476,9 @@ export function useModels(): ModelsState {
       hfRepo,
       hfError,
       isHfLoading,
+      discovery,
+      discoveryError,
+      isDiscovering,
       testingId,
       lastSmokeTest,
       refresh,
@@ -427,6 +487,8 @@ export function useModels(): ModelsState {
       verdictFor,
       lookupRepo,
       clearRepo,
+      discover,
+      clearDiscovery,
       download,
       pause,
       cancel,

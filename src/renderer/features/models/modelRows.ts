@@ -10,7 +10,13 @@
  * machine is exactly the one the page has always used.
  */
 
-import { describeSmokeTest, type LocalModel, type SmokeTestView, type SupportVerdict } from './llmExtra';
+import {
+  describeSmokeTest,
+  type DiscoveredVariantView,
+  type LocalModel,
+  type SmokeTestView,
+  type SupportVerdict,
+} from './llmExtra';
 import type { DownloadState } from './useModels';
 
 /** The StatusDot variants a row can take. */
@@ -78,6 +84,80 @@ export function verdictStatus(verdict: SupportVerdict): RowStatus {
     case 'GREY':
       return 'neutral';
   }
+}
+
+/**
+ * Whether a verdict means "you can actually run this".
+ *
+ * YELLOW counts: it runs, split across CPU and GPU, and telling someone with no
+ * discrete GPU that nothing fits would be false on the most common machine there
+ * is. GREY does not count — unknown is not the same as yes.
+ */
+export function fitsMachine(verdict: SupportVerdict): boolean {
+  return verdict === 'GREEN' || verdict === 'YELLOW';
+}
+
+export interface FitCounts {
+  readonly fits: number;
+  readonly tooBig: number;
+  readonly unknown: number;
+}
+
+/** Tally a discovery result, so the section header can say what it actually found. */
+export function countByFit(verdicts: readonly SupportVerdict[]): FitCounts {
+  let fits = 0;
+  let tooBig = 0;
+  let unknown = 0;
+  for (const verdict of verdicts) {
+    if (fitsMachine(verdict)) fits += 1;
+    else if (verdict === 'RED') tooBig += 1;
+    else unknown += 1;
+  }
+  return { fits, tooBig, unknown };
+}
+
+export interface DiscoveredGroup {
+  readonly repo: string;
+  readonly license: string | null;
+  readonly gated: boolean;
+  readonly isPrivate: boolean;
+  readonly downloads: number | null;
+  readonly models: readonly DiscoveredVariantView[];
+}
+
+/**
+ * Group discovered files under their repo, keeping the order they arrived in.
+ *
+ * Main already sorted the flat list best-fit-first, so first appearance is the
+ * right order for the groups too: re-sorting here would quietly disagree with
+ * the ranking the verdicts produced.
+ */
+export function groupDiscovered(
+  models: readonly DiscoveredVariantView[],
+): DiscoveredGroup[] {
+  const groups = new Map<string, { group: DiscoveredGroup; models: DiscoveredVariantView[] }>();
+
+  for (const model of models) {
+    const existing = groups.get(model.repo);
+    if (existing) {
+      existing.models.push(model);
+      continue;
+    }
+    const collected: DiscoveredVariantView[] = [model];
+    groups.set(model.repo, {
+      models: collected,
+      group: {
+        repo: model.repo,
+        license: model.license,
+        gated: model.gated,
+        isPrivate: model.isPrivate,
+        downloads: model.downloads,
+        models: collected,
+      },
+    });
+  }
+
+  return [...groups.values()].map((entry) => entry.group);
 }
 
 export interface SmokeTestStatus {

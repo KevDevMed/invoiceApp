@@ -33,6 +33,7 @@ export const CATALOG_OPS = [
   'systemInfo',
   'checkSupport',
   'hfLookup',
+  'discover',
   'smokeTest',
 ] as const;
 
@@ -85,6 +86,24 @@ export const HfLookupRequest = z.object({
   repo: z.string().min(1).max(300),
 });
 
+/**
+ * Search the Hub and rank what comes back against this machine.
+ *
+ * The caps are part of the request because they are what the call costs: each
+ * repo is a JSON listing and each verified file is a 4 MB range read. Bounding
+ * them here means the renderer cannot ask for an unbounded sweep by accident.
+ */
+export const DiscoverRequest = z.object({
+  op: z.literal('discover'),
+  /** Empty means "the most downloaded GGUF repos", which is a valid first screen. */
+  query: z.string().max(200).optional(),
+  ctxSize: z.number().int().min(256).max(1_048_576).optional(),
+  maxRepos: z.number().int().min(1).max(30).optional(),
+  maxVariantsPerRepo: z.number().int().min(1).max(10).optional(),
+  maxChecks: z.number().int().min(1).max(60).optional(),
+  refresh: z.boolean().optional(),
+});
+
 export const SmokeTestRequest = z.object({
   op: z.literal('smokeTest'),
   modelId: Id,
@@ -95,6 +114,7 @@ export const SmokeTestRequest = z.object({
 export type SystemInfoRequest = z.infer<typeof SystemInfoRequest>;
 export type CheckSupportRequest = z.infer<typeof CheckSupportRequest>;
 export type HfLookupRequest = z.infer<typeof HfLookupRequest>;
+export type DiscoverRequest = z.infer<typeof DiscoverRequest>;
 export type SmokeTestRequest = z.infer<typeof SmokeTestRequest>;
 
 /** Settings key holding the optional Hugging Face access token for gated repos. */
