@@ -27,12 +27,13 @@ const { execFileSync } = require('node:child_process');
  * Pure decision function: returns the argv to exec, or null to skip.
  *
  * Deliberately NOT passing `--options=runtime` (hardened runtime). Hardened
- * runtime is only meaningful in combination with notarisation, which needs an
- * Apple Developer ID we do not have. Under an ad-hoc signature it buys nothing
- * and actively risks breaking the two native components — better-sqlite3's
- * .node addon and node-llama-cpp's dlopen'd backend — because hardened runtime
- * refuses to load unsigned/foreign-signed libraries unless the matching
- * entitlements are granted. `hardenedRuntime: true` stays in
+ * runtime does enable real runtime protections on its own — it is not inert
+ * without notarisation. It is omitted here because on this path the trade is
+ * all cost: an ad-hoc signature is not a trusted identity, so the flag earns no
+ * Gatekeeper benefit, while its library-validation and JIT/executable-memory
+ * restrictions can break the two native components — better-sqlite3's .node
+ * addon and node-llama-cpp's dlopen'd backend — and no entitlements are applied
+ * on this path to grant them back. `hardenedRuntime: true` stays in
  * electron-builder.yml, where it governs the real-certificate path only.
  *
  * `--deep` is required here: the bundle contains nested helper apps and the

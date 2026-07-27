@@ -49,7 +49,8 @@
 #   Privacy & Security > Open Anyway, or:
 #     xattr -dr com.apple.quarantine /Applications/InvoiceApp.app
 #   Nothing is uploaded until codesign reports `Signature=adhoc` and the zip
-#   contains _CodeSignature entries.
+#   contains the outer bundle seal
+#   InvoiceApp.app/Contents/_CodeSignature/CodeResources.
 #
 # The modes are mutually exclusive by construction: build/after-pack.cjs no-ops
 # whenever MAC_HAS_SIGNING_CERT is true, and CSC_IDENTITY_AUTO_DISCOVERY is the
@@ -607,22 +608,38 @@ jobs:
           spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 || true
 
       # Signing the .app is not enough on its own: the signature has to survive
-      # into the artifact users actually download. Listing the zip for
-      # _CodeSignature/CodeResources is the exact check that caught the v0.1.0
-      # bug, so it runs on every build.
+      # into the artifact users actually download. Listing the zip for the outer
+      # bundle seal is the exact check that caught the v0.1.0 bug, so it runs on
+      # every build.
       - name: Verify the signature survives into the zip
         env:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           ZIP="release/InvoiceApp-mac-$ARCH.zip"
-          ENTRIES=$(unzip -Z1 "$ZIP" | grep -c '_CodeSignature/CodeResources' || true)
-          echo "$ZIP contains $ENTRIES _CodeSignature/CodeResources entries"
-          if [ "$ENTRIES" -lt 1 ]; then
-            echo "::error::$ZIP contains no _CodeSignature/CodeResources entry. The signature did not survive packaging, so the download would be treated as unsigned and reported as damaged."
-            unzip -Z1 "$ZIP" | head -50
+
+          # unzip's exit status is checked on its own. Piping straight into
+          # `grep -c ... || true` swallowed a failing or truncated unzip just as
+          # readily as grep's expected exit 1 on no-match, so a corrupt listing
+          # that happened to contain one matching line still passed. A
+          # verification step that cannot fail is worse than no step at all.
+          if ! LISTING=$(unzip -Z1 "$ZIP"); then
+            echo "::error::unzip could not list $ZIP. The archive is unreadable or truncated, so its signature cannot be verified."
             exit 1
           fi
+
+          # Whole-path match on the OUTER bundle seal, never a substring. Every
+          # nested helper app and the Electron Framework carries its own
+          # _CodeSignature/CodeResources whether or not InvoiceApp.app itself was
+          # sealed, so a substring count passes on exactly the top-level-unsigned
+          # artifact this check exists to reject.
+          OUTER='InvoiceApp.app/Contents/_CodeSignature/CodeResources'
+          if ! printf '%s\n' "$LISTING" | grep -qE '^(\./)?InvoiceApp\.app/Contents/_CodeSignature/CodeResources$'; then
+            echo "::error::$ZIP contains no $OUTER entry. The outer bundle seal did not survive packaging, so the download would be treated as unsigned and reported as damaged — nested helper signatures do not substitute for it."
+            printf '%s\n' "$LISTING" | head -50
+            exit 1
+          fi
+          echo "$ZIP contains the outer bundle seal $OUTER"
 
       # v4 artifacts are immutable and names must be unique per job, so each
       # matrix leg uploads under its own arch-suffixed name.
