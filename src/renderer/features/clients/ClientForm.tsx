@@ -2,7 +2,7 @@
  * Create/edit client form, rendered inside a Dialog.
  */
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
@@ -17,6 +17,7 @@ import { TextInput } from '@astryxdesign/core/TextInput';
 
 import type { Client } from '../../../shared/types';
 import { toDraft, toInput, validateDraft, type ClientDraft, type DraftErrors } from './clientDraft';
+import { createSaveGuard } from './saveGuard';
 
 export interface ClientFormProps {
   /** Existing client when editing, null when creating. */
@@ -30,6 +31,20 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
   const [fieldErrors, setFieldErrors] = useState<DraftErrors>({});
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const guardRef = useRef(createSaveGuard());
+  useEffect(() => {
+    const guard = guardRef.current;
+    guard.arm();
+    return () => {
+      guard.dismiss();
+    };
+  }, []);
+
+  const close = (): void => {
+    guardRef.current.dismiss();
+    onClose();
+  };
 
   const set = (key: keyof ClientDraft) => (value: string) => {
     setDraft((prev) => ({ ...prev, [key]: value }));
@@ -57,21 +72,30 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
       const saved = client
         ? await window.api.invoke('clients:update', { id: client.id, patch: toInput(draft) })
         : await window.api.invoke('clients:create', toInput(draft));
-      onSaved(saved);
+      guardRef.current.settle(() => {
+        onSaved(saved);
+      });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setIsSaving(false);
+      guardRef.current.settle(() => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setIsSaving(false);
+      });
     }
   };
 
   return (
-    <Dialog isOpen onOpenChange={(open) => !open && onClose()} purpose="form" width={640}>
+    <Dialog
+      isOpen
+      onOpenChange={(open) => !open && !isSaving && close()}
+      purpose={isSaving ? 'required' : 'form'}
+      width={640}
+    >
       <Layout
         header={
           <DialogHeader
             title={client ? `Edit ${client.name}` : 'New client'}
             subtitle="Only the name is required."
-            onOpenChange={(open) => !open && onClose()}
+            onOpenChange={(open) => !open && !isSaving && close()}
           />
         }
         content={
@@ -148,7 +172,7 @@ export function ClientForm({ client, onClose, onSaved }: ClientFormProps): React
         footer={
           <LayoutFooter>
             <HStack gap={2} justify="end">
-              <Button label="Cancel" variant="secondary" isDisabled={isSaving} onClick={onClose} />
+              <Button label="Cancel" variant="secondary" isDisabled={isSaving} onClick={close} />
               <Button
                 label={client ? 'Save changes' : 'Create client'}
                 variant="primary"
