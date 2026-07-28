@@ -94,6 +94,65 @@ export const SIDE_NAV_WIDTH = {
 /** localStorage key SideNav uses to persist the user's dragged width. */
 export const SIDE_NAV_WIDTH_STORAGE_ID = 'invoiceapp.sidenav.width';
 
+/**
+ * Prefix the design system's `useResizable` puts in front of an `autoSaveId`
+ * before touching localStorage (`Resizable/useResizable.ts`, `STORAGE_PREFIX`).
+ * Duplicated here because the hook does not export it, and reading the same key
+ * the hook writes is the whole point of `wasSideNavCollapsed` below.
+ */
+export const RESIZABLE_STORAGE_PREFIX = 'astryx-resizable:';
+
+/** Full localStorage key the sidebar's persisted width is stored under. */
+export const SIDE_NAV_WIDTH_STORAGE_KEY = `${RESIZABLE_STORAGE_PREFIX}${SIDE_NAV_WIDTH_STORAGE_ID}`;
+
+/** The one method of `Storage` this module needs, so tests can inject a double. */
+export interface StorageReader {
+  getItem(key: string): string | null;
+}
+
+/**
+ * localStorage, or null wherever it is unusable.
+ *
+ * Absent under `environment: 'node'` in the unit tests and in the main process;
+ * *present but throwing on access* in a Safari private window. Both degrade to
+ * "no persisted state" rather than taking the shell down on first render.
+ */
+function defaultStorage(): StorageReader | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Was the sidebar left collapsed at the end of the last session?
+ *
+ * The collapsed flag is *not* persisted separately: `useResizable` writes
+ * `isCollapsed ? 0 : size` under one key and re-derives collapse on the next
+ * mount as `persisted === 0`. AppShell drives SideNav's collapse in controlled
+ * mode, so its initial state has to be derived from that same byte — a bare
+ * `useState(false)` disagrees with the hook after a collapsed restart, and
+ * SideNav then renders *expanded* content at `resizableHook.size`, which is 0.
+ *
+ * Mirrors the hook's own parse exactly (`JSON.parse`, number-typed, `=== 0`).
+ * Anything missing, unparseable or not the number 0 means expanded, because
+ * that is what the hook will decide too.
+ */
+export function wasSideNavCollapsed(
+  storage: StorageReader | null | undefined = defaultStorage(),
+  storageId: string = SIDE_NAV_WIDTH_STORAGE_ID,
+): boolean {
+  if (!storage) return false;
+  try {
+    const raw = storage.getItem(`${RESIZABLE_STORAGE_PREFIX}${storageId}`);
+    if (raw == null) return false;
+    return (JSON.parse(raw) as unknown) === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Sidebar group a nav item belongs to. Items without a group sit in the footer. */
 export type NavGroup = 'Billing' | 'Insights' | 'Local AI';
 

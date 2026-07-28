@@ -43,6 +43,7 @@ import {
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   titleBarInset,
+  wasSideNavCollapsed,
   type NavGroup,
 } from './chrome';
 import { isDockVisible } from './ui/dockVisibility';
@@ -278,8 +279,13 @@ export function AppShell(): React.JSX.Element {
     cannot also be the way back out. Knowing the state lets the collapsed rail
     render its own expand button in `footerIcons` and lets the theme control —
     which cannot shrink to an icon — sit out the collapsed state entirely.
+
+    Seeded from the *same* localStorage byte `resizable.autoSaveId` persists
+    below, because controlled collapse and the resizable width are two views of
+    one saved state. Seed it `false` instead and a collapsed restart renders the
+    expanded sidebar at the hook's width of 0. See `wasSideNavCollapsed`.
   */
-  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [isCollapsed, setIsCollapsed] = useState(wasSideNavCollapsed);
   const { state: updateState } = useUpdates();
   const badge = updateBadge(updateState);
 

@@ -10,8 +10,12 @@ import {
   OVERLAY_TITLE_BAR_INSET,
   readDesktopInfo,
   SECTION_ROUTES,
+  RESIZABLE_STORAGE_PREFIX,
   SIDE_NAV_WIDTH,
+  SIDE_NAV_WIDTH_STORAGE_ID,
+  SIDE_NAV_WIDTH_STORAGE_KEY,
   titleBarInset,
+  wasSideNavCollapsed,
   WEB_DESKTOP_INFO,
 } from '../chrome';
 
@@ -166,6 +170,71 @@ describe('collapsedRailWidth', () => {
     expect(resolvePx(OVERLAY_COLLAPSED_RAIL_WIDTH)).toBeGreaterThan(
       resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH),
     );
+  });
+});
+
+/**
+ * A localStorage double. `entries` is what the store holds; `failOn` makes
+ * `getItem` throw the way a Safari private window does.
+ */
+function fakeStorage(entries: Record<string, string>, failing = false) {
+  return {
+    getItem(key: string): string | null {
+      if (failing) throw new DOMException('denied', 'SecurityError');
+      return entries[key] ?? null;
+    },
+  };
+}
+
+describe('wasSideNavCollapsed', () => {
+  // The prefix is not exported by the design system, so it is copied into
+  // chrome.ts. Pinned literally: derive the expected key from the constant and
+  // a typo in the constant passes its own test while silently reading a key
+  // nothing ever writes.
+  it('reads the key useResizable actually writes', () => {
+    expect(RESIZABLE_STORAGE_PREFIX).toBe('astryx-resizable:');
+    expect(SIDE_NAV_WIDTH_STORAGE_KEY).toBe(`astryx-resizable:${SIDE_NAV_WIDTH_STORAGE_ID}`);
+  });
+
+  // useResizable persists `isCollapsed ? 0 : size`, so 0 is the collapse flag.
+  it('is collapsed when the persisted width is 0', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '0' }))).toBe(true);
+  });
+
+  it('is expanded at a persisted normal width', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '264' }))).toBe(false);
+    expect(
+      wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: String(SIDE_NAV_WIDTH.min) })),
+    ).toBe(false);
+  });
+
+  it('is expanded when the key is absent', () => {
+    expect(wasSideNavCollapsed(fakeStorage({}))).toBe(false);
+    expect(wasSideNavCollapsed(fakeStorage({ 'some-other-key': '0' }))).toBe(false);
+  });
+
+  it('is expanded on malformed JSON', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '{oops' }))).toBe(false);
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '' }))).toBe(false);
+  });
+
+  // The hook requires `typeof parsed === 'number'`, so a stringy or null 0 is
+  // not collapse to it either. Disagreeing here is the whole bug.
+  it('is expanded on a non-number value', () => {
+    for (const raw of ['"0"', 'null', 'false', '{"width":0}', '[0]', '"264"']) {
+      expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: raw }))).toBe(false);
+    }
+  });
+
+  it('is expanded when storage is unusable', () => {
+    expect(wasSideNavCollapsed(fakeStorage({}, true))).toBe(false);
+    expect(wasSideNavCollapsed(null)).toBe(false);
+  });
+
+  // Called as a React lazy initializer — React invokes it with no arguments,
+  // and under `environment: 'node'` there is no localStorage to fall back on.
+  it('defaults to expanded with no arguments', () => {
+    expect(wasSideNavCollapsed()).toBe(false);
   });
 });
 
