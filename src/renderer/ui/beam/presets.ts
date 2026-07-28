@@ -11,7 +11,10 @@
  * The six presets between them cover every `BorderBeamSize` and every
  * `BorderBeamColorVariant` the library ships. That is a deliberate product
  * requirement, not an accident of taste, and `__tests__/presets.test.ts`
- * asserts it: drop a variant and the exhaustiveness test fails.
+ * guards it from both sides: drop a variant and the runtime exhaustiveness
+ * test fails, while a `border-beam` upgrade that *adds* a size or variant
+ * fails `npm run typecheck` there, so a newly-shipped element cannot go
+ * quietly uncovered.
  */
 
 import type { BorderBeamColorVariant, BorderBeamSize } from 'border-beam';

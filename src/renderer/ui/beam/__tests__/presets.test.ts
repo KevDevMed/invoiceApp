@@ -1,17 +1,45 @@
+import type { BorderBeamColorVariant, BorderBeamSize } from 'border-beam';
 import { describe, expect, it } from 'vitest';
 
 import type { ThemeMode } from '../../../../shared/types';
 import { BEAM_PRESETS, beamProps, resolveScheme, type BeamPreset } from '../presets';
 
 /**
- * The library's full vocabulary, spelled out rather than imported: the point of
- * the exhaustiveness test below is to fail when *our* presets stop covering it,
- * and a set derived from the same source as the thing under test could not.
- * A library upgrade that adds a sixth size should fail here too — that is a
- * decision someone has to make, not a silent gap in coverage.
+ * The library's full vocabulary, spelled out once and then checked against the
+ * library's own union by `satisfies`. The guard has two halves and they catch
+ * opposite failures:
+ *
+ * - `satisfies Record<BorderBeamSize, true>` catches the library *growing*. A
+ *   `border-beam` upgrade that adds a sixth size makes this object miss a key
+ *   and `npm run typecheck` fails here, at the upgrade, rather than the new
+ *   element going quietly unused. (It equally catches a size being removed:
+ *   the leftover key becomes an excess property.)
+ * - The runtime union assertions below catch a preset *dropping* one. They
+ *   compare the sizes our presets actually emit against these keys, so
+ *   retuning `composer-focus` off `sm` fails vitest.
+ *
+ * The keys are hand-written on purpose — a set derived from `PRESETS` could
+ * not detect a preset that stopped covering something. `tsc` is what keeps the
+ * hand-written half honest.
  */
-const ALL_SIZES = ['sm', 'md', 'line', 'pulse-outside', 'pulse-inner'] as const;
-const ALL_COLOR_VARIANTS = ['colorful', 'mono', 'ocean', 'sunset'] as const;
+const ALL_SIZES = {
+  sm: true,
+  md: true,
+  line: true,
+  'pulse-outside': true,
+  'pulse-inner': true,
+} satisfies Record<BorderBeamSize, true>;
+
+const ALL_COLOR_VARIANTS = {
+  colorful: true,
+  mono: true,
+  ocean: true,
+  sunset: true,
+} satisfies Record<BorderBeamColorVariant, true>;
+
+/** Runtime views of the two maps, so vitest and `tsc` cannot drift apart. */
+const ALL_SIZE_KEYS = Object.keys(ALL_SIZES) as readonly BorderBeamSize[];
+const ALL_COLOR_VARIANT_KEYS = Object.keys(ALL_COLOR_VARIANTS) as readonly BorderBeamColorVariant[];
 
 const EXPECTED_PRESETS: readonly BeamPreset[] = [
   'launcher-idle',
@@ -35,12 +63,21 @@ describe('resolveScheme', () => {
     expect(resolveScheme('system', false)).toBe('light');
   });
 
-  it('resolves every ThemeMode to a concrete scheme', () => {
-    const modes: readonly ThemeMode[] = ['light', 'dark', 'system'];
-    for (const mode of modes) {
-      for (const prefersDark of [true, false]) {
-        expect(['light', 'dark']).toContain(resolveScheme(mode, prefersDark));
-      }
+  it('resolves every ThemeMode to the right concrete scheme', () => {
+    // Spelled out as a full truth table rather than `toContain(['light',
+    // 'dark'])`: that shape passes for any implementation that returns a legal
+    // scheme, including one that ignores its arguments entirely.
+    const cases: readonly (readonly [ThemeMode, boolean, 'light' | 'dark'])[] = [
+      ['light', true, 'light'],
+      ['light', false, 'light'],
+      ['dark', true, 'dark'],
+      ['dark', false, 'dark'],
+      ['system', true, 'dark'],
+      ['system', false, 'light'],
+    ];
+    expect(cases).toHaveLength(6);
+    for (const [mode, prefersDark, expected] of cases) {
+      expect(resolveScheme(mode, prefersDark)).toBe(expected);
     }
   });
 });
@@ -52,12 +89,12 @@ describe('beamProps', () => {
 
   it('uses every BorderBeamSize the library ships at least once', () => {
     const used = new Set(BEAM_PRESETS.map((preset) => beamProps(preset, 'dark').size));
-    expect([...used].sort()).toEqual([...ALL_SIZES].sort());
+    expect([...used].sort()).toEqual([...ALL_SIZE_KEYS].sort());
   });
 
   it('uses every BorderBeamColorVariant the library ships at least once', () => {
     const used = new Set(BEAM_PRESETS.map((preset) => beamProps(preset, 'dark').colorVariant));
-    expect([...used].sort()).toEqual([...ALL_COLOR_VARIANTS].sort());
+    expect([...used].sort()).toEqual([...ALL_COLOR_VARIANT_KEYS].sort());
   });
 
   it('returns the scheme it was given as `theme`, and never `auto`', () => {
@@ -87,6 +124,28 @@ describe('beamProps', () => {
       const ambient = beamProps(preset, 'dark');
       expect(ambient.duration).toBeGreaterThan(2.3);
       expect(ambient.strength).toBeLessThan(streaming.strength);
+    }
+  });
+
+  it('freezes the hue shift on exactly the monochrome presets', () => {
+    // `staticColors` is not free tuning: on `mono` a drifting hue is either
+    // invisible or a grey that faintly tints, and on a coloured variant the
+    // shift is the point. Asserting both directions, so setting the flag
+    // everywhere — or nowhere — fails.
+    for (const preset of BEAM_PRESETS) {
+      const props = beamProps(preset, 'dark');
+      expect(props.staticColors ?? false).toBe(props.colorVariant === 'mono');
+    }
+  });
+
+  it('makes panel-streaming the single loudest preset', () => {
+    // The one loud beam, by design. If a second preset ties or beats it, the
+    // "is it stuck or is it thinking" signal has stopped being distinctive.
+    const streaming = beamProps('panel-streaming', 'dark');
+    const others = BEAM_PRESETS.filter((preset) => preset !== 'panel-streaming');
+    expect(others).toHaveLength(5);
+    for (const preset of others) {
+      expect(beamProps(preset, 'dark').strength).toBeLessThan(streaming.strength);
     }
   });
 
