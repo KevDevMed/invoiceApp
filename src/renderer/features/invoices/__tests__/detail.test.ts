@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Invoice, InvoiceItem } from '../../../../shared/types';
+import { INVOICE_STATUSES } from '../../../../shared/types';
 import {
   averagePaymentDelayDays,
   buildHistoryEvents,
@@ -93,13 +94,34 @@ describe('daysPastDue', () => {
 });
 
 describe('openAmountCents', () => {
+  it('is the full total for the two statuses that are actually owed', () => {
+    expect(openAmountCents(makeInvoice({ status: 'sent' }))).toBe(123_000);
+    expect(openAmountCents(makeInvoice({ status: 'overdue' }))).toBe(123_000);
+  });
+
   it('is zero once the invoice is paid', () => {
     expect(openAmountCents(makeInvoice({ status: 'paid' }))).toBe(0);
   });
 
-  it('is the full total while unpaid', () => {
-    expect(openAmountCents(makeInvoice({ status: 'sent' }))).toBe(123_000);
-    expect(openAmountCents(makeInvoice({ status: 'overdue' }))).toBe(123_000);
+  it('is zero for a void invoice, which was cancelled and is not payable', () => {
+    expect(openAmountCents(makeInvoice({ status: 'void' }))).toBe(0);
+  });
+
+  it('is zero for a draft, which has not been issued to anyone yet', () => {
+    expect(openAmountCents(makeInvoice({ status: 'draft' }))).toBe(0);
+  });
+
+  it('covers every status in INVOICE_STATUSES', () => {
+    const byStatus = Object.fromEntries(
+      INVOICE_STATUSES.map((status) => [status, openAmountCents(makeInvoice({ status }))]),
+    );
+    expect(byStatus).toEqual({
+      draft: 0,
+      sent: 123_000,
+      paid: 0,
+      overdue: 123_000,
+      void: 0,
+    });
   });
 });
 
@@ -275,6 +297,26 @@ describe('buildStatTiles', () => {
     expect(byKey.open).toBe('$0.00');
     expect(byKey.paid).toBe('3 February 2026');
     expect(byKey.delay).toBe('—');
+  });
+
+  it('shows nothing outstanding on a void invoice', () => {
+    const tiles = buildStatTiles({
+      invoice: makeInvoice({ status: 'void' }),
+      averageDelayDays: null,
+    });
+    const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
+    // The total still reads as the face value of the cancelled document.
+    expect(byKey.total).toBe('$1,230.00');
+    expect(byKey.open).toBe('$0.00');
+  });
+
+  it('shows nothing outstanding on a draft', () => {
+    const tiles = buildStatTiles({
+      invoice: makeInvoice({ status: 'draft' }),
+      averageDelayDays: null,
+    });
+    const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
+    expect(byKey.open).toBe('$0.00');
   });
 });
 
