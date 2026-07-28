@@ -13,11 +13,21 @@
  *     the contract's message schema does allow.
  */
 
-import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import type { ChatMessage } from '../../../shared/types';
 import type { LocalModel } from '../models/llmExtra';
 import { assistantAvailability, isDesktopOnlyError, type AssistantAvailability } from './availability';
+import { canDecide, canStartRequest, shouldAppendToken, shouldClearOnSettle } from './requestGuard';
 
 const THREAD_INDEX_KEY = 'llm.threadIndex';
 const THREAD_TRANSCRIPT_PREFIX = 'llm.thread.';
@@ -105,6 +115,13 @@ export function useAssistant(): AssistantState {
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState('');
   const [requestId, setRequestId] = useState<string | null>(null);
+  /*
+    The single-flight guard. `requestId` state exists so the UI re-renders,
+    but state lags a render: two `send` calls in the same tick would both see
+    the stale `null`. The ref is written synchronously before any `await`, so
+    the second caller is refused before it can start an overlapping request.
+  */
+  const activeRequestRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isDesktopOnly, setIsDesktopOnly] = useState(false);
@@ -160,7 +177,9 @@ export function useAssistant(): AssistantState {
 
   useEffect(() => {
     const unsubscribe = window.api.on('llm:chatToken', (event) => {
-      if (event.done) return;
+      // Tokens for anything but the active request (stale, cancelled, or a
+      // late straggler after settle) must not reach the transcript.
+      if (!shouldAppendToken(activeRequestRef.current, event)) return;
       setStreamingText((current) => current + event.token);
     });
     return unsubscribe;
@@ -168,7 +187,12 @@ export function useAssistant(): AssistantState {
 
   const runChat = useCallback(
     async (turns: { role: ChatMessage['role']; content: string }[]) => {
+      // Deliberately silent: the composers are disabled while streaming, so a
+      // second entry here is a same-tick race, not a user intent to queue.
+      if (!canStartRequest(activeRequestRef.current)) return;
+
       const id = newId('req');
+      activeRequestRef.current = id;
       setRequestId(id);
       setStreamingText('');
       setError(null);
@@ -188,8 +212,13 @@ export function useAssistant(): AssistantState {
       } catch (caught) {
         reportError(caught);
       } finally {
-        setRequestId(null);
-        setStreamingText('');
+        // Only the still-active request may clear busy state; a stale settle
+        // flipping `isStreaming` false would re-enable Approve mid-generation.
+        if (shouldClearOnSettle(activeRequestRef.current, id)) {
+          activeRequestRef.current = null;
+          setRequestId(null);
+          setStreamingText('');
+        }
       }
     },
     [threadId, refreshTranscript, refreshShell, reportError],
@@ -199,6 +228,9 @@ export function useAssistant(): AssistantState {
     async (text: string) => {
       const trimmed = text.trim();
       if (trimmed.length === 0) return;
+      // Checked here too, not only in `runChat`: the optimistic message must
+      // not be appended for a send that will be refused.
+      if (!canStartRequest(activeRequestRef.current)) return;
 
       // Show the user's turn immediately; main persists it and we re-read the
       // authoritative transcript when the reply lands.
@@ -217,14 +249,34 @@ export function useAssistant(): AssistantState {
     [messages, threadId, runChat],
   );
 
+  const pendingApprovals = useMemo(() => {
+    const answered = new Set<string>();
+    const pending = new Map<string, ToolCallRecord>();
+
+    for (const message of messages) {
+      for (const call of parseToolCalls(message)) {
+        if (call.status === 'awaiting_approval') pending.set(call.id, call);
+        else answered.add(call.id);
+      }
+    }
+
+    for (const id of answered) pending.delete(id);
+    return [...pending.values()];
+  }, [messages]);
+
   const decide = useCallback(
     async (callId: string, decision: 'approve' | 'reject') => {
+      // Silently refused while a request is streaming or when the call id is
+      // no longer awaiting approval — a stale/replayed id must not act.
+      const pendingIds = pendingApprovals.map((call) => call.id);
+      if (!canDecide(activeRequestRef.current, callId, pendingIds)) return;
+
       await runChat([
         ...toTurns(messages),
         { role: 'tool', content: encodeToolDecision(callId, decision) },
       ]);
     },
-    [messages, runChat],
+    [messages, pendingApprovals, runChat],
   );
 
   const stop = useCallback(async () => {
@@ -263,21 +315,6 @@ export function useAssistant(): AssistantState {
   const dismissError = useCallback(() => {
     setError(null);
   }, []);
-
-  const pendingApprovals = useMemo(() => {
-    const answered = new Set<string>();
-    const pending = new Map<string, ToolCallRecord>();
-
-    for (const message of messages) {
-      for (const call of parseToolCalls(message)) {
-        if (call.status === 'awaiting_approval') pending.set(call.id, call);
-        else answered.add(call.id);
-      }
-    }
-
-    for (const id of answered) pending.delete(id);
-    return [...pending.values()];
-  }, [messages]);
 
   const availability = assistantAvailability({
     isLoading,

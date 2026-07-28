@@ -190,7 +190,7 @@ export function AssistantPage(): React.JSX.Element {
                   value={draft}
                   onChange={setDraft}
                   placeholder="Ask about invoices, clients, or totals…"
-                  isDisabled={!hasModel}
+                  isDisabled={!hasModel || assistant.isStreaming}
                   isStopShown={assistant.isStreaming}
                   onStop={() => {
                     void assistant.stop();
