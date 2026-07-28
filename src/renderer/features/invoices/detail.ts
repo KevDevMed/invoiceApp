@@ -91,9 +91,32 @@ export function daysPastDue(dueDate: string, today: string): number {
   return days;
 }
 
-/** What is still owed: nothing once paid, the full total otherwise. */
+/**
+ * What is still owed on this invoice.
+ *
+ * Only `sent` and `overdue` carry an open amount — those are the two states in
+ * which a real receivable exists. `paid` is settled. `void` was cancelled and
+ * is not payable, so reporting its face value as outstanding would inflate
+ * what the client appears to owe. `draft` is the judgement call: a draft has
+ * never been issued, so nobody has been asked for the money and there is no
+ * receivable yet — it reads as 0 here, the same way accounting would only
+ * recognise the debt on issue. The document's face value is still shown by the
+ * Total Amount tile in every one of these cases; only the *open* figure moves.
+ *
+ * Written as an exhaustive switch on purpose: a sixth status added to
+ * `INVOICE_STATUSES` should fail typecheck here rather than silently inherit
+ * whichever branch a ternary happened to fall into.
+ */
 export function openAmountCents(invoice: Pick<Invoice, 'status' | 'totalCents'>): number {
-  return invoice.status === 'paid' ? 0 : invoice.totalCents;
+  switch (invoice.status) {
+    case 'sent':
+    case 'overdue':
+      return invoice.totalCents;
+    case 'draft':
+    case 'paid':
+    case 'void':
+      return 0;
+  }
 }
 
 /**

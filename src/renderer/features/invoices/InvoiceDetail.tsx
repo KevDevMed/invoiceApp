@@ -9,7 +9,7 @@
  * the editor previews, so the two screens can never drift apart.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 
 import { Badge } from '@astryxdesign/core/Badge';
@@ -143,6 +143,15 @@ export function InvoiceDetail(): React.JSX.Element {
   const [notice, setNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<DetailTab>('invoice');
 
+  // Which invoice the screen is actually showing right now. Actions await an
+  // IPC round trip and the route can change underneath them, so every state
+  // write below is gated on this — the same guarantee the load effect gets
+  // from its `cancelled` flag, which only covers the load.
+  const currentIdRef = useRef<string | undefined>(id);
+  useEffect(() => {
+    currentIdRef.current = id;
+  }, [id]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -216,11 +225,18 @@ export function InvoiceDetail(): React.JSX.Element {
   }, [invoice, data]);
 
   const changeStatus = async (next: InvoiceStatus): Promise<void> => {
-    if (id === undefined) return;
+    const requestedId = id;
+    if (requestedId === undefined) return;
     setActionError(null);
     setNotice(null);
     try {
-      const updated = await window.api.invoke('invoices:setStatus', { id, status: next });
+      const updated = await window.api.invoke('invoices:setStatus', {
+        id: requestedId,
+        status: next,
+      });
+      // Navigating away mid-flight would otherwise write this invoice's status
+      // onto whichever row the page moved on to.
+      if (currentIdRef.current !== requestedId) return;
       setData((prev) =>
         prev === null
           ? prev
@@ -236,20 +252,26 @@ export function InvoiceDetail(): React.JSX.Element {
       );
       setNotice(`Status changed to ${updated.status}.`);
     } catch (cause) {
+      if (currentIdRef.current !== requestedId) return;
       setActionError(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
   const exportPdf = async (): Promise<void> => {
-    if (id === undefined) return;
+    const requestedId = id;
+    if (requestedId === undefined) return;
     setActionError(null);
     setNotice(null);
     try {
-      const result = await window.api.invoke('invoices:exportPdf', { id });
+      const result = await window.api.invoke('invoices:exportPdf', { id: requestedId });
       if (result.path === '') return; // user closed the save dialog
+      // Same hole as changeStatus: the banner would otherwise report invoice
+      // A's export on invoice B's page.
+      if (currentIdRef.current !== requestedId) return;
       setNotice(`PDF written to ${result.path} (${result.bytes} bytes).`);
     } catch (cause) {
       // DESKTOP_ONLY in the browser preview: an inline banner, never a crash.
+      if (currentIdRef.current !== requestedId) return;
       setActionError(cause instanceof Error ? cause.message : String(cause));
     }
   };
