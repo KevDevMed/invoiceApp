@@ -1,25 +1,52 @@
 /**
- * The persistent application frame: top bar (breadcrumb + theme control),
- * grouped sidebar, and the content outlet every route renders into.
+ * The persistent application frame: identity sidebar, a slim content bar
+ * (breadcrumb + theme control) and the content outlet every route renders into.
+ *
+ * Layout note — why there is no `topNav`. On macOS `src/main/window.ts` sets
+ * `titleBarStyle: 'hiddenInset'`, so the OS paints the traffic lights over the
+ * renderer's top-left corner. AppShell renders `topNav` above *both* columns,
+ * starting at x=0, which puts the lights on top of the bar's first element.
+ * Instead the sidebar owns the top-left corner (SideNavHeading carries the app
+ * identity) and the breadcrumb bar lives inside the content column, below a
+ * reserved band that keeps the lights over empty, draggable surface. See
+ * `./chrome` for the geometry and `styles/global.css` for the drag regions.
  *
  * Downstream builders replace route *elements* (see routes.tsx). They do not
  * change this file — the shell is the same on every screen. Page-level layout
  * lives in `./ui/Page`.
  */
 
-import { Fragment, createContext, useContext } from 'react';
+import { createContext, useContext } from 'react';
 import { Outlet, useLocation } from 'react-router';
 
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
 import { BreadcrumbItem, Breadcrumbs } from '@astryxdesign/core/Breadcrumbs';
 import { Divider } from '@astryxdesign/core/Divider';
-import type { IconName, IconType } from '@astryxdesign/core/Icon';
+import { Icon, type IconName, type IconType } from '@astryxdesign/core/Icon';
+import { NavIcon } from '@astryxdesign/core/NavIcon';
 import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
-import { SideNav, SideNavItem, SideNavSection } from '@astryxdesign/core/SideNav';
-import { VStack } from '@astryxdesign/core/Stack';
-import { TopNav } from '@astryxdesign/core/TopNav';
+import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
+import {
+  SideNav,
+  SideNavHeading,
+  SideNavItem,
+  SideNavSection,
+} from '@astryxdesign/core/SideNav';
 
 import type { ThemeMode } from '../shared/types';
+import {
+  breadcrumbTrail,
+  isSectionSelected,
+  NAV_GROUPS,
+  readDesktopInfo,
+  SECTION_ROUTES,
+  SIDE_NAV_WIDTH,
+  SIDE_NAV_WIDTH_STORAGE_ID,
+  titleBarInset,
+  type NavGroup,
+} from './chrome';
+
+export type { NavGroup } from './chrome';
 
 /**
  * Nav icons.
@@ -28,9 +55,9 @@ import type { ThemeMode } from '../shared/types';
  * none of them mean "invoice", "client", "report", "model" or "assistant". The
  * Icon docs sanction the escape hatch we use here: "For any icon not in this
  * list, pass an SVG component directly." No icon library is installed and this
- * is an offline app, so these five minimal SVGs match the fallback set's own
- * conventions — 24x24 viewBox, currentColor, 1.5 stroke — and Icon sizes and
- * colours them. `/settings` uses the semantic `wrench` name.
+ * is an offline app, so these SVGs match the fallback set's own conventions —
+ * 24x24 viewBox, currentColor, 1.5 stroke — and Icon sizes and colours them.
+ * `/settings` uses the semantic `wrench` name.
  */
 type NavIconProps = React.SVGProps<SVGSVGElement>;
 
@@ -42,6 +69,29 @@ const svgProps = {
   strokeLinecap: 'round',
   strokeLinejoin: 'round',
 } as const;
+
+/**
+ * The design system asks for a distinct icon variant on the selected item.
+ * These are line icons with no filled twin, so the selected variant is the same
+ * glyph at a heavier stroke — the same trick the semantic set uses, and it
+ * reads at 16px where a filled version of a receipt outline would not.
+ */
+function selectedVariant(Base: React.ComponentType<NavIconProps>): IconType {
+  function Selected(props: NavIconProps): React.JSX.Element {
+    return <Base strokeWidth={2.25} {...props} />;
+  }
+  return Selected;
+}
+
+function AppMarkIcon(props: NavIconProps): React.JSX.Element {
+  return (
+    <svg {...svgProps} {...props}>
+      <path d="M5 3.5h14v17l-3.5-2-3.5 2-3.5-2-3.5 2z" />
+      <path d="M9 9h6" />
+      <path d="M9 13h4" />
+    </svg>
+  );
+}
 
 function InvoicesIcon(props: NavIconProps): React.JSX.Element {
   return (
@@ -95,14 +145,27 @@ function AssistantIcon(props: NavIconProps): React.JSX.Element {
   );
 }
 
-/** Sidebar group a nav item belongs to. Items without a group sit in the footer. */
-export type NavGroup = 'Billing' | 'Insights' | 'Local AI';
+interface NavIconPair {
+  readonly icon: IconType | IconName;
+  readonly selectedIcon: IconType | IconName;
+}
+
+/** One icon pair per section path. Membership and order live in `./chrome`. */
+const NAV_ICONS: Readonly<Record<string, NavIconPair>> = {
+  '/invoices': { icon: InvoicesIcon, selectedIcon: selectedVariant(InvoicesIcon) },
+  '/clients': { icon: ClientsIcon, selectedIcon: selectedVariant(ClientsIcon) },
+  '/reports': { icon: ReportsIcon, selectedIcon: selectedVariant(ReportsIcon) },
+  '/models': { icon: ModelsIcon, selectedIcon: selectedVariant(ModelsIcon) },
+  '/assistant': { icon: AssistantIcon, selectedIcon: selectedVariant(AssistantIcon) },
+  '/settings': { icon: 'wrench', selectedIcon: 'wrench' },
+};
 
 export interface NavItem {
   readonly path: string;
   readonly label: string;
   /** Semantic icon name or SVG component, passed straight to SideNavItem. */
   readonly icon: IconType | IconName;
+  readonly selectedIcon: IconType | IconName;
   /** Sidebar section. Omitted means bottom-anchored in the SideNav footer. */
   readonly group?: NavGroup;
 }
@@ -111,16 +174,13 @@ export interface NavItem {
  * The nav is the app's contract with itself: one entry per top-level route.
  * routes.tsx renders an element for each of these paths.
  */
-export const NAV_ITEMS: readonly NavItem[] = [
-  { path: '/invoices', label: 'Invoices', icon: InvoicesIcon, group: 'Billing' },
-  { path: '/clients', label: 'Clients', icon: ClientsIcon, group: 'Billing' },
-  { path: '/reports', label: 'Reports', icon: ReportsIcon, group: 'Insights' },
-  { path: '/models', label: 'Models', icon: ModelsIcon, group: 'Local AI' },
-  { path: '/assistant', label: 'Assistant', icon: AssistantIcon, group: 'Local AI' },
-  { path: '/settings', label: 'Settings', icon: 'wrench' },
-];
+/** A section added to `./chrome` without an icon renders, rather than crashing. */
+const FALLBACK_ICONS: NavIconPair = { icon: 'wrench', selectedIcon: 'wrench' };
 
-const NAV_GROUPS: readonly NavGroup[] = ['Billing', 'Insights', 'Local AI'];
+export const NAV_ITEMS: readonly NavItem[] = SECTION_ROUTES.map((route) => ({
+  ...route,
+  ...(NAV_ICONS[route.path] ?? FALLBACK_ICONS),
+}));
 
 export interface ThemeModeContextValue {
   readonly mode: ThemeMode;
@@ -136,25 +196,22 @@ export function useThemeMode(): ThemeModeContextValue {
   return useContext(ThemeModeContext);
 }
 
-function isSelected(pathname: string, path: string): boolean {
-  return pathname === path || pathname.startsWith(`${path}/`);
-}
-
 function navItem(item: NavItem, pathname: string): React.JSX.Element {
   return (
     <SideNavItem
       key={item.path}
       label={item.label}
       icon={item.icon}
+      selectedIcon={item.selectedIcon}
       // HashRouter: a plain `#/path` href navigates in-place without
       // reloading the document, which is what we need under file://.
       href={`#${item.path}`}
-      isSelected={isSelected(pathname, item.path)}
+      isSelected={isSectionSelected(pathname, item.path)}
     />
   );
 }
 
-/** Compact appearance control for the top bar. Writes through useThemeMode(). */
+/** Compact appearance control for the content bar. Writes through useThemeMode(). */
 function ThemeControl(): React.JSX.Element {
   const { mode, setMode } = useThemeMode();
   return (
@@ -173,15 +230,26 @@ function ThemeControl(): React.JSX.Element {
   );
 }
 
-/** `InvoiceApp / <section>`, derived from the route. */
-function sectionLabel(pathname: string): string | null {
-  const match = NAV_ITEMS.find((item) => isSelected(pathname, item.path));
-  return match?.label ?? null;
+/**
+ * The band the OS window controls sit in. Empty by construction and draggable,
+ * because `hiddenInset` leaves the window with no title bar to grab. Collapses
+ * to zero height off macOS, so the preview and the Windows/Linux builds have no
+ * dead space at the top.
+ */
+function TitleBarInset({ height }: { height: string }): React.JSX.Element {
+  return (
+    // size="static" so the band keeps its exact height: it is a flex child of a
+    // full-height column and would otherwise shrink under the content's demands.
+    <StackItem size="static">
+      <VStack className="app-drag-region" height={height} aria-hidden />
+    </StackItem>
+  );
 }
 
 export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
-  const section = sectionLabel(pathname);
+  const inset = titleBarInset(readDesktopInfo());
+  const trail = breadcrumbTrail(pathname);
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
 
   return (
@@ -189,44 +257,72 @@ export function AppShell(): React.JSX.Element {
       height="fill"
       contentPadding={0}
       variant="section"
-      topNav={
-        <TopNav
-          label="Application"
-          startContent={
-            <Breadcrumbs>
-              <BreadcrumbItem href="#/invoices" isCurrent={section === null}>
-                InvoiceApp
-              </BreadcrumbItem>
-              {section === null ? null : <BreadcrumbItem isCurrent>{section}</BreadcrumbItem>}
-            </Breadcrumbs>
-          }
-          endContent={<ThemeControl />}
-        />
-      }
       sideNav={
         <SideNav
+          header={
+            <VStack gap={0}>
+              <TitleBarInset height={inset} />
+              <SideNavHeading
+                icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
+                heading="InvoiceApp"
+                headingHref="#/invoices"
+              />
+            </VStack>
+          }
           footer={
-            <VStack gap={0} paddingBlock={1}>
+            <VStack gap={0}>
               <Divider />
               {footerItems.map((item) => navItem(item, pathname))}
             </VStack>
           }
           collapsible
+          resizable={{
+            defaultWidth: SIDE_NAV_WIDTH.default,
+            minWidth: SIDE_NAV_WIDTH.min,
+            maxWidth: SIDE_NAV_WIDTH.max,
+            autoSaveId: SIDE_NAV_WIDTH_STORAGE_ID,
+          }}
         >
-          {NAV_GROUPS.map((group, index) => (
-            <Fragment key={group}>
-              {index === 0 ? null : <Divider />}
-              <SideNavSection title={group}>
-                {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
-                  navItem(item, pathname),
-                )}
-              </SideNavSection>
-            </Fragment>
+          {NAV_GROUPS.map((group) => (
+            <SideNavSection key={group} title={group}>
+              {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
+                navItem(item, pathname),
+              )}
+            </SideNavSection>
           ))}
         </SideNav>
       }
     >
-      <Outlet />
+      <VStack gap={0} height="100%">
+        <TitleBarInset height={inset} />
+        <StackItem size="static">
+          <HStack
+            as="header"
+            className="app-drag-region"
+            gap={4}
+            paddingInline={5}
+            paddingBlock={2}
+            align="center"
+          >
+            <StackItem size="fill">
+              {trail.length === 0 ? null : (
+                <Breadcrumbs variant="supporting">
+                  {trail.map((crumb) => (
+                    <BreadcrumbItem key={crumb.label} href={crumb.href} isCurrent={crumb.isCurrent}>
+                      {crumb.label}
+                    </BreadcrumbItem>
+                  ))}
+                </Breadcrumbs>
+              )}
+            </StackItem>
+            <ThemeControl />
+          </HStack>
+          <Divider />
+        </StackItem>
+        <StackItem size="fill">
+          <Outlet />
+        </StackItem>
+      </VStack>
     </AstryxAppShell>
   );
 }

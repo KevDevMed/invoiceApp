@@ -22,6 +22,7 @@
  * and would crash on `undefined`.
  */
 
+import { resolveDesktopInfo } from '../src/shared/desktop';
 import {
   isEventChannel,
   isInvokeChannel,
@@ -147,8 +148,25 @@ export function installApi(target: Window = window): void {
   });
 }
 
+/**
+ * Install `window.desktop`. Idempotent, so a hot reload does not throw.
+ *
+ * Always `'web'`: the preview must never reserve macOS traffic-light space,
+ * even when the browser itself runs on a real Mac — which is exactly why the
+ * renderer reads this signal instead of sniffing `navigator.userAgent`.
+ */
+export function installDesktop(target: Window = window): void {
+  Object.defineProperty(target, 'desktop', {
+    value: resolveDesktopInfo('web'),
+    configurable: true,
+    enumerable: true,
+    writable: false,
+  });
+}
+
 // Runs on import, before the renderer's entry module — see preview/index.html.
 // Guarded so the module can also be imported by the node-environment tests.
 if (typeof window !== 'undefined') {
   installApi();
+  installDesktop();
 }
