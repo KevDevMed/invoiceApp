@@ -33,6 +33,7 @@ interface Parsed {
   path: string;
   sha512: string;
   releaseDate: string;
+  [key: string]: unknown;
 }
 
 function parse(yml: string): Parsed {
@@ -102,6 +103,42 @@ releaseDate: '2026-07-28T05:02:11.456Z'
     expect(() => mergeLatestMac(x64Yml, x64Yml)).toThrow(/exactly one arm64/);
     // Both carry only arm64: zero x64 entries.
     expect(() => mergeLatestMac(arm64Yml, arm64Yml)).toThrow(/exactly one/);
+  });
+
+  it('preserves extra top-level keys that both inputs agree on', () => {
+    const extras = 'stagingPercentage: 10\nminimumSystemVersion: 23.1.0\n';
+    const merged = parse(mergeLatestMac(arm64Yml + extras, x64Yml + extras));
+    expect(merged.stagingPercentage).toBe(10);
+    expect(merged.minimumSystemVersion).toBe('23.1.0');
+  });
+
+  it('preserves an extra key present on only one side', () => {
+    const merged = parse(mergeLatestMac(arm64Yml, x64Yml + "releaseNotes: 'Fixes PDF export'\n"));
+    expect(merged.releaseNotes).toBe('Fixes PDF export');
+  });
+
+  it('preserves an extra key with a structured value', () => {
+    const extras = 'releaseNotes:\n  - version: 0.1.4\n    note: Fixes PDF export\n';
+    const merged = parse(mergeLatestMac(arm64Yml + extras, x64Yml + extras));
+    expect(merged.releaseNotes).toEqual([{ version: '0.1.4', note: 'Fixes PDF export' }]);
+  });
+
+  it('throws when the two inputs disagree on an extra key, naming it', () => {
+    const arm = arm64Yml + 'stagingPercentage: 10\n';
+    const x = x64Yml + 'stagingPercentage: 50\n';
+    expect(() => mergeLatestMac(arm, x)).toThrow(/stagingPercentage/);
+    expect(() => mergeLatestMac(arm, x)).toThrow(/10/);
+    expect(() => mergeLatestMac(arm, x)).toThrow(/50/);
+  });
+
+  it('never lets an extra key override the computed fields', () => {
+    // The five computed keys keep their merge semantics even though both
+    // inputs carry them: path/sha512 still come from the x64 entry, not from
+    // either input's own top-level values.
+    const merged = parse(mergeLatestMac(arm64Yml, x64Yml));
+    expect(merged.path).toBe('InvoiceApp-mac-x64.zip');
+    expect(merged.sha512).toBe(X64_SHA);
+    expect(merged.releaseDate).toBe('2026-07-28T05:02:11.456Z');
   });
 
   it('round-trips: the merged string re-parses to the same object', () => {

@@ -56,6 +56,72 @@ function parseLatestMac(yml: string, label: string): LatestMac {
   return record as unknown as LatestMac;
 }
 
+// The five keys this script computes itself; everything else is passed
+// through from the inputs.
+const COMPUTED_KEYS = new Set(['version', 'files', 'path', 'sha512', 'releaseDate']);
+
+// Structural equality for YAML-parsed values. JSON.stringify is not enough:
+// two mappings with the same entries can serialise differently when their
+// keys arrive in a different order.
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, i) => deepEqual(item, b[i]));
+  }
+  if (
+    typeof a === 'object' &&
+    typeof b === 'object' &&
+    a !== null &&
+    b !== null &&
+    !Array.isArray(a) &&
+    !Array.isArray(b)
+  ) {
+    const aRecord = a as Record<string, unknown>;
+    const bRecord = b as Record<string, unknown>;
+    const aKeys = Object.keys(aRecord);
+    return (
+      aKeys.length === Object.keys(bRecord).length &&
+      aKeys.every((key) => key in bRecord && deepEqual(aRecord[key], bRecord[key]))
+    );
+  }
+  return false;
+}
+
+// Every top-level key beyond the five computed ones is preserved, not
+// allow-listed away: electron-builder also emits keys like stagingPercentage,
+// minimumSystemVersion, releaseName and releaseNotes, and dropping them is
+// not cosmetic — a lost stagingPercentage turns a staged 10% rollout into an
+// instant 100%, and a lost minimumSystemVersion offers the update to macOS
+// versions the build does not support.
+//
+// A key present on one side only is kept: an omission is not a disagreement
+// between values. A key present on both sides with different values IS a
+// real inconsistency — the two legs were configured differently — and there
+// is no side that is safely "right" (stagingPercentage 10 vs 50 has no sane
+// winner), so it throws, the same way a version mismatch does.
+function mergeExtraKeys(
+  arm64: Record<string, unknown>,
+  x64: Record<string, unknown>,
+): Record<string, unknown> {
+  const extras: Record<string, unknown> = {};
+  const keys = [...Object.keys(arm64), ...Object.keys(x64)].filter(
+    (key, index, all) => !COMPUTED_KEYS.has(key) && all.indexOf(key) === index,
+  );
+  for (const key of keys) {
+    const inArm64 = key in arm64;
+    const inX64 = key in x64;
+    if (inArm64 && inX64 && !deepEqual(arm64[key], x64[key])) {
+      throw new Error(
+        `"${key}" differs between the two inputs (arm64: ${JSON.stringify(arm64[key])}, ` +
+          `x64: ${JSON.stringify(x64[key])}) — the two build legs were configured ` +
+          'differently and neither side can be assumed correct, refusing to merge',
+      );
+    }
+    extras[key] = inArm64 ? arm64[key] : x64[key];
+  }
+  return extras;
+}
+
 export function mergeLatestMac(arm64Yml: string, x64Yml: string): string {
   const arm64 = parseLatestMac(arm64Yml, 'arm64 input');
   const x64 = parseLatestMac(x64Yml, 'x64 input');
@@ -108,6 +174,7 @@ export function mergeLatestMac(arm64Yml: string, x64Yml: string): string {
     path: legacy.url,
     sha512: legacy.sha512,
     releaseDate: later,
+    ...mergeExtraKeys(arm64, x64),
   };
 
   // lineWidth: -1 keeps the ~88-char base64 sha512 values on one line instead
