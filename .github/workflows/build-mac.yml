@@ -29,6 +29,15 @@
 #   APPLE_TEAM_ID        10-character team id
 #
 # NOTE: macOS runner minutes bill at 10x on private repositories.
+#
+# The release also publishes an auto-update feed: each matrix leg emits a
+# per-arch latest-mac.yml (electron-builder writes it whenever a publish:
+# block exists in electron-builder.yml, even under --publish never), the
+# release job merges the two with scripts/merge-latest-mac.ts, and the merged
+# latest-mac.yml is attached to the GitHub release. electron-updater in the
+# installed app polls exactly that asset. If latest-mac.yml goes missing from
+# a release, every installed copy silently stops seeing updates — the checks
+# below fail the build instead of letting that happen.
 
 name: Build macOS app
 
@@ -164,7 +173,9 @@ jobs:
           npm run test:run
 
   build:
-    needs: [verify]
+    # `validate` is needed for the resolved tag (version stamping below);
+    # `verify` stays as the test gate.
+    needs: [verify, validate]
     strategy:
       fail-fast: false
       matrix:
@@ -238,6 +249,26 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           rm -f /tmp/cert.p12
 
+      # app.getVersion() and latest-mac.yml's `version` are both read from
+      # package.json at package time, and the checked-in package.json version
+      # lags the release tags (it says 0.1.0 while tags run ahead). Without
+      # this stamp every release would advertise version 0.1.0, so no
+      # installed client would ever consider an update newer than itself.
+      # The edit stays in this runner's checkout only — nothing is committed.
+      # Skipped on artifacts-only dispatches, which have no tag to stamp from.
+      - name: Set package version from the release tag
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid release tag. Expected v<major>.<minor>.<patch> with an optional pre-release suffix, e.g. v0.1.4 or v0.2.0-beta.1. The tag becomes the app version, so a malformed tag would ship a build electron-updater cannot compare."
+            exit 1
+          fi
+          npm version --no-git-tag-version --allow-same-version "${TAG#v}"
+          echo "package.json version set to ${TAG#v}"
+
       # `--mac dmg:<arch> zip:<arch>` overrides electron-builder.yml's target
       # list for this run: a target list carrying explicit types short-circuits
       # computeArchToTargetNamesMap (app-builder-lib/out/targets/targetFactory.js)
@@ -274,14 +305,46 @@ jobs:
             fi
           done
 
+      # electron-builder writes release/latest-mac.yml whenever a publish:
+      # block exists in electron-builder.yml, --publish never notwithstanding.
+      # If it is missing on a publishing run, the publish: block was removed
+      # and the release would ship binaries with no update feed — installed
+      # apps could never see another update. Fail here, loudly. Both legs
+      # write the SAME filename, so copy it to an arch-distinct name before
+      # upload; download-artifact's merge-multiple would otherwise clobber
+      # one leg's feed with the other's.
+      - name: Confirm and stage the update feed metadata
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [ ! -f release/latest-mac.yml ]; then
+            echo "::error::release/latest-mac.yml was not produced. electron-builder only writes it when electron-builder.yml has a publish: block — restore that block, or this release ships an update feed nobody can read and installed apps never update."
+            exit 1
+          fi
+          cp release/latest-mac.yml "release/latest-mac-$ARCH.yml"
+
       # v4 artifacts are immutable and names must be unique per job, so each
-      # matrix leg uploads under its own arch-suffixed name.
+      # matrix leg uploads under its own arch-suffixed name. The blockmap
+      # pattern may match nothing (electron-builder does not always emit
+      # them); that is fine — if-no-files-found only fires when the WHOLE
+      # path list matches nothing, and the dmg/zip always exist.
       - uses: actions/upload-artifact@v4
         with:
           name: invoiceapp-macos-${{ matrix.arch }}
           path: |
             release/InvoiceApp-mac-${{ matrix.arch }}.dmg
             release/InvoiceApp-mac-${{ matrix.arch }}.zip
+            release/InvoiceApp-mac-${{ matrix.arch }}.zip.blockmap
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          name: invoiceapp-update-meta-${{ matrix.arch }}
+          path: release/latest-mac-${{ matrix.arch }}.yml
           if-no-files-found: error
           retention-days: 30
 
@@ -292,24 +355,56 @@ jobs:
     if: needs.validate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
+      # This job needs the repo (for scripts/merge-latest-mac.ts) and Node —
+      # neither was required back when it only shuffled artifacts. Same sha
+      # as verify/build so the merge script version matches what was tested.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # --ignore-scripts: this job only needs js-yaml and tsx. The postinstall
+      # rebuilds better-sqlite3 and pulls llama.cpp backends — minutes of work
+      # this Linux box would throw away.
+      - name: Install dependencies (scripts only)
+        run: npm ci --ignore-scripts
+
       - name: Collect artifacts from every arch
         uses: actions/download-artifact@v4
         with:
-          pattern: invoiceapp-macos-*
+          pattern: invoiceapp-*
           merge-multiple: true
           path: release-assets
 
-      - name: Confirm all four assets are present
+      - name: Confirm all six release inputs are present
         run: |
           set -euo pipefail
           ls -lh release-assets/
           for f in InvoiceApp-mac-arm64.dmg InvoiceApp-mac-x64.dmg \
-                   InvoiceApp-mac-arm64.zip InvoiceApp-mac-x64.zip; do
+                   InvoiceApp-mac-arm64.zip InvoiceApp-mac-x64.zip \
+                   latest-mac-arm64.yml latest-mac-x64.yml; do
             if [ ! -f "release-assets/$f" ]; then
               echo "::error::Missing $f — refusing to publish a partial release."
               exit 1
             fi
           done
+
+      # Each leg's latest-mac.yml names only its own zip; electron-updater
+      # needs one feed listing both so MacUpdater can pick by arch. The script
+      # also cross-checks that both legs built the same version.
+      - name: Merge per-arch update metadata into one feed
+        run: |
+          set -euo pipefail
+          node --import tsx scripts/merge-latest-mac.ts \
+            release-assets/latest-mac-arm64.yml \
+            release-assets/latest-mac-x64.yml \
+            release-assets/latest-mac.yml
+          echo "Merged update feed:"
+          cat release-assets/latest-mac.yml
 
       # `validate` ran up to an hour ago; a tag could have been created in the
       # meantime. Re-check immediately before publishing so the assets can never
@@ -349,9 +444,40 @@ jobs:
           draft: false
           make_latest: 'true'
           generate_release_notes: true
+          # latest-mac.yml is the auto-update feed — without it every
+          # installed app stops seeing updates. It belongs in this list so
+          # fail_on_unmatched_files guards it like the binaries.
           fail_on_unmatched_files: true
           files: |
             release-assets/InvoiceApp-mac-arm64.dmg
             release-assets/InvoiceApp-mac-x64.dmg
             release-assets/InvoiceApp-mac-arm64.zip
             release-assets/InvoiceApp-mac-x64.zip
+            release-assets/latest-mac.yml
+
+      # Blockmaps are optional: electron-builder does not always emit them and
+      # macOS electron-updater downloads the full zip anyway. They cannot go
+      # in the list above — fail_on_unmatched_files (which must stay, it
+      # guards the required assets) would fail the release whenever the glob
+      # matches nothing. So attach them in a second, explicitly conditional
+      # step that only runs when blockmaps exist; it updates the release
+      # created above under the same tag.
+      - name: Check for blockmaps
+        id: blockmaps
+        run: |
+          set -euo pipefail
+          if compgen -G 'release-assets/*.blockmap' > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No blockmap files were produced; publishing without them."
+          fi
+
+      - name: Attach blockmaps
+        if: steps.blockmaps.outputs.present == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: release-assets/*.blockmap
