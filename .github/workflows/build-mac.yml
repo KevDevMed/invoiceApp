@@ -222,15 +222,24 @@ jobs:
             arch: arm64
             expected_uname: arm64
     runs-on: ${{ matrix.runner }}
-    # Was 60, then 120. In certificate mode the critical path now carries TWO
-    # notarytool round trips per arch — electron-builder's, on the .app, and
-    # this workflow's, on the .dmg — each commonly 5-20 minutes with no upper
-    # bound worth relying on, on top of an npm ci that compiles better-sqlite3
-    # and node-llama-cpp from source. The dmg submission is capped at
-    # `--timeout 45m` so a stuck one fails with a notarytool message rather than
-    # a bare job timeout; 150 leaves room for that cap plus the rest of the job.
-    # A timeout here burns the whole matrix leg and the release with it.
-    timeout-minutes: 150
+    # Was 60, then 120, then 150. In certificate mode the critical path carries
+    # TWO notarytool round trips per arch — electron-builder's, on the .app, and
+    # this workflow's, on the .dmg — on top of an npm ci that compiles
+    # better-sqlite3 and node-llama-cpp from source. A timeout here burns the
+    # whole matrix leg and the release with it.
+    #
+    # 150 was not enough. Measured on the v0.1.2 attempts, all four submissions
+    # of the same two artifacts:
+    #
+    #   arm64 app   63m   arm64 dmg   44m   (job total 108m, passed)
+    #   x64   app  147m+  never returned    (hit the 150m job ceiling)
+    #   x64   app   37m   x64 dmg     45m+  (hit the 45m notarytool cap)
+    #
+    # Apple publishes no upper bound and the spread above is on identical
+    # inputs, so the cap has to be sized for their worst queue rather than
+    # their median. 330 is inside GitHub's 360-minute hosted-runner maximum and
+    # leaves headroom for two 120m submissions plus the build.
+    timeout-minutes: 330
 
     # `secrets` is not one of the contexts available to a step-level `if:`
     # (github, needs, strategy, matrix, job, runner, env, vars, steps, inputs),
@@ -712,14 +721,21 @@ jobs:
           fi
 
           echo "=== xcrun notarytool submit $DMG ==="
-          # --wait blocks until Apple returns a verdict; --timeout keeps a stuck
-          # submission from eating the whole job timeout with no output.
+          # --wait blocks until Apple returns a verdict; --timeout bounds it so a
+          # genuinely stuck submission fails with a notarytool message rather
+          # than a bare job timeout.
+          #
+          # 120m, not the 45m this was: v0.1.2's x64 dmg submission was still
+          # "In Progress" when 45m elapsed, and its arm64 counterpart finished at
+          # 44m — one minute inside the cap. Both were the same artifact built
+          # two ways, so the cap was sitting exactly on top of Apple's real
+          # spread and turning slow-but-fine submissions into build failures.
           NOTARY_STATUS=0
           NOTARY_OUT=$(xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 45m 2>&1) || NOTARY_STATUS=$?
+            --wait --timeout 120m 2>&1) || NOTARY_STATUS=$?
           printf '%s\n' "$NOTARY_OUT"
           SUBMISSION_ID=$(awk '/^ *id: / { print $2; exit }' <<<"$NOTARY_OUT")
           if [ "$NOTARY_STATUS" -ne 0 ] || ! grep -q '^ *status: Accepted$' <<<"$NOTARY_OUT"; then
@@ -729,6 +745,15 @@ jobs:
                 --apple-id "$APPLE_ID" \
                 --password "$APPLE_APP_SPECIFIC_PASSWORD" \
                 --team-id "$APPLE_TEAM_ID" || true
+            fi
+            # A timeout and a rejection are different failures and want
+            # different responses — wait longer versus fix the binary — so do
+            # not report one as the other. notarytool prints "Timeout of N
+            # second(s) was reached before processing completed." and exits
+            # non-zero without ever returning a status.
+            if grep -qi 'Timeout of .* was reached before processing completed' <<<"$NOTARY_OUT"; then
+              echo "::error::Apple's notary service had not finished processing $DMG within the --timeout window. This is a queue delay, NOT a rejection: the submission may still complete on Apple's side. Re-run the job, or raise --timeout. Submission id: ${SUBMISSION_ID:-unknown} (query it with 'xcrun notarytool info <id>')."
+              exit 1
             fi
             echo "::error::Apple's notary service did not accept $DMG. The log above lists the offending items."
             exit 1
