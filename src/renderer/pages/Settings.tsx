@@ -23,6 +23,7 @@ import { TextArea } from '@astryxdesign/core/TextArea';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
 import { SETTINGS_KEYS } from '../../shared/types';
+import { UpdatesSection } from '../features/updates';
 import { Page, PageHeader } from '../ui/Page';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
@@ -264,6 +265,13 @@ export function SettingsPage(): React.JSX.Element {
           />
         </SettingsRow>
       </SettingsGroup>
+
+      {/*
+        Its own section, and deliberately outside the save flow above: the
+        update controls act the moment they are pressed and have nothing to do
+        with "Save settings".
+      */}
+      <UpdatesSection />
     </Page>
   );
 }
