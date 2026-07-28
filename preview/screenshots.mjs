@@ -244,6 +244,10 @@ async function tileValue(page, label) {
  *   { left, right }   the two gutters between the column and the region's
  *                     padding box — equal when the column is centred
  *   { columnWidth, availableWidth }  the column and the space it may occupy
+ *   { regionScrollWidth, regionClientWidth }  the region's own overflow, which
+ *                     the document's width does not see: the region owns
+ *                     `overflow: auto`, so it can scroll sideways on its own
+ *   { documentScrollWidth, viewportWidth }  the separate, document-level check
  *
  * Found from the page's own h1 by walking up to the first scrolling ancestor,
  * so nothing here keys off a design-system class name. `clientWidth` is used for
@@ -275,7 +279,12 @@ async function contentColumnGutters(page) {
           // Content inside the column must not move: the h1 still starts at the
           // column's own left edge.
           headingOffset: heading.getBoundingClientRect().left - column.left,
-          overflowsHorizontally: document.documentElement.scrollWidth > window.innerWidth,
+          // Raw widths only; the tolerance that turns them into an overflow
+          // verdict lives in Node, next to the other centring tolerances.
+          regionScrollWidth: region.scrollWidth,
+          regionClientWidth: region.clientWidth,
+          documentScrollWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
         };
       }
       node = region;
@@ -560,10 +569,22 @@ async function main() {
       narrow.left <= CENTRE_TOLERANCE,
     gutterDetail(narrow),
   );
+  // The scroll region owns `overflow: auto`, so it can scroll sideways while the
+  // document's width never changes. That is the regression this guards, so it is
+  // measured on the region; the document is asserted separately below.
   checkTrue(
-    'no horizontal page scrollbar at 900 wide',
-    narrow !== null && !narrow.overflowsHorizontally,
-    `document scrollWidth exceeds the viewport: ${narrow === null ? 'not measured' : narrow.overflowsHorizontally}`,
+    'scroll region does not overflow sideways at 900 wide',
+    narrow !== null && narrow.regionScrollWidth <= narrow.regionClientWidth + CENTRE_TOLERANCE,
+    narrow === null
+      ? 'not measured'
+      : `region scrollWidth: ${narrow.regionScrollWidth.toFixed(1)}, clientWidth: ${narrow.regionClientWidth.toFixed(1)}`,
+  );
+  checkTrue(
+    'document does not overflow the viewport at 900 wide',
+    narrow !== null && narrow.documentScrollWidth <= narrow.viewportWidth + CENTRE_TOLERANCE,
+    narrow === null
+      ? 'not measured'
+      : `document scrollWidth: ${narrow.documentScrollWidth.toFixed(1)}, viewport: ${narrow.viewportWidth.toFixed(1)}`,
   );
 
   // Back to the viewport and the page the rest of the run expects.
