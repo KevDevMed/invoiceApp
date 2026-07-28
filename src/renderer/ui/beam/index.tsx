@@ -17,7 +17,7 @@
 import { useSyncExternalStore } from 'react';
 import { BorderBeam, type BorderBeamProps } from 'border-beam';
 
-import { useThemeMode } from '../../AppShell';
+import { useThemeMode } from '../themeMode';
 import { beamProps, resolveScheme, type BeamPreset } from './presets';
 
 /** One import site for consumers: the dock takes both from here. */

@@ -46,6 +46,53 @@ body {
   -webkit-app-region: no-drag;
 }
 
+/*
+ * The floating assistant dock. Two things here have no design-system
+ * equivalent, which is the only sanctioned reason for app-level CSS: fixed
+ * positioning (no Astryx layout component exposes it) and sizing measured
+ * against the viewport rather than a parent.
+ *
+ * The positioning sits on this wrapper rather than on the AppBeam element:
+ * `border-beam` injects `[data-beam="…"] { position: relative }` from a <style>
+ * tag mounted with the component, so it lands after this file in document order
+ * at equal specificity and would win.
+ *
+ * Bottom-right is the safe corner. The macOS traffic lights are top-left (see
+ * `chrome.ts`) and the sidebar's resize handle rides the sidebar's inline edge,
+ * so nothing the dock can cover is interactive.
+ */
+.assistant-dock-launcher {
+  position: fixed;
+  inset-block-end: var(--spacing-6, 24px);
+  inset-inline-end: var(--spacing-6, 24px);
+  /* Above page content. The panel itself needs no z-index: usePopover promotes
+     it into the browser's top layer, which sits above every stacking context. */
+  z-index: 10;
+}
+
+/* Circular, per the launcher's design. Button's own radius is rectangular, and
+   the beam auto-detects its child's computed radius — so setting it here is
+   also what makes the halo round instead of a rounded rectangle. */
+.assistant-dock-launcher-button {
+  border-radius: var(--radius-full, 9999px);
+}
+
+/*
+ * There is no width token, so the panel's size is built from the spacing scale
+ * instead of a bare number. The block-size cap is the important half: the panel
+ * is anchored to a fixed launcher and nothing above it constrains its height,
+ * so on a short window it would otherwise run off the top of the screen. The
+ * ChatLayout message list inside is the flex scroll region that absorbs it.
+ */
+.assistant-dock-panel {
+  inline-size: min(
+    calc(var(--spacing-12, 48px) * 8),
+    calc(100vw - var(--spacing-10, 40px))
+  );
+  block-size: calc(var(--spacing-12, 48px) * 13);
+  max-block-size: calc(100dvh - var(--spacing-12, 48px) * 3);
+}
+
 .app-page {
   display: flex;
   flex-direction: column;
