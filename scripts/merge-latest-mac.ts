@@ -146,22 +146,34 @@ export function mergeLatestMac(arm64Yml: string, x64Yml: string): string {
     files.push(entry);
   }
 
-  const arm64Entries = files.filter((f) => f.url.includes('arm64'));
-  const x64Entries = files.filter((f) => f.url.includes('x64'));
-  if (arm64Entries.length !== 1 || x64Entries.length !== 1) {
+  // What must be true of the merged feed is not "one entry per arch" — each
+  // per-arch file legitimately lists both a .zip and a .dmg. It is "exactly
+  // one installable update per arch": electron-updater's MacUpdater calls
+  // findFile(files, "zip", ["pkg", "dmg"]), so the .zip is the only entry a
+  // client will ever install. The .dmg entries are valid metadata and ride
+  // along untouched. Zero zips for an arch strands that architecture; two
+  // zips for an arch makes the update the client picks ambiguous.
+  const isZip = (f: UpdateFileEntry) => f.url.endsWith('.zip');
+  const arm64Zips = files.filter((f) => isZip(f) && f.url.includes('arm64'));
+  const x64Zips = files.filter((f) => isZip(f) && !f.url.includes('arm64') && f.url.includes('x64'));
+  if (arm64Zips.length !== 1 || x64Zips.length !== 1) {
     throw new Error(
-      `merged feed must contain exactly one arm64 entry and one x64 entry, got ` +
-        `${arm64Entries.length} arm64 / ${x64Entries.length} x64 ` +
-        `(urls: ${files.map((f) => f.url).join(', ')}) — a half-populated feed would ` +
-        'silently strand one architecture, refusing to merge',
+      `merged feed must contain exactly one installable zip per architecture, got ` +
+        `${arm64Zips.length} arm64 zip(s) / ${x64Zips.length} x64 zip(s) ` +
+        `(urls: ${files.map((f) => f.url).join(', ')}) — MacUpdater installs only the zip ` +
+        '(findFile(files, "zip", ["pkg", "dmg"])), so a feed without exactly one per arch ' +
+        'would silently strand or confuse one architecture, refusing to merge',
     );
   }
 
   // Older clients ignore `files` and read only the top-level path/sha512.
-  // Point those at the x64 zip: an Intel binary still runs on Apple Silicon
-  // under Rosetta; an arm64 binary does not run on Intel at all.
-  const [legacy] = x64Entries;
-  if (!legacy) throw new Error('unreachable: x64 entry vanished after the count check');
+  // Point those at the x64 zip — matching what electron-builder itself writes
+  // (its top-level path is the zip, never the dmg). x64 because an Intel
+  // binary still runs on Apple Silicon under Rosetta; an arm64 binary does
+  // not run on Intel at all. Selected by arch + extension, never by array
+  // position: input ordering must not decide what legacy clients download.
+  const [legacy] = x64Zips;
+  if (!legacy) throw new Error('unreachable: x64 zip vanished after the count check');
 
   const later =
     Date.parse(arm64.releaseDate) >= Date.parse(x64.releaseDate)
