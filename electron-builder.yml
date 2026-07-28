@@ -19,6 +19,18 @@ asarUnpack:
 
 npmRebuild: true
 
+# Present even though CI packages with `--publish never`, which is the point:
+# nothing here uploads anything. A `publish:` block is what makes electron-builder
+# (a) emit `latest-mac.yml` next to the artifacts — the manifest `autoUpdater`
+# fetches from GitHub Releases to learn a newer version exists — and (b) bake
+# `app-update.yml` into the packaged app, without which `autoUpdater` throws at
+# runtime because it has no feed to ask. The release workflow uploads the
+# artifacts and the manifest itself.
+publish:
+  - provider: github
+    owner: KevDevMed
+    repo: invoiceApp
+
 mac:
   category: public.app-category.finance
   # Version-less on purpose. The landing and download pages link straight at
