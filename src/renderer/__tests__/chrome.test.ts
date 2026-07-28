@@ -1,14 +1,21 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  breadcrumbTrail,
+  COLLAPSED_RAIL_MIN_PX,
+  collapsedRailWidth,
+  DEFAULT_COLLAPSED_RAIL_WIDTH,
   isSectionSelected,
   NO_TITLE_BAR_INSET,
+  OVERLAY_COLLAPSED_RAIL_WIDTH,
   OVERLAY_TITLE_BAR_INSET,
   readDesktopInfo,
   SECTION_ROUTES,
+  RESIZABLE_STORAGE_PREFIX,
   SIDE_NAV_WIDTH,
+  SIDE_NAV_WIDTH_STORAGE_ID,
+  SIDE_NAV_WIDTH_STORAGE_KEY,
   titleBarInset,
+  wasSideNavCollapsed,
   WEB_DESKTOP_INFO,
 } from '../chrome';
 
@@ -115,38 +122,119 @@ describe('isSectionSelected', () => {
   });
 });
 
-describe('breadcrumbTrail', () => {
-  it('shows the section alone on a top-level route', () => {
-    expect(breadcrumbTrail('/invoices')).toEqual([{ label: 'Invoices', isCurrent: true }]);
-    expect(breadcrumbTrail('/settings')).toEqual([{ label: 'Settings', isCurrent: true }]);
+// The spacing scale astryx.css writes onto :root, copied here so the tokens the
+// rail is built from can be resolved to real pixels in a node test. Asserting
+// only the string 'calc(var(--spacing-11) * 2)' would pass just as happily for
+// --spacing-2 (8px), which is the bug this suite exists to prevent.
+const SPACING_PX: Readonly<Record<string, number>> = {
+  '--spacing-11': 44,
+  '--spacing-12': 48,
+};
+
+/** Resolves the two shapes chrome.ts emits: `var(--x)` and `calc(var(--x) * n)`. */
+function resolvePx(length: string): number {
+  const plain = /^var\((--spacing-[\d-]+)\)$/.exec(length);
+  if (plain !== null) return SPACING_PX[plain[1] ?? ''] ?? Number.NaN;
+
+  const scaled = /^calc\(var\((--spacing-[\d-]+)\) \* (\d+)\)$/.exec(length);
+  if (scaled !== null) return (SPACING_PX[scaled[1] ?? ''] ?? Number.NaN) * Number(scaled[2]);
+
+  return Number.NaN;
+}
+
+describe('collapsedRailWidth', () => {
+  it('clears the traffic-light zone when the OS overlays window controls', () => {
+    const width = collapsedRailWidth({ platform: 'darwin', hasOverlayWindowControls: true });
+    expect(resolvePx(width)).toBeGreaterThanOrEqual(COLLAPSED_RAIL_MIN_PX);
+    expect(resolvePx(width)).toBeGreaterThanOrEqual(88);
   });
 
-  it('never emits a leading InvoiceApp crumb', () => {
-    expect(breadcrumbTrail('/reports').map((crumb) => crumb.label)).toEqual(['Reports']);
+  it('keeps the design system width where there are no overlay controls', () => {
+    expect(collapsedRailWidth(WEB_DESKTOP_INFO)).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+    expect(collapsedRailWidth({ platform: 'win32', hasOverlayWindowControls: false })).toBe(
+      DEFAULT_COLLAPSED_RAIL_WIDTH,
+    );
+    expect(collapsedRailWidth({ platform: 'linux', hasOverlayWindowControls: false })).toBe(
+      DEFAULT_COLLAPSED_RAIL_WIDTH,
+    );
   });
 
-  it('links the section and marks the leaf current on a nested route', () => {
-    expect(breadcrumbTrail('/invoices/new')).toEqual([
-      { label: 'Invoices', href: '#/invoices', isCurrent: false },
-      { label: 'New', isCurrent: true },
-    ]);
+  it('is built from spacing tokens, never raw pixels', () => {
+    expect(OVERLAY_COLLAPSED_RAIL_WIDTH).toMatch(/^calc\(var\(--spacing-\d+\) \* \d+\)$/);
+    expect(DEFAULT_COLLAPSED_RAIL_WIDTH).toMatch(/^var\(--spacing-\d+\)$/);
   });
 
-  it('builds cumulative hrefs for deeper paths', () => {
-    expect(breadcrumbTrail('/clients/42/edit-details')).toEqual([
-      { label: 'Clients', href: '#/clients', isCurrent: false },
-      { label: '42', href: '#/clients/42', isCurrent: false },
-      { label: 'Edit details', isCurrent: true },
-    ]);
+  // 48px ends inside the lights' x 13-70 zone, which is exactly the collision
+  // the wider rail exists to fix.
+  it('is wider than the design system default it replaces', () => {
+    expect(resolvePx(OVERLAY_COLLAPSED_RAIL_WIDTH)).toBeGreaterThan(
+      resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH),
+    );
+  });
+});
+
+/**
+ * A localStorage double. `entries` is what the store holds; `failOn` makes
+ * `getItem` throw the way a Safari private window does.
+ */
+function fakeStorage(entries: Record<string, string>, failing = false) {
+  return {
+    getItem(key: string): string | null {
+      if (failing) throw new DOMException('denied', 'SecurityError');
+      return entries[key] ?? null;
+    },
+  };
+}
+
+describe('wasSideNavCollapsed', () => {
+  // The prefix is not exported by the design system, so it is copied into
+  // chrome.ts. Pinned literally: derive the expected key from the constant and
+  // a typo in the constant passes its own test while silently reading a key
+  // nothing ever writes.
+  it('reads the key useResizable actually writes', () => {
+    expect(RESIZABLE_STORAGE_PREFIX).toBe('astryx-resizable:');
+    expect(SIDE_NAV_WIDTH_STORAGE_KEY).toBe(`astryx-resizable:${SIDE_NAV_WIDTH_STORAGE_ID}`);
   });
 
-  it('ignores a trailing slash', () => {
-    expect(breadcrumbTrail('/models/')).toEqual([{ label: 'Models', isCurrent: true }]);
+  // useResizable persists `isCollapsed ? 0 : size`, so 0 is the collapse flag.
+  it('is collapsed when the persisted width is 0', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '0' }))).toBe(true);
   });
 
-  it('returns an empty trail for an unknown path', () => {
-    expect(breadcrumbTrail('/nonexistent')).toEqual([]);
-    expect(breadcrumbTrail('/')).toEqual([]);
+  it('is expanded at a persisted normal width', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '264' }))).toBe(false);
+    expect(
+      wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: String(SIDE_NAV_WIDTH.min) })),
+    ).toBe(false);
+  });
+
+  it('is expanded when the key is absent', () => {
+    expect(wasSideNavCollapsed(fakeStorage({}))).toBe(false);
+    expect(wasSideNavCollapsed(fakeStorage({ 'some-other-key': '0' }))).toBe(false);
+  });
+
+  it('is expanded on malformed JSON', () => {
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '{oops' }))).toBe(false);
+    expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: '' }))).toBe(false);
+  });
+
+  // The hook requires `typeof parsed === 'number'`, so a stringy or null 0 is
+  // not collapse to it either. Disagreeing here is the whole bug.
+  it('is expanded on a non-number value', () => {
+    for (const raw of ['"0"', 'null', 'false', '{"width":0}', '[0]', '"264"']) {
+      expect(wasSideNavCollapsed(fakeStorage({ [SIDE_NAV_WIDTH_STORAGE_KEY]: raw }))).toBe(false);
+    }
+  });
+
+  it('is expanded when storage is unusable', () => {
+    expect(wasSideNavCollapsed(fakeStorage({}, true))).toBe(false);
+    expect(wasSideNavCollapsed(null)).toBe(false);
+  });
+
+  // Called as a React lazy initializer — React invokes it with no arguments,
+  // and under `environment: 'node'` there is no localStorage to fall back on.
+  it('defaults to expanded with no arguments', () => {
+    expect(wasSideNavCollapsed()).toBe(false);
   });
 });
 

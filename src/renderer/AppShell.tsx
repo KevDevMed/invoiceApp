@@ -1,32 +1,33 @@
 /**
- * The persistent application frame: identity sidebar, a slim content bar
- * (breadcrumb + theme control) and the content outlet every route renders into.
+ * The persistent application frame: identity sidebar and the content outlet
+ * every route renders into.
  *
  * Layout note — why there is no `topNav`. On macOS `src/main/window.ts` sets
  * `titleBarStyle: 'hiddenInset'`, so the OS paints the traffic lights over the
  * renderer's top-left corner. AppShell renders `topNav` above *both* columns,
  * starting at x=0, which puts the lights on top of the bar's first element.
  * Instead the sidebar owns the top-left corner (SideNavHeading carries the app
- * identity) and the breadcrumb bar lives inside the content column, below a
- * reserved band that keeps the lights over empty, draggable surface. See
- * `./chrome` for the geometry and `styles/global.css` for the drag regions.
+ * identity) and both columns open with a reserved band that keeps the lights
+ * over empty, draggable surface. There is no breadcrumb bar: the nav says where
+ * you are, and the page's own heading says it again. See `./chrome` for the
+ * geometry and `styles/global.css` for the drag regions and the sidebar panel.
  *
  * Downstream builders replace route *elements* (see routes.tsx). They do not
  * change this file — the shell is the same on every screen. Page-level layout
  * lives in `./ui/Page`.
  */
 
+import { useState } from 'react';
 import { Outlet, useLocation } from 'react-router';
 
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
-import { BreadcrumbItem, Breadcrumbs } from '@astryxdesign/core/Breadcrumbs';
-import { Divider } from '@astryxdesign/core/Divider';
 import { Icon, type IconName, type IconType } from '@astryxdesign/core/Icon';
 import { NavIcon } from '@astryxdesign/core/NavIcon';
 import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
-import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
+import { StackItem, VStack } from '@astryxdesign/core/Stack';
 import {
   SideNav,
+  SideNavCollapseButton,
   SideNavHeading,
   SideNavItem,
   SideNavSection,
@@ -34,7 +35,7 @@ import {
 
 import type { ThemeMode } from '../shared/types';
 import {
-  breadcrumbTrail,
+  collapsedRailWidth,
   isSectionSelected,
   NAV_GROUPS,
   readDesktopInfo,
@@ -42,12 +43,15 @@ import {
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   titleBarInset,
+  wasSideNavCollapsed,
   type NavGroup,
 } from './chrome';
 import { isDockVisible } from './ui/dockVisibility';
+import { updateBadge } from './ui/updateBadge';
 import { useThemeMode } from './ui/themeMode';
 import { AssistantDock } from './ui/AssistantDock';
 import { AssistantProvider } from './features/assistant/useAssistant';
+import { useUpdates } from './features/updates/useUpdates';
 
 export type { NavGroup } from './chrome';
 
@@ -159,6 +163,17 @@ function AssistantIcon(props: NavIconProps): React.JSX.Element {
   );
 }
 
+/** Download-into-tray: the update indicator's glyph on the collapsed rail. */
+function UpdateIcon(props: NavIconProps): React.JSX.Element {
+  return (
+    <svg {...svgProps} {...props}>
+      <path d="M12 3v11" />
+      <path d="M8 10.5l4 4 4-4" />
+      <path d="M4.5 18.5h15" />
+    </svg>
+  );
+}
+
 interface NavIconPair {
   readonly icon: IconType | IconName;
   readonly selectedIcon: IconType | IconName;
@@ -211,7 +226,14 @@ function navItem(item: NavItem, pathname: string): React.JSX.Element {
   );
 }
 
-/** Compact appearance control for the content bar. Writes through useThemeMode(). */
+/**
+ * Compact appearance control, in the sidebar footer beside Settings.
+ *
+ * It stays a SegmentedControl with exactly these three labels: the screenshot
+ * harness in `preview/screenshots.mjs` drives appearance through
+ * `getByRole('radio', { name: 'Light' | 'Dark' })`, and any other control shape
+ * breaks that gate. Writes through useThemeMode().
+ */
 function ThemeControl(): React.JSX.Element {
   const { mode, setMode } = useThemeMode();
   return (
@@ -248,9 +270,42 @@ function TitleBarInset({ height }: { height: string }): React.JSX.Element {
 
 export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
-  const inset = titleBarInset(readDesktopInfo());
-  const trail = breadcrumbTrail(pathname);
+  const desktop = readDesktopInfo();
+  const inset = titleBarInset(desktop);
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
+  /*
+    Collapse is controlled here for one reason: `headerEndContent` is hidden
+    while the rail is collapsed, so the toggle that lives on the heading row
+    cannot also be the way back out. Knowing the state lets the collapsed rail
+    render its own expand button in `footerIcons` and lets the theme control —
+    which cannot shrink to an icon — sit out the collapsed state entirely.
+
+    Seeded from the *same* localStorage byte `resizable.autoSaveId` persists
+    below, because controlled collapse and the resizable width are two views of
+    one saved state. Seed it `false` instead and a collapsed restart renders the
+    expanded sidebar at the hook's width of 0. See `wasSideNavCollapsed`.
+  */
+  const [isCollapsed, setIsCollapsed] = useState(wasSideNavCollapsed);
+  const { state: updateState } = useUpdates();
+  const badge = updateBadge(updateState);
+
+  /*
+    The sidebar as an inset, rounded panel rather than a column welded to the
+    window edge. Inline styles, in tokens: SideNav's own width/height come from
+    the design system's StyleX classes, which carry specificity hacks that
+    author CSS cannot outrank, and `minInlineSize` is precisely the property
+    that widens the collapsed rail past the traffic lights (see `./chrome`)
+    without fighting either the collapsed width or the resizable one.
+  */
+  const sideNavPanel: React.CSSProperties = {
+    minInlineSize: collapsedRailWidth(desktop),
+    boxSizing: 'border-box',
+    marginBlock: 'var(--spacing-2)',
+    marginInlineStart: 'var(--spacing-2)',
+    blockSize: 'calc(100% - var(--spacing-4))',
+    borderRadius: 'var(--radius-container)',
+    background: 'var(--color-background-surface)',
+  };
 
   return (
     /*
@@ -263,9 +318,17 @@ export function AppShell(): React.JSX.Element {
       <AstryxAppShell
         height="fill"
         contentPadding={0}
-        variant="section"
+        /*
+          `section` draws a divider down the sidebar's inline-end edge, and that
+          divider runs to y=0 — straight past the green traffic light. `elevated`
+          separates the columns with background instead, which is what lets the
+          sidebar read as the inset panel `sideNavPanel` shapes.
+        */
+        variant="elevated"
         sideNav={
           <SideNav
+            className="app-side-nav"
+            style={sideNavPanel}
             header={
               <VStack gap={0}>
                 <TitleBarInset height={inset} />
@@ -273,16 +336,37 @@ export function AppShell(): React.JSX.Element {
                   icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
                   heading="InvoiceApp"
                   headingHref="#/invoices"
+                  /* A1: the toggle belongs on the identity row, not orphaned
+                     under Settings. Hidden while collapsed — `footerIcons`
+                     below is the way back. */
+                  headerEndContent={<SideNavCollapseButton />}
                 />
               </VStack>
             }
             footer={
-              <VStack gap={0}>
-                <Divider />
+              <VStack gap={1}>
+                {badge.isVisible ? (
+                  <SideNavItem
+                    label={badge.label}
+                    icon={UpdateIcon}
+                    selectedIcon={selectedVariant(UpdateIcon)}
+                    // The full update UI already lives on Settings; this is a
+                    // pointer to it, not a second copy of it.
+                    href="#/settings"
+                  />
+                ) : null}
                 {footerItems.map((item) => navItem(item, pathname))}
+                {isCollapsed ? null : <ThemeControl />}
               </VStack>
             }
-            collapsible
+            /* Only while collapsed: expanded, the heading row owns the toggle,
+               and two of them would be the orphan chevron all over again. */
+            footerIcons={isCollapsed ? <SideNavCollapseButton /> : undefined}
+            collapsible={{
+              isCollapsed,
+              onCollapsedChange: setIsCollapsed,
+              hasButton: false,
+            }}
             resizable={{
               defaultWidth: SIDE_NAV_WIDTH.default,
               minWidth: SIDE_NAV_WIDTH.min,
@@ -301,31 +385,12 @@ export function AppShell(): React.JSX.Element {
         }
       >
         <VStack gap={0} height="100%">
+          {/*
+            Kept even though the bar that used to sit under it is gone: this is
+            the content half of the window's drag surface. Delete it and the
+            top-right of the window cannot be grabbed at all.
+          */}
           <TitleBarInset height={inset} />
-          <StackItem size="static">
-            <HStack
-              as="header"
-              className="app-drag-region"
-              gap={4}
-              paddingInline={5}
-              paddingBlock={2}
-              align="center"
-            >
-              <StackItem size="fill">
-                {trail.length === 0 ? null : (
-                  <Breadcrumbs variant="supporting">
-                    {trail.map((crumb) => (
-                      <BreadcrumbItem key={crumb.label} href={crumb.href} isCurrent={crumb.isCurrent}>
-                        {crumb.label}
-                      </BreadcrumbItem>
-                    ))}
-                  </Breadcrumbs>
-                )}
-              </StackItem>
-              <ThemeControl />
-            </HStack>
-            <Divider />
-          </StackItem>
           <StackItem size="fill">
             <Outlet />
           </StackItem>

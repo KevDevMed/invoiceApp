@@ -47,6 +47,30 @@ body {
 }
 
 /*
+ * The sidebar's scroll region keeps scrolling; it just stops drawing a bar.
+ * `scrollbar-width` and the `::-webkit-scrollbar` pseudo-element are browser
+ * chrome with no design-system equivalent — the same reason `-webkit-app-region`
+ * above lives here. Scoped to the sidebar so the content column, where a long
+ * page genuinely needs a visible scroll position, is untouched. Both rules are
+ * needed: Chromium honours the pseudo-element, and `scrollbar-width` is the
+ * standard property that survives if it ever stops doing so.
+ *
+ * `overflow` is deliberately not touched. Hiding the bar must not disable the
+ * scrolling, or a long nav loses its bottom items outright.
+ */
+.app-side-nav,
+.app-side-nav * {
+  scrollbar-width: none;
+}
+
+.app-side-nav::-webkit-scrollbar,
+.app-side-nav *::-webkit-scrollbar {
+  display: none;
+  inline-size: 0;
+  block-size: 0;
+}
+
+/*
  * The floating assistant dock. Two things here have no design-system
  * equivalent, which is the only sanctioned reason for app-level CSS: fixed
  * positioning (no Astryx layout component exposes it) and sizing measured

@@ -4,8 +4,9 @@
  * AppShell.tsx is a React file the test runner cannot mount — the root vitest
  * project is `environment: 'node'` and there is no DOM harness. Everything the
  * shell *decides* (what the platform is, how much space the traffic lights
- * need, what the breadcrumb trail says) therefore lives here, free of React and
- * of the design system, so it can be unit-tested directly.
+ * need, how wide the collapsed rail has to be to clear them) therefore lives
+ * here, free of React and of the design system, so it can be unit-tested
+ * directly.
  */
 
 /**
@@ -93,6 +94,65 @@ export const SIDE_NAV_WIDTH = {
 /** localStorage key SideNav uses to persist the user's dragged width. */
 export const SIDE_NAV_WIDTH_STORAGE_ID = 'invoiceapp.sidenav.width';
 
+/**
+ * Prefix the design system's `useResizable` puts in front of an `autoSaveId`
+ * before touching localStorage (`Resizable/useResizable.ts`, `STORAGE_PREFIX`).
+ * Duplicated here because the hook does not export it, and reading the same key
+ * the hook writes is the whole point of `wasSideNavCollapsed` below.
+ */
+export const RESIZABLE_STORAGE_PREFIX = 'astryx-resizable:';
+
+/** Full localStorage key the sidebar's persisted width is stored under. */
+export const SIDE_NAV_WIDTH_STORAGE_KEY = `${RESIZABLE_STORAGE_PREFIX}${SIDE_NAV_WIDTH_STORAGE_ID}`;
+
+/** The one method of `Storage` this module needs, so tests can inject a double. */
+export interface StorageReader {
+  getItem(key: string): string | null;
+}
+
+/**
+ * localStorage, or null wherever it is unusable.
+ *
+ * Absent under `environment: 'node'` in the unit tests and in the main process;
+ * *present but throwing on access* in a Safari private window. Both degrade to
+ * "no persisted state" rather than taking the shell down on first render.
+ */
+function defaultStorage(): StorageReader | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Was the sidebar left collapsed at the end of the last session?
+ *
+ * The collapsed flag is *not* persisted separately: `useResizable` writes
+ * `isCollapsed ? 0 : size` under one key and re-derives collapse on the next
+ * mount as `persisted === 0`. AppShell drives SideNav's collapse in controlled
+ * mode, so its initial state has to be derived from that same byte — a bare
+ * `useState(false)` disagrees with the hook after a collapsed restart, and
+ * SideNav then renders *expanded* content at `resizableHook.size`, which is 0.
+ *
+ * Mirrors the hook's own parse exactly (`JSON.parse`, number-typed, `=== 0`).
+ * Anything missing, unparseable or not the number 0 means expanded, because
+ * that is what the hook will decide too.
+ */
+export function wasSideNavCollapsed(
+  storage: StorageReader | null | undefined = defaultStorage(),
+  storageId: string = SIDE_NAV_WIDTH_STORAGE_ID,
+): boolean {
+  if (!storage) return false;
+  try {
+    const raw = storage.getItem(`${RESIZABLE_STORAGE_PREFIX}${storageId}`);
+    if (raw == null) return false;
+    return (JSON.parse(raw) as unknown) === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Sidebar group a nav item belongs to. Items without a group sit in the footer. */
 export type NavGroup = 'Billing' | 'Insights' | 'Local AI';
 
@@ -124,52 +184,34 @@ export function isSectionSelected(pathname: string, path: string): boolean {
   return pathname === path || pathname.startsWith(`${path}/`);
 }
 
-export interface Crumb {
-  readonly label: string;
-  /** Hash href, omitted on the current page. */
-  readonly href?: string;
-  readonly isCurrent: boolean;
-}
+/**
+ * Narrowest the collapsed icon rail may be when the OS overlays window
+ * controls, in px.
+ *
+ * The traffic lights occupy roughly x 13-70. The design system's own collapsed
+ * width is --spacing-12 (48px), which ends *inside* that zone: the lights then
+ * straddle the rail's inline-end edge and the divider runs between the yellow
+ * and the green light. 88px puts the whole light cluster inside the rail with
+ * room to spare, even once the panel is inset from the window edge by
+ * --spacing-2 (8px): the rail then spans x 8-96 and the lights end at 70.
+ */
+export const COLLAPSED_RAIL_MIN_PX = 88;
 
-/** `invoice-drafts` -> `Invoice drafts`; ids and numbers pass through. */
-function humanize(segment: string): string {
-  let decoded = segment;
-  try {
-    decoded = decodeURIComponent(segment);
-  } catch {
-    // A malformed escape is not worth failing a breadcrumb over.
-  }
-  const words = decoded.replace(/[-_]+/g, ' ').trim();
-  return words.charAt(0).toUpperCase() + words.slice(1);
-}
+/** 44 * 2 = 88px, expressed on the spacing scale rather than as a raw length. */
+export const OVERLAY_COLLAPSED_RAIL_WIDTH = 'calc(var(--spacing-11) * 2)';
+
+/** No overlay controls, no light zone to clear — the design system's own width. */
+export const DEFAULT_COLLAPSED_RAIL_WIDTH = 'var(--spacing-12)';
 
 /**
- * The content bar's trail for a pathname.
+ * Minimum width of the collapsed icon rail, as a CSS length.
  *
- * There is no leading "InvoiceApp" crumb: the sidebar's SideNavHeading now
- * carries the app identity, and repeating it two inches to the right is noise.
- * An unknown path yields an empty trail — the bar shows the theme control
- * alone rather than inventing a location.
+ * Applied as `min-inline-size`, not `width`: SideNav owns its collapsed width
+ * and its expanded (resizable) width, and a floor is the one thing that widens
+ * the rail without fighting either.
  */
-export function breadcrumbTrail(pathname: string): readonly Crumb[] {
-  const section = SECTION_ROUTES.find((route) => isSectionSelected(pathname, route.path));
-  if (section === undefined) return [];
-
-  const rest = pathname.slice(section.path.length).split('/').filter(Boolean);
-  if (rest.length === 0) return [{ label: section.label, isCurrent: true }];
-
-  const trail: Crumb[] = [
-    { label: section.label, href: `#${section.path}`, isCurrent: false },
-  ];
-  let prefix = section.path;
-  rest.forEach((segment, index) => {
-    prefix = `${prefix}/${segment}`;
-    const isCurrent = index === rest.length - 1;
-    trail.push(
-      isCurrent
-        ? { label: humanize(segment), isCurrent: true }
-        : { label: humanize(segment), href: `#${prefix}`, isCurrent: false },
-    );
-  });
-  return trail;
+export function collapsedRailWidth(info: DesktopInfo): string {
+  return info.hasOverlayWindowControls
+    ? OVERLAY_COLLAPSED_RAIL_WIDTH
+    : DEFAULT_COLLAPSED_RAIL_WIDTH;
 }

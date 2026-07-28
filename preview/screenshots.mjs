@@ -521,16 +521,24 @@ async function main() {
   // gutters; a column pinned to the left leaves the whole remainder on the
   // right. Both halves of the contract are asserted: symmetry when the cap
   // bites, and a full-width column when it does not.
+  //
+  // Measured at 1600, not at the run's default 1440. The sidebar is an inset
+  // panel (see AppShell's `sideNavPanel`), so the shell consumes its own width
+  // plus margins and at 1440 the invoices content region lands on exactly the
+  // 1120 cap — gutters of zero, which says nothing either way about centring.
+  // 1600 puts the region clear of the cap again, so "the cap bites" is a real
+  // assertion rather than a boundary coincidence.
   console.log('\nContent column centring');
   const CENTRE_TOLERANCE = 2;
+  await page.setViewportSize({ width: 1600, height: 960 });
   const wide = await contentColumnGutters(page);
   const wideCentred = checkTrue(
-    'invoices column is centred at 1440 wide',
+    'invoices column is centred at 1600 wide',
     wide !== null && Math.abs(wide.left - wide.right) <= CENTRE_TOLERANCE,
     gutterDetail(wide),
   );
   checkTrue(
-    'invoices column cap actually bites at 1440 wide',
+    'invoices column cap actually bites at 1600 wide',
     wide !== null && Math.min(wide.left, wide.right) >= CENTRE_TOLERANCE,
     gutterDetail(wide),
   );
@@ -549,7 +557,7 @@ async function main() {
   await page.getByRole('heading', { name: 'Settings', exact: true }).first().waitFor({ timeout: 15_000 });
   const settings = await contentColumnGutters(page);
   checkTrue(
-    'settings column (cap 860) is centred at 1440 wide',
+    'settings column (cap 860) is centred at 1600 wide',
     settings !== null &&
       Math.abs(settings.left - settings.right) <= CENTRE_TOLERANCE &&
       Math.min(settings.left, settings.right) > 100,
