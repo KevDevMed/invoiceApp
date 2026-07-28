@@ -18,7 +18,7 @@ import { Button } from '@astryxdesign/core/Button';
 import { Card } from '@astryxdesign/core/Card';
 import { Divider } from '@astryxdesign/core/Divider';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
-import { Grid } from '@astryxdesign/core/Grid';
+import { Grid, GridSpan } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { List, ListItem } from '@astryxdesign/core/List';
 import { Section } from '@astryxdesign/core/Layout';
@@ -56,7 +56,10 @@ type DetailTab = 'invoice' | 'history' | 'notes';
 interface DetailData {
   readonly invoice: InvoiceWithItems;
   readonly business: { readonly name: string | null; readonly address: string | null };
-  /** Null when the client has no paid invoices, or when the sweep failed. */
+  /**
+   * Null when the client has no *other* paid invoice than this one, or when
+   * the sweep failed.
+   */
   readonly averageDelayDays: number | null;
 }
 
@@ -90,14 +93,21 @@ function StatTileCard({
   return (
     <Card padding={4} variant={isEmphasised ? 'default' : 'muted'}>
       <VStack gap={1}>
-        <Text type="label" color="secondary" maxLines={1}>
+        {/* Two lines, not one: at three columns a 1440px page gives each tile
+            ~175px, which clips "Other invoices av delay" to an ellipsis. The
+            label wraps instead; the row stretches all six tiles together. */}
+        <Text type="label" color="secondary" maxLines={2}>
           {label}
         </Text>
+        {/* The headline number is never truncated: its tile spans the whole
+            row (see GridSpan below), so `€1,234,567.89` at display-3 has room
+            at both column widths. maxLines stays off it — an ellipsis on the
+            most important figure on the page is worse than any overflow. */}
         <Text
           type={isEmphasised ? 'display-3' : 'large'}
           weight={isEmphasised ? 'bold' : 'semibold'}
           hasTabularNumbers
-          maxLines={1}
+          maxLines={isEmphasised ? 0 : 1}
         >
           {value}
         </Text>
@@ -157,8 +167,12 @@ export function InvoiceDetail(): React.JSX.Element {
     void (async () => {
       // Drop the previous invoice before fetching the next one, so navigating
       // between two detail pages shows the spinner rather than stale numbers.
+      // The action banners go with it: "Status changed to paid." is about the
+      // invoice that was on screen, not the one arriving.
       setData(null);
       setLoadError(null);
+      setActionError(null);
+      setNotice(null);
       if (id === undefined) {
         setLoadError('This invoice no longer exists.');
         return;
@@ -178,7 +192,10 @@ export function InvoiceDetail(): React.JSX.Element {
         // rather than taking the whole page down with it.
         let averageDelayDays: number | null = null;
         try {
-          averageDelayDays = averagePaymentDelayDays(await fetchPaidSiblings(invoice.clientId));
+          averageDelayDays = averagePaymentDelayDays(
+            await fetchPaidSiblings(invoice.clientId),
+            invoice.id,
+          );
         } catch {
           averageDelayDays = null;
         }
@@ -250,6 +267,9 @@ export function InvoiceDetail(): React.JSX.Element {
               },
             },
       );
+      // No sibling re-sweep: `averageDelayDays` is the mean over the client's
+      // *other* paid invoices, and none of those rows changed here. Paying
+      // this invoice cannot move a number it is excluded from.
       setNotice(`Status changed to ${updated.status}.`);
     } catch (cause) {
       if (currentIdRef.current !== requestedId) return;
@@ -368,14 +388,25 @@ export function InvoiceDetail(): React.JSX.Element {
               </HStack>
 
               <Grid columns={{ minWidth: 150, max: 3 }} gap={3}>
-                {tiles.map((tile) => (
-                  <StatTileCard
-                    key={tile.key}
-                    label={tile.label}
-                    value={tile.value}
-                    isEmphasised={tile.isEmphasised}
-                  />
-                ))}
+                {/* The emphasised tile takes the whole row. At display-3 the
+                    headline amount needs more than a third of the column —
+                    €21,873.75 was being clipped to `€21,873....` at 1440px —
+                    and growing the tile keeps the type size the mockup asked
+                    for instead of shrinking the one number that matters. */}
+                {tiles.map((tile) =>
+                  tile.isEmphasised ? (
+                    <GridSpan key={tile.key} columns="full">
+                      <StatTileCard label={tile.label} value={tile.value} isEmphasised />
+                    </GridSpan>
+                  ) : (
+                    <StatTileCard
+                      key={tile.key}
+                      label={tile.label}
+                      value={tile.value}
+                      isEmphasised={false}
+                    />
+                  ),
+                )}
               </Grid>
 
               <Section padding={4}>

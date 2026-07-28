@@ -43,6 +43,7 @@ import {
 import type { Client, InvoiceItemInput, InvoiceStatus } from '../../../shared/types';
 import { SETTINGS_KEYS } from '../../../shared/types';
 import { Page, PageHeader } from '../../ui/Page';
+import { normaliseNotes } from './detail';
 import { buildDocumentModel, netTermDays } from './document';
 import { STATUS_OPTIONS, money, todayIso } from './format';
 import { InvoiceDocument } from './InvoiceDocument';
@@ -251,7 +252,9 @@ export function InvoiceEditor(): React.JSX.Element {
         dueDate,
         currency,
         taxRateBps,
-        notes: notes.trim() === '' ? null : notes,
+        // Same normalisation the save below uses, so the preview can never
+        // promise a document without a Notes block and then store one.
+        notes: normaliseNotes(notes),
         items: validItems,
         totals,
         client: selectedClient,
@@ -320,7 +323,15 @@ export function InvoiceEditor(): React.JSX.Element {
     setActionError(null);
     setNotice(null);
     try {
-      const payload = { clientId, issueDate, dueDate, currency, taxRateBps, notes: notes || null, items };
+      const payload = {
+        clientId,
+        issueDate,
+        dueDate,
+        currency,
+        taxRateBps,
+        notes: normaliseNotes(notes),
+        items,
+      };
       if (isNew) {
         const created = await window.api.invoke('invoices:create', payload);
         // Lands on the read-only detail page; this component unmounts mid-flight.
