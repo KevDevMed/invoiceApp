@@ -1,0 +1,279 @@
+# Cut a release in one click, from the Actions tab, with no local git.
+#
+# Releasing used to take three manual steps: bump package.json on a branch,
+# PR and merge it, then tag the merge commit. This workflow collapses that to
+# one workflow_dispatch: type the new version (or patch/minor/major), and it
+# bumps, commits to main, tags, and hands off to build-mac.yml — which does
+# all the real work of building, signing, notarising and publishing.
+#
+# DELIBERATE TRADEOFF — this pushes straight to main, no PR. That is the price
+# of one-click, and it is acceptable here because a version-only bump cannot
+# break the build (nothing under src/ changes), and build-mac.yml runs
+# typecheck / lint / unit tests in its own `verify` job before packaging
+# anything, so a broken main would still never ship. If main ever becomes
+# branch-protected, this workflow stops working and needs a PAT or a
+# deploy-key bypass — revisit the tradeoff then.
+#
+# THE TRIGGER PROBLEM, AND WHY THIS DISPATCHES INSTEAD OF RELYING ON THE TAG.
+# A tag pushed with the workflow's own GITHUB_TOKEN does NOT trigger
+# build-mac.yml's `on: push: tags` — GitHub suppresses workflow runs for
+# events caused by GITHUB_TOKEN, by design, to prevent recursive workflows:
+#   "When you use the repository's GITHUB_TOKEN to perform tasks, events
+#    triggered by the GITHUB_TOKEN, with the exception of workflow_dispatch
+#    and repository_dispatch, will not create a new workflow run."
+#   (GitHub Docs, "Triggering a workflow from a workflow")
+# So the tag push below is inert on its own, and without the dispatch step
+# this workflow would silently produce no build at all. The documented
+# exception is the fix: workflow_dispatch events created via the API DO run
+# even when GITHUB_TOKEN creates them. build-mac.yml already has a manual
+# dispatch path built for exactly this shape (`release: true` + an explicit
+# `tag` input), and its `validate` job re-checks that the tag exists and
+# points at the commit being built (it does, by construction — we dispatch on
+# the tag's own ref). The alternative — a PAT or deploy key so the tag push
+# itself triggers — was rejected: it adds a long-lived credential to rotate
+# for zero functional gain.
+#
+# Preflight is strict and runs before ANY write: malformed version, version
+# not strictly greater than package.json, or an already-existing tag each
+# abort with instructions. The existing-tag case is not hypothetical: v0.1.4
+# exists as a tag with no release behind it because a release job once failed
+# after the tag was pushed. Re-running into an existing tag must stay
+# impossible — a tag name is permanent history; pick the next free version
+# instead.
+
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version: patch, minor, major, or an explicit version like 0.1.6 (a pre-release like 0.2.0-beta.1 is allowed; no leading v)'
+        type: string
+        required: true
+
+# The default GITHUB_TOKEN in this repo is read-only. `contents: write` lets
+# the job push the bump commit and the tag (build-mac.yml declares the same
+# for its release job). `actions: write` is required by the dispatch step —
+# POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches needs it, and
+# an explicit permissions block zeroes out everything not listed.
+permissions:
+  contents: write
+  actions: write
+
+# Two concurrent release cuts would race each other's push to main and tag
+# creation. Queue them instead; never cancel a half-done release.
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Always main's current head, regardless of which ref the dispatch was
+      # clicked from — a release is only ever cut from main. persist-credentials
+      # (the default) keeps GITHUB_TOKEN wired into the remote so the pushes
+      # below authenticate.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Everything that can refuse, refuses here — before any write anywhere.
+      - name: Preflight — resolve and validate the new version
+        id: preflight
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(node -p "require('./package.json').version")
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$CURRENT" =~ $SEMVER_RE ]]; then
+            echo "::error::package.json's current version '$CURRENT' is not a valid semver — fix package.json on main before cutting a release."
+            exit 1
+          fi
+
+          RAW=$(printf '%s' "$VERSION_INPUT" | tr -d '[:space:]')
+          case "$RAW" in
+            patch|minor|major)
+              # Bump keywords always produce a plain x.y.z, computed from the
+              # current version with any pre-release suffix dropped first
+              # (patch on 0.2.0-beta.1 releases 0.2.1, matching npm-version).
+              IFS=. read -r MAJ MIN PAT <<<"${CURRENT%%-*}"
+              case "$RAW" in
+                patch) NEW="$MAJ.$MIN.$((PAT + 1))" ;;
+                minor) NEW="$MAJ.$((MIN + 1)).0" ;;
+                major) NEW="$((MAJ + 1)).0.0" ;;
+              esac
+              ;;
+            v*)
+              # The most likely typo gets its own message rather than the
+              # generic one: versions here are bare, the v belongs to the tag.
+              echo "::error::Version '$RAW' starts with 'v'. Type the bare version — '${RAW#v}' — and the workflow adds the v to the tag itself."
+              exit 1
+              ;;
+            *)
+              NEW="$RAW"
+              ;;
+          esac
+
+          # Same grammar build-mac.yml's version-stamping step enforces on the
+          # tag (v<major>.<minor>.<patch> with an optional pre-release suffix)
+          # — anything that would fail there must fail here, before a push.
+          if [[ ! "$NEW" =~ $SEMVER_RE ]]; then
+            echo "::error::'$RAW' is not patch/minor/major and not a valid version. Use one of the bump keywords, or an explicit version like 0.1.6 or 0.2.0-beta.1."
+            exit 1
+          fi
+
+          # Strictly greater, by real semver precedence (semver.org §11) —
+          # `sort -V` mis-ranks pre-releases (it puts 1.0.0-beta AFTER 1.0.0),
+          # so the comparison is done properly in node instead. Node's argv[0]
+          # under -e is the node binary itself, hence slice(1).
+          GREATER=$(node -e '
+            const parse = (v) => {
+              const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v);
+              if (!m) throw new Error(`unparseable version: ${v}`);
+              return { nums: [1, 2, 3].map((i) => Number(m[i])), pre: m[4] ? m[4].split(".") : null };
+            };
+            const [a, b] = process.argv.slice(1).map(parse);
+            const cmp = () => {
+              for (let i = 0; i < 3; i++) if (a.nums[i] !== b.nums[i]) return a.nums[i] - b.nums[i];
+              if (!a.pre && !b.pre) return 0;
+              if (!a.pre) return 1;   // a release outranks its own pre-releases
+              if (!b.pre) return -1;
+              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                const x = a.pre[i], y = b.pre[i];
+                if (x === undefined) return -1;  // shorter pre-release list ranks lower
+                if (y === undefined) return 1;
+                const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
+                if (xn && yn) { if (Number(x) !== Number(y)) return Number(x) - Number(y); }
+                else if (xn !== yn) { return xn ? -1 : 1; }  // numeric < alphanumeric
+                else if (x !== y) { return x < y ? -1 : 1; }
+              }
+              return 0;
+            };
+            process.stdout.write(cmp() > 0 ? "yes" : "no");
+          ' "$NEW" "$CURRENT")
+          if [ "$GREATER" != "yes" ]; then
+            echo "::error::New version $NEW is not strictly greater than the current version $CURRENT. Releases only move forward — pick a version above $CURRENT (e.g. re-run with 'patch')."
+            exit 1
+          fi
+
+          TAG="v$NEW"
+          # Asked of origin live, not of a local snapshot, so a tag created a
+          # second ago is still seen. --exit-code returns 0 iff the ref exists.
+          # This is the guard the v0.1.4 incident demands: that tag exists with
+          # NO release behind it (its release job failed after the tag was
+          # pushed), and re-running into an existing tag would publish binaries
+          # under a name that already means something else.
+          if git ls-remote --exit-code origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::Tag $TAG already exists on origin. A tag is permanent history — never re-release into it (that is how v0.1.4 became a tag with no release: its build failed after the tag was pushed). Pick the next free version instead; if $TAG's build failed, cut $NEW's successor and leave $TAG as a dead tag."
+            exit 1
+          fi
+
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Preflight passed: $CURRENT -> $NEW (tag $TAG)"
+
+      # `npm version --no-git-tag-version` rewrites package.json AND both
+      # version fields in package-lock.json, without needing node_modules.
+      # The read-back is not paranoia for its own sake: a lockfile the bump
+      # missed would ship a release whose lockfile disagrees with its manifest.
+      - name: Bump package.json and package-lock.json
+        env:
+          NEW: ${{ steps.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version --no-git-tag-version "$NEW"
+          for F in package.json package-lock.json; do
+            GOT=$(node -p "require('./$F').version")
+            if [ "$GOT" != "$NEW" ]; then
+              echo "::error::$F reads $GOT after the bump, expected $NEW."
+              exit 1
+            fi
+          done
+          git diff --stat
+
+      # Committed under the exact identity the repo's release history already
+      # uses (see `git log` for the previous chore(release) commits), so the
+      # history stays uniform. The tag is created at the pushed commit's SHA,
+      # never at a branch name — a branch can move between the push and the
+      # tag, and build-mac.yml's release job refuses to publish a tag whose
+      # commit differs from what was built.
+      - name: Commit, push to main, and tag
+        id: push
+        env:
+          NEW: ${{ steps.preflight.outputs.version }}
+          TAG: ${{ steps.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name 'KevDevMed'
+          git config user.email 'kevynlopez01@gmail.com'
+          git add package.json package-lock.json
+          git commit -m "chore(release): $NEW"
+          COMMIT=$(git rev-parse HEAD)
+
+          # If main moved since checkout this push fails non-fast-forward and
+          # the whole run aborts before any tag exists — safe to just re-run.
+          git push origin HEAD:refs/heads/main
+
+          # Should the tag push fail after the commit push landed, main holds
+          # a harmless bump commit and no tag: re-running this workflow would
+          # refuse ($NEW is no longer greater), so recover by pushing the tag
+          # by hand at $COMMIT, or by dispatching build-mac.yml directly.
+          git tag "$TAG" "$COMMIT"
+          git push origin "refs/tags/$TAG"
+
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Pushed $COMMIT to main and tagged it $TAG"
+
+      # The tag push above triggered nothing (see the header comment), so the
+      # build is started explicitly through build-mac.yml's own manual-release
+      # path. Dispatching on the tag's ref makes github.sha the tagged commit,
+      # so build-mac.yml's validate job finds tag and build commit identical
+      # and publishes exactly as it would for a human-pushed tag.
+      - name: Start the build (build-mac.yml)
+        env:
+          TAG: ${{ steps.preflight.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-mac.yml --ref "$TAG" -f release=true -f tag="$TAG"
+
+      # The dispatch API returns 204 with no run id, so the run is found by
+      # its head commit. If none appears, that is precisely the
+      # silently-no-build failure mode this workflow exists to prevent — fail
+      # loudly rather than end green with nothing building.
+      - name: Print the build run URL
+        env:
+          TAG: ${{ steps.preflight.outputs.tag }}
+          COMMIT: ${{ steps.push.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_URL=''
+          for _ in $(seq 1 30); do
+            RUN_URL=$(gh run list --workflow build-mac.yml --event workflow_dispatch \
+              --commit "$COMMIT" --limit 1 --json url --jq '.[0].url // empty')
+            if [ -n "$RUN_URL" ]; then
+              break
+            fi
+            sleep 3
+          done
+          if [ -z "$RUN_URL" ]; then
+            echo "::error::The dispatch was accepted but no build-mac.yml run appeared within 90s. The tag $TAG and the bump commit are already pushed, so do NOT re-run this workflow — start the build by hand: gh workflow run build-mac.yml --ref $TAG -f release=true -f tag=$TAG, or use the Run workflow button on https://github.com/$GITHUB_REPOSITORY/actions/workflows/build-mac.yml"
+            exit 1
+          fi
+          echo "Release $TAG is building: $RUN_URL"
+          {
+            echo "## Release $TAG"
+            echo ""
+            echo "Bump commit: \`$COMMIT\` on main"
+            echo ""
+            echo "Watch the build and publish here: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

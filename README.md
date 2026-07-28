@@ -137,6 +137,16 @@ https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-
 https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg
 ```
 
+### Cutting a release
+
+One click, no local git: Actions → **Cut release** → Run workflow, and type the
+new version — `patch`, `minor`, `major`, or an explicit `0.1.6` (no leading
+`v`). The workflow bumps `package.json` on main, tags `v0.1.6`, and starts
+`build-mac.yml`, which builds, signs and publishes the release. A bad version —
+malformed, not above the current one, or an already-used tag — is refused
+before anything is pushed. The last step prints the URL of the build run;
+expect the release to appear there (notarisation can take a couple of hours).
+
 The published build is ad-hoc signed but not notarised (no Apple Developer ID),
 so Gatekeeper interrupts the first launch — the user approves it via System
 Settings > Privacy & Security > Open Anyway. The preview's `/download` page
