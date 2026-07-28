@@ -12,11 +12,22 @@ import {
   WEB_DESKTOP_INFO,
 } from '../chrome';
 
+// Same reasoning as APPROVED_OVERLAY_INSET below: asserting the fallback
+// against WEB_DESKTOP_INFO only proves readDesktopInfo returns whatever that
+// constant happens to hold. A fallback of `{ platform: 'darwin',
+// hasOverlayWindowControls: true }` would reserve a 44px band in the browser
+// preview and still pass. Written out so the fallback itself is pinned.
+const APPROVED_WEB_FALLBACK = { platform: 'web', hasOverlayWindowControls: false };
+
 describe('readDesktopInfo', () => {
   it('falls back to web when window.desktop is missing', () => {
-    expect(readDesktopInfo({})).toEqual(WEB_DESKTOP_INFO);
-    expect(readDesktopInfo(undefined)).toEqual(WEB_DESKTOP_INFO);
-    expect(readDesktopInfo(null)).toEqual(WEB_DESKTOP_INFO);
+    expect(readDesktopInfo({})).toEqual(APPROVED_WEB_FALLBACK);
+    expect(readDesktopInfo(undefined)).toEqual(APPROVED_WEB_FALLBACK);
+    expect(readDesktopInfo(null)).toEqual(APPROVED_WEB_FALLBACK);
+  });
+
+  it('exports the approved web fallback', () => {
+    expect(WEB_DESKTOP_INFO).toEqual(APPROVED_WEB_FALLBACK);
   });
 
   it('reads a well-formed global', () => {
@@ -30,9 +41,9 @@ describe('readDesktopInfo', () => {
 
   it('rejects an unknown platform', () => {
     expect(readDesktopInfo({ desktop: { platform: 'beos', hasOverlayWindowControls: true } })).toEqual(
-      WEB_DESKTOP_INFO,
+      APPROVED_WEB_FALLBACK,
     );
-    expect(readDesktopInfo({ desktop: 'darwin' })).toEqual(WEB_DESKTOP_INFO);
+    expect(readDesktopInfo({ desktop: 'darwin' })).toEqual(APPROVED_WEB_FALLBACK);
   });
 
   it('treats a non-boolean overlay flag as false', () => {
@@ -46,26 +57,36 @@ describe('readDesktopInfo', () => {
   });
 });
 
+// These are the approved values, written out rather than imported from the
+// module under test. Comparing against OVERLAY_TITLE_BAR_INSET would only
+// re-assert the implementation against itself: --spacing-1 (4px, lights
+// overlap the shell again) or --spacing-10 (a 40px dead gap in the browser
+// preview) would both keep the suite green while shipping the bug this file
+// exists to prevent. --spacing-11 measures 44px, which clears the tallest
+// traffic light at y 12-32; changing either constant must fail here.
+const APPROVED_OVERLAY_INSET = 'var(--spacing-11)';
+const APPROVED_NO_INSET = 'var(--spacing-0)';
+
 describe('titleBarInset', () => {
-  it('reserves a band only when the OS overlays window controls', () => {
+  it('reserves the approved 44px band when the OS overlays window controls', () => {
     expect(titleBarInset({ platform: 'darwin', hasOverlayWindowControls: true })).toBe(
-      OVERLAY_TITLE_BAR_INSET,
+      APPROVED_OVERLAY_INSET,
     );
   });
 
   it('reserves nothing on web, Windows and Linux', () => {
-    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(NO_TITLE_BAR_INSET);
+    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(APPROVED_NO_INSET);
     expect(titleBarInset({ platform: 'win32', hasOverlayWindowControls: false })).toBe(
-      NO_TITLE_BAR_INSET,
+      APPROVED_NO_INSET,
     );
     expect(titleBarInset({ platform: 'linux', hasOverlayWindowControls: false })).toBe(
-      NO_TITLE_BAR_INSET,
+      APPROVED_NO_INSET,
     );
   });
 
-  it('uses spacing tokens, never raw pixels', () => {
-    expect(OVERLAY_TITLE_BAR_INSET).toMatch(/^var\(--spacing-/);
-    expect(NO_TITLE_BAR_INSET).toMatch(/^var\(--spacing-/);
+  it('exports the approved spacing tokens, never raw pixels', () => {
+    expect(OVERLAY_TITLE_BAR_INSET).toBe(APPROVED_OVERLAY_INSET);
+    expect(NO_TITLE_BAR_INSET).toBe(APPROVED_NO_INSET);
   });
 });
 

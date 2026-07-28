@@ -8,14 +8,15 @@
  * of the design system, so it can be unit-tested directly.
  */
 
-/** Platforms the renderer can run on. `'web'` is the browser preview. */
-export type DesktopPlatform = 'darwin' | 'win32' | 'linux' | 'web';
+/**
+ * The shape of `window.desktop` has exactly one owner: `src/shared/desktop.ts`.
+ * These are type-only imports, so nothing here is coupled to the preload at
+ * runtime — `import type` is erased entirely, and the module is shared code,
+ * not preload code. Re-exported because chrome.ts's own consumers name them.
+ */
+import type { DesktopInfo, DesktopPlatform } from '../shared/desktop';
 
-export interface DesktopInfo {
-  readonly platform: DesktopPlatform;
-  /** true when macOS draws traffic lights over the renderer's top-left corner. */
-  readonly hasOverlayWindowControls: boolean;
-}
+export type { DesktopInfo, DesktopPlatform };
 
 /**
  * What we assume when `window.desktop` is missing or malformed: a plain browser
