@@ -13,6 +13,7 @@ import {
   daysBetween,
   daysPastDue,
   formatDelayDays,
+  normaliseNotes,
   openAmountCents,
 } from '../detail';
 
@@ -176,6 +177,29 @@ describe('averagePaymentDelayDays', () => {
     expect(averagePaymentDelayDays(invoices)).toBe(0);
   });
 
+  it('excludes the invoice on screen, so the tile is about the rest of the client', () => {
+    const invoices = [
+      makeInvoice({ id: 'here', status: 'paid', dueDate: '2026-01-31', paidAt: '2026-02-09T10:00:00.000Z' }),
+      makeInvoice({ id: 'other', status: 'paid', dueDate: '2026-01-31', paidAt: '2026-02-03T10:00:00.000Z' }),
+    ];
+    expect(averagePaymentDelayDays(invoices, 'here')).toBe(3);
+  });
+
+  it('is null when the excluded invoice was the client\'s only paid one', () => {
+    const invoices = [
+      makeInvoice({ id: 'here', status: 'paid', dueDate: '2026-01-31', paidAt: '2026-02-09T10:00:00.000Z' }),
+    ];
+    expect(averagePaymentDelayDays(invoices, 'here')).toBeNull();
+  });
+
+  it('averages everything when no invoice is excluded', () => {
+    const invoices = [
+      makeInvoice({ id: 'here', status: 'paid', dueDate: '2026-01-31', paidAt: '2026-02-09T10:00:00.000Z' }),
+      makeInvoice({ id: 'other', status: 'paid', dueDate: '2026-01-31', paidAt: '2026-02-03T10:00:00.000Z' }),
+    ];
+    expect(averagePaymentDelayDays(invoices)).toBe(6);
+  });
+
   it('uses the calendar date of paidAt, not its UTC instant', () => {
     // 23:30 on the due date is still on time, not a day late.
     const invoices = [
@@ -275,7 +299,7 @@ describe('buildStatTiles', () => {
       'VAT Amount',
       'Due Date',
       'Paid On',
-      'Customer av delay',
+      'Other invoices av delay',
     ]);
     expect(tiles.map((tile) => tile.value)).toEqual([
       '$1,230.00',
@@ -317,6 +341,29 @@ describe('buildStatTiles', () => {
     });
     const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
     expect(byKey.open).toBe('$0.00');
+  });
+});
+
+describe('normaliseNotes', () => {
+  it('treats a whitespace-only field as no notes at all', () => {
+    expect(normaliseNotes('  ')).toBeNull();
+    expect(normaliseNotes('\n\t ')).toBeNull();
+    expect(normaliseNotes('')).toBeNull();
+  });
+
+  it('trims the surrounding whitespace off real notes', () => {
+    expect(normaliseNotes('  Pay by wire.\n')).toBe('Pay by wire.');
+  });
+
+  it('leaves the inside of the text alone', () => {
+    expect(normaliseNotes('Line one\n\nLine two')).toBe('Line one\n\nLine two');
+  });
+
+  it('agrees with buildNotesSections about what counts as blank', () => {
+    for (const raw of ['  ', '\n', '', 'Pay by wire.']) {
+      const normalised = normaliseNotes(raw);
+      expect(buildNotesSections(normalised, null, null).length).toBe(normalised === null ? 0 : 1);
+    }
   });
 });
 

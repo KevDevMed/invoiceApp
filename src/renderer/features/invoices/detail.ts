@@ -124,15 +124,24 @@ export function openAmountCents(invoice: Pick<Invoice, 'status' | 'totalCents'>)
  * is late, negative is early. Invoices without a `paidAt`, and dates that do
  * not parse, are skipped. Null when nothing is left to average.
  *
+ * `excludeInvoiceId` drops one row from the set: the detail page passes the
+ * invoice it is showing, because a tile sitting beside that invoice's own
+ * "Paid On" earns its place only by saying something the row does not. A
+ * client whose single paid invoice is the one on screen therefore averages to
+ * null, which the tile renders as an em dash rather than echoing this row back
+ * as a customer-wide pattern.
+ *
  * The mean is rounded with `Math.round`, which breaks ties toward positive
  * infinity (-2.5 rounds to -2).
  */
 export function averagePaymentDelayDays(
-  invoices: readonly Pick<Invoice, 'status' | 'dueDate' | 'paidAt'>[],
+  invoices: readonly Pick<Invoice, 'id' | 'status' | 'dueDate' | 'paidAt'>[],
+  excludeInvoiceId: string | null = null,
 ): number | null {
   let sum = 0;
   let count = 0;
   for (const invoice of invoices) {
+    if (invoice.id === excludeInvoiceId) continue;
     if (invoice.status !== 'paid' || invoice.paidAt === null) continue;
     const delay = daysBetween(invoice.dueDate, calendarDateOf(invoice.paidAt));
     if (delay === null) continue;
@@ -200,7 +209,10 @@ export interface StatTilesInput {
     Invoice,
     'status' | 'currency' | 'totalCents' | 'taxCents' | 'dueDate' | 'paidAt'
   >;
-  /** Mean delay across the client's other paid invoices, or null when there are none. */
+  /**
+   * Mean delay across the client's *other* paid invoices — this invoice is not
+   * in it — or null when the client has no other paid invoice.
+   */
   readonly averageDelayDays: number | null;
 }
 
@@ -239,7 +251,7 @@ export function buildStatTiles({ invoice, averageDelayDays }: StatTilesInput): S
     },
     {
       key: 'delay',
-      label: 'Customer av delay',
+      label: 'Other invoices av delay',
       value: formatDelayDays(averageDelayDays),
       isEmphasised: false,
     },
@@ -275,6 +287,19 @@ export function buildHistoryEvents(
   }
   // ISO-8601 UTC timestamps sort correctly as plain strings.
   return events.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+}
+
+/**
+ * The stored form of a free-text notes field: whitespace is not content.
+ *
+ * The editor uses this for both the live preview and the saved payload, so the
+ * two can never disagree about whether a field of two spaces is a note. It
+ * matches what `buildNotesSections` below and the document's Notes block treat
+ * as blank — three readers, one rule.
+ */
+export function normaliseNotes(notes: string): string | null {
+  const trimmed = notes.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /** Invoice notes and the client's own notes, each dropped when blank. */
