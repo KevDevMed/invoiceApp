@@ -15,9 +15,12 @@
  *     spring on someone.
  *   - `unsupported` is a phase, not an error. A development run and a non-macOS
  *     build cannot update themselves, and saying so plainly beats a stack trace.
+ *   - a background check that finds something says so out loud, once. Settings is
+ *     the only screen that shows update state and nobody opens it speculatively,
+ *     so without a notification a found release can go unnoticed forever.
  */
 
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, Notification } from 'electron';
 import * as electronUpdater from 'electron-updater';
 import type { AppUpdater } from 'electron-updater';
 
@@ -44,6 +47,11 @@ export const BACKGROUND_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Shown when a failure carries no message of its own. */
 const GENERIC_FAILURE = 'The update could not be completed. Please try again later.';
 
+/** Notification copy. One line of body: name the version, say where to go. */
+const NOTIFICATION_TITLE = 'Update available';
+const notificationBody = (version: string): string =>
+  `InvoiceApp ${version} is ready to download — open Settings to install it.`;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -53,6 +61,25 @@ let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let periodicTimer: ReturnType<typeof setInterval> | null = null;
 let listenersAttached = false;
 let installRequested = false;
+
+/**
+ * True only while a check started by the timers is in flight.
+ *
+ * `update-available` fires from inside `checkForUpdates()`, and by then the state
+ * looks identical whoever asked — so the caller's intent has to be carried, not
+ * reconstructed. Someone who just pressed "Check for updates" is already reading
+ * the answer; a toast on top of it is noise.
+ */
+let backgroundCheckInFlight = false;
+
+/**
+ * The version a notification has already been posted for.
+ *
+ * `update-available` re-fires on every check, and the interval is six hours, so
+ * without this the same release would be announced four times a day for as long
+ * as the app stays open. Process-wide and deliberately not cleared on shutdown.
+ */
+let announcedVersion: string | null = null;
 
 /**
  * Why this build cannot update itself, or null if it can.
@@ -146,6 +173,59 @@ function toByteCount(value: number | undefined): number | null {
 }
 
 // ---------------------------------------------------------------------------
+// Notification
+// ---------------------------------------------------------------------------
+
+/**
+ * Bring the app forward, the same way a second launch does.
+ *
+ * `src/main/index.ts:26-32` already answers `second-instance` with restore-then-
+ * focus; a click on the toast means the same thing ("show me the app"), so it
+ * gets the same two lines rather than a second idiom.
+ */
+function focusMainWindow(): void {
+  const [existing] = BrowserWindow.getAllWindows();
+  if (!existing) return;
+  if (existing.isMinimized()) existing.restore();
+  existing.focus();
+}
+
+/**
+ * Tell the user, once, that a background check found something.
+ *
+ * Every reason to stay quiet is checked here rather than at the call site, and
+ * the whole thing is wrapped: a toast is a courtesy, and a courtesy that fails
+ * must not drag the update flow into `error`. `Notification` is only touched
+ * after the unsupported guard, so a development run never constructs one.
+ */
+function announceUpdate(version: string): void {
+  if (!backgroundCheckInFlight) return;
+  if (unsupportedReason() !== null) return;
+  if (announcedVersion === version) return;
+
+  try {
+    if (!Notification.isSupported()) return;
+
+    const notification = new Notification({
+      title: NOTIFICATION_TITLE,
+      body: notificationBody(version),
+    });
+    notification.on('click', () => {
+      try {
+        focusMainWindow();
+      } catch (error) {
+        console.warn('[updates] could not focus a window from the notification:', error);
+      }
+    });
+    notification.show();
+
+    announcedVersion = version;
+  } catch (error) {
+    console.warn('[updates] could not post the update notification:', error);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // electron-updater
 // ---------------------------------------------------------------------------
 
@@ -180,6 +260,8 @@ function updater(): AppUpdater {
       totalBytes: null,
       message: null,
     });
+    // After the broadcast: the UI is the primary surface, the toast is the nudge.
+    announceUpdate(info.version);
   });
 
   instance.on('update-not-available', () => {
@@ -246,13 +328,16 @@ export function startUpdater(): void {
   }
   if (startupTimer !== null || periodicTimer !== null) return;
 
+  // Both timer paths are background: nobody asked, so a find has to announce
+  // itself. The IPC path calls `checkForUpdates()` with no argument and stays
+  // silent by default.
   startupTimer = setTimeout(() => {
     startupTimer = null;
-    void checkForUpdates();
+    void checkForUpdates({ background: true });
   }, STARTUP_CHECK_DELAY_MS);
 
   periodicTimer = setInterval(() => {
-    void checkForUpdates();
+    void checkForUpdates({ background: true });
   }, BACKGROUND_CHECK_INTERVAL_MS);
 }
 
@@ -262,8 +347,14 @@ export function startUpdater(): void {
  * Re-entrant calls are ignored rather than queued: a check already in flight will
  * broadcast the same answer, and re-checking on top of a finished download would
  * knock the state back from `downloaded` to `available` for no reason.
+ *
+ * `background` is the timers' claim that nobody is watching, and is the only
+ * thing that lets a find post a notification. It defaults to false so the IPC
+ * path — a user standing in Settings — is silent without having to say so.
  */
-export async function checkForUpdates(): Promise<UpdateState> {
+export async function checkForUpdates(
+  options: { background?: boolean } = {},
+): Promise<UpdateState> {
   const snapshot = current();
   if (
     snapshot.phase === 'unsupported' ||
@@ -274,10 +365,14 @@ export async function checkForUpdates(): Promise<UpdateState> {
     return snapshot;
   }
 
+  const outer = backgroundCheckInFlight;
+  backgroundCheckInFlight = options.background === true;
   try {
     await updater().checkForUpdates();
   } catch (error) {
     return fail(error);
+  } finally {
+    backgroundCheckInFlight = outer;
   }
   return current();
 }

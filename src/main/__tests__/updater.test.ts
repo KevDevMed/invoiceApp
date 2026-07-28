@@ -40,15 +40,61 @@ const h = vi.hoisted(() => {
 
   interface FakeWindow {
     isDestroyed: () => boolean;
+    isMinimized: () => boolean;
+    restore: ReturnType<typeof vi.fn>;
+    focus: ReturnType<typeof vi.fn>;
     webContents: { isDestroyed: () => boolean; send: ReturnType<typeof vi.fn> };
   }
 
   const windows: FakeWindow[] = [];
 
+  /** How the fake `Notification` should behave for the test in hand. */
+  const notificationState = {
+    supported: true,
+    throwOnConstruct: false,
+    throwOnShow: false,
+  };
+
+  const notifications: FakeNotification[] = [];
+
+  class FakeNotification {
+    static isSupported = vi.fn(() => notificationState.supported);
+
+    readonly options: { title?: string; body?: string };
+    readonly show = vi.fn(() => {
+      if (notificationState.throwOnShow) throw new Error('NSUserNotificationCenter refused');
+    });
+
+    private readonly handlers = new Map<string, Listener[]>();
+
+    constructor(options: { title?: string; body?: string }) {
+      if (notificationState.throwOnConstruct) throw new Error('Notification could not be created');
+      this.options = options;
+      notifications.push(this);
+    }
+
+    on(event: string, listener: Listener) {
+      const bucket = this.handlers.get(event) ?? [];
+      bucket.push(listener);
+      this.handlers.set(event, bucket);
+      return this;
+    }
+
+    /** Fire what the OS would fire when the toast is clicked. */
+    click() {
+      for (const listener of [...(this.handlers.get('click') ?? [])]) {
+        (listener as () => void)();
+      }
+    }
+  }
+
   return {
     autoUpdater,
     app,
     windows,
+    notifications,
+    notificationState,
+    Notification: FakeNotification,
     /** Fire an electron-updater event at whatever the module under test wired up. */
     emit(event: string, ...args: unknown[]) {
       for (const listener of [...(listeners.get(event) ?? [])]) {
@@ -67,6 +113,7 @@ const h = vi.hoisted(() => {
 vi.mock('electron', () => ({
   app: h.app,
   BrowserWindow: { getAllWindows: () => h.windows },
+  Notification: h.Notification,
 }));
 
 vi.mock('electron-updater', () => ({ autoUpdater: h.autoUpdater }));
@@ -81,9 +128,14 @@ function setPlatform(value: string): void {
   Object.defineProperty(process, 'platform', { value, configurable: true });
 }
 
-function fakeWindow(options: { destroyed?: boolean; contentsDestroyed?: boolean } = {}) {
+function fakeWindow(
+  options: { destroyed?: boolean; contentsDestroyed?: boolean; minimized?: boolean } = {},
+) {
   return {
     isDestroyed: () => options.destroyed === true,
+    isMinimized: () => options.minimized === true,
+    restore: vi.fn(),
+    focus: vi.fn(),
     webContents: {
       isDestroyed: () => options.contentsDestroyed === true,
       send: vi.fn(),
@@ -95,6 +147,13 @@ function fakeWindow(options: { destroyed?: boolean; contentsDestroyed?: boolean 
 async function load(): Promise<typeof UpdaterModule> {
   vi.resetModules();
   return import('../updater');
+}
+
+/** The nth posted notification, asserted to exist so the test reads about behaviour. */
+function posted(index = 0) {
+  const toast = h.notifications[index];
+  if (!toast) throw new Error(`expected a notification at index ${index}`);
+  return toast;
 }
 
 /** Drive a check that finds `version`, the way electron-updater would. */
@@ -120,6 +179,12 @@ beforeEach(() => {
   h.autoUpdater.downloadUpdate.mockReset();
   h.autoUpdater.downloadUpdate.mockImplementation(async () => []);
   h.autoUpdater.quitAndInstall.mockReset();
+  h.notifications.length = 0;
+  h.notificationState.supported = true;
+  h.notificationState.throwOnConstruct = false;
+  h.notificationState.throwOnShow = false;
+  h.Notification.isSupported.mockReset();
+  h.Notification.isSupported.mockImplementation(() => h.notificationState.supported);
   h.app.isPackaged = true;
   h.app.quit.mockReset();
   h.app.exit.mockReset();
@@ -492,6 +557,18 @@ describe('scheduling', () => {
     expect(h.autoUpdater.checkForUpdates).not.toHaveBeenCalled();
   });
 
+  it('announces a find from the startup timer, so the toast is the timers own', async () => {
+    vi.useFakeTimers();
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    updater.startUpdater();
+    await vi.advanceTimersByTimeAsync(updater.STARTUP_CHECK_DELAY_MS);
+
+    expect(h.notifications).toHaveLength(1);
+    expect(posted().options.body).toContain('2.0.0');
+  });
+
   it('does not let a failing background check escape', async () => {
     vi.useFakeTimers();
     h.autoUpdater.checkForUpdates.mockImplementation(async () => {
@@ -506,5 +583,154 @@ describe('scheduling', () => {
       phase: 'error',
       message: 'EAI_AGAIN api.github.com',
     });
+  });
+});
+
+/**
+ * Settings is the only screen that shows update state, and nobody opens it on
+ * spec. A background find therefore has to speak up — but only a background one,
+ * only once per version, and never at the cost of the update itself.
+ */
+describe('notifications', () => {
+  it('posts exactly one notification naming the version on a background find', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await updater.checkForUpdates({ background: true });
+
+    expect(h.notifications).toHaveLength(1);
+    const toast = posted();
+    expect(toast.options.title).toBe('Update available');
+    expect(toast.options.body).toBe(
+      'InvoiceApp 2.0.0 is ready to download — open Settings to install it.',
+    );
+    expect(toast.show).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays quiet when a later background check finds the same version again', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await updater.checkForUpdates({ background: true });
+    await updater.checkForUpdates({ background: true });
+    await updater.checkForUpdates({ background: true });
+
+    expect(h.notifications).toHaveLength(1);
+  });
+
+  it('speaks again once a genuinely newer version turns up', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+    await updater.checkForUpdates({ background: true });
+
+    respondWithUpdate('2.1.0');
+    await updater.checkForUpdates({ background: true });
+
+    expect(h.notifications).toHaveLength(2);
+    expect(posted(1).options.body).toContain('2.1.0');
+  });
+
+  it('says nothing for a user-initiated check, which is what the IPC path does', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    // No argument: exactly how `src/main/ipc/updates.ts` calls it.
+    const state = await updater.checkForUpdates();
+
+    expect(state.phase).toBe('available');
+    expect(h.notifications).toHaveLength(0);
+    expect(h.Notification.isSupported).not.toHaveBeenCalled();
+  });
+
+  it('leaves a user-initiated find un-announced, then announces it in the background', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await updater.checkForUpdates();
+    expect(h.notifications).toHaveLength(0);
+
+    await updater.checkForUpdates({ background: true });
+    expect(h.notifications).toHaveLength(1);
+  });
+
+  it('never notifies on an unsupported run', async () => {
+    h.app.isPackaged = false;
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await updater.checkForUpdates({ background: true });
+
+    expect(h.notifications).toHaveLength(0);
+    expect(h.Notification.isSupported).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when notifications are unsupported, and does not disturb the update', async () => {
+    h.notificationState.supported = false;
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    const state = await updater.checkForUpdates({ background: true });
+
+    expect(h.Notification.isSupported).toHaveBeenCalled();
+    expect(h.notifications).toHaveLength(0);
+    expect(state).toMatchObject({ phase: 'available', availableVersion: '2.0.0' });
+  });
+
+  it('swallows a throwing constructor and still reaches available', async () => {
+    h.notificationState.throwOnConstruct = true;
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await expect(updater.checkForUpdates({ background: true })).resolves.toMatchObject({
+      phase: 'available',
+      availableVersion: '2.0.0',
+    });
+    expect(h.notifications).toHaveLength(0);
+  });
+
+  it('swallows a throwing show() and still reaches available', async () => {
+    h.notificationState.throwOnShow = true;
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+
+    await expect(updater.checkForUpdates({ background: true })).resolves.toMatchObject({
+      phase: 'available',
+      availableVersion: '2.0.0',
+    });
+    expect(h.notifications).toHaveLength(1);
+  });
+
+  it('restores a minimised window and focuses it when the toast is clicked', async () => {
+    const window = fakeWindow({ minimized: true });
+    h.windows.push(window);
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+    await updater.checkForUpdates({ background: true });
+
+    posted().click();
+
+    expect(window.restore).toHaveBeenCalledTimes(1);
+    expect(window.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it('only focuses a window that is not minimised', async () => {
+    const window = fakeWindow();
+    h.windows.push(window);
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+    await updater.checkForUpdates({ background: true });
+
+    posted().click();
+
+    expect(window.restore).not.toHaveBeenCalled();
+    expect(window.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it('survives a click with no window left to focus', async () => {
+    respondWithUpdate('2.0.0');
+    const updater = await load();
+    await updater.checkForUpdates({ background: true });
+
+    expect(() => posted().click()).not.toThrow();
   });
 });
