@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  breadcrumbTrail,
+  COLLAPSED_RAIL_MIN_PX,
+  collapsedRailWidth,
+  DEFAULT_COLLAPSED_RAIL_WIDTH,
   isSectionSelected,
   NO_TITLE_BAR_INSET,
+  OVERLAY_COLLAPSED_RAIL_WIDTH,
   OVERLAY_TITLE_BAR_INSET,
   readDesktopInfo,
   SECTION_ROUTES,
@@ -115,38 +118,54 @@ describe('isSectionSelected', () => {
   });
 });
 
-describe('breadcrumbTrail', () => {
-  it('shows the section alone on a top-level route', () => {
-    expect(breadcrumbTrail('/invoices')).toEqual([{ label: 'Invoices', isCurrent: true }]);
-    expect(breadcrumbTrail('/settings')).toEqual([{ label: 'Settings', isCurrent: true }]);
+// The spacing scale astryx.css writes onto :root, copied here so the tokens the
+// rail is built from can be resolved to real pixels in a node test. Asserting
+// only the string 'calc(var(--spacing-11) * 2)' would pass just as happily for
+// --spacing-2 (8px), which is the bug this suite exists to prevent.
+const SPACING_PX: Readonly<Record<string, number>> = {
+  '--spacing-11': 44,
+  '--spacing-12': 48,
+};
+
+/** Resolves the two shapes chrome.ts emits: `var(--x)` and `calc(var(--x) * n)`. */
+function resolvePx(length: string): number {
+  const plain = /^var\((--spacing-[\d-]+)\)$/.exec(length);
+  if (plain !== null) return SPACING_PX[plain[1] ?? ''] ?? Number.NaN;
+
+  const scaled = /^calc\(var\((--spacing-[\d-]+)\) \* (\d+)\)$/.exec(length);
+  if (scaled !== null) return (SPACING_PX[scaled[1] ?? ''] ?? Number.NaN) * Number(scaled[2]);
+
+  return Number.NaN;
+}
+
+describe('collapsedRailWidth', () => {
+  it('clears the traffic-light zone when the OS overlays window controls', () => {
+    const width = collapsedRailWidth({ platform: 'darwin', hasOverlayWindowControls: true });
+    expect(resolvePx(width)).toBeGreaterThanOrEqual(COLLAPSED_RAIL_MIN_PX);
+    expect(resolvePx(width)).toBeGreaterThanOrEqual(88);
   });
 
-  it('never emits a leading InvoiceApp crumb', () => {
-    expect(breadcrumbTrail('/reports').map((crumb) => crumb.label)).toEqual(['Reports']);
+  it('keeps the design system width where there are no overlay controls', () => {
+    expect(collapsedRailWidth(WEB_DESKTOP_INFO)).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+    expect(collapsedRailWidth({ platform: 'win32', hasOverlayWindowControls: false })).toBe(
+      DEFAULT_COLLAPSED_RAIL_WIDTH,
+    );
+    expect(collapsedRailWidth({ platform: 'linux', hasOverlayWindowControls: false })).toBe(
+      DEFAULT_COLLAPSED_RAIL_WIDTH,
+    );
   });
 
-  it('links the section and marks the leaf current on a nested route', () => {
-    expect(breadcrumbTrail('/invoices/new')).toEqual([
-      { label: 'Invoices', href: '#/invoices', isCurrent: false },
-      { label: 'New', isCurrent: true },
-    ]);
+  it('is built from spacing tokens, never raw pixels', () => {
+    expect(OVERLAY_COLLAPSED_RAIL_WIDTH).toMatch(/^calc\(var\(--spacing-\d+\) \* \d+\)$/);
+    expect(DEFAULT_COLLAPSED_RAIL_WIDTH).toMatch(/^var\(--spacing-\d+\)$/);
   });
 
-  it('builds cumulative hrefs for deeper paths', () => {
-    expect(breadcrumbTrail('/clients/42/edit-details')).toEqual([
-      { label: 'Clients', href: '#/clients', isCurrent: false },
-      { label: '42', href: '#/clients/42', isCurrent: false },
-      { label: 'Edit details', isCurrent: true },
-    ]);
-  });
-
-  it('ignores a trailing slash', () => {
-    expect(breadcrumbTrail('/models/')).toEqual([{ label: 'Models', isCurrent: true }]);
-  });
-
-  it('returns an empty trail for an unknown path', () => {
-    expect(breadcrumbTrail('/nonexistent')).toEqual([]);
-    expect(breadcrumbTrail('/')).toEqual([]);
+  // 48px ends inside the lights' x 13-70 zone, which is exactly the collision
+  // the wider rail exists to fix.
+  it('is wider than the design system default it replaces', () => {
+    expect(resolvePx(OVERLAY_COLLAPSED_RAIL_WIDTH)).toBeGreaterThan(
+      resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH),
+    );
   });
 });
 
