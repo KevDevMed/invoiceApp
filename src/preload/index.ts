@@ -1,16 +1,19 @@
 /**
  * The only bridge between renderer and main.
  *
- * `ipcRenderer` itself is never exposed. The renderer gets exactly two
- * functions, both of which check the requested channel against the frozen
- * contract's allow-list before touching IPC. A channel that is not in the
- * contract cannot be invoked or subscribed to from the renderer at all.
+ * `ipcRenderer` itself is never exposed. The renderer gets two surfaces:
+ * `window.api`, exactly two functions that check the requested channel
+ * against the frozen contract's allow-list before touching IPC, and
+ * `window.desktop`, a plain data object describing the host platform. A
+ * channel that is not in the contract cannot be invoked or subscribed to
+ * from the renderer at all, and `desktop` carries no IPC capability.
  *
  * This file is bundled as CommonJS so it can run with `sandbox: true`.
  */
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 
+import { resolveDesktopInfo } from '../shared/desktop';
 import {
   isEventChannel,
   isInvokeChannel,
@@ -54,3 +57,6 @@ const api: RendererApi = {
 };
 
 contextBridge.exposeInMainWorld('api', api);
+
+// A sandboxed preload still sees `process.platform`; static data, no IPC.
+contextBridge.exposeInMainWorld('desktop', resolveDesktopInfo(process.platform));

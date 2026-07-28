@@ -8,6 +8,7 @@
  * `src/main/ipc/registry.ts` and `*.sql?raw` in `src/db/migrate.ts`.
  */
 
+import type { DesktopInfo } from '../shared/desktop';
 import type { RendererApi } from './index';
 
 declare global {
@@ -17,6 +18,12 @@ declare global {
      * `src/preload/index.ts` through `contextBridge`.
      */
     readonly api: RendererApi;
+
+    /**
+     * Host platform info for chrome layout. Injected by `src/preload/index.ts`
+     * under Electron and by `preview/web-shim.ts` in the browser preview.
+     */
+    readonly desktop: DesktopInfo;
   }
 }
 
