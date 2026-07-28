@@ -16,7 +16,7 @@ import { Divider } from '@astryxdesign/core/Divider';
 import { Heading } from '@astryxdesign/core/Heading';
 import { MetadataList, MetadataListItem } from '@astryxdesign/core/MetadataList';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
-import { Table, proportional } from '@astryxdesign/core/Table';
+import { Table, pixel, proportional } from '@astryxdesign/core/Table';
 import { Text } from '@astryxdesign/core/Text';
 
 import type { InvoiceStatus } from '../../../shared/types';
@@ -24,6 +24,10 @@ import type { DocumentParty, InvoiceDocumentModel } from './document';
 
 /** Width of the right-aligned totals column, in px — a budgeted region, not styling. */
 const TOTALS_WIDTH = 280;
+
+/** Budgeted widths for the line table's numeric columns, in px. */
+const QTY_WIDTH = 64;
+const MONEY_WIDTH = 104;
 
 interface LineRow extends Record<string, unknown> {
   key: string;
@@ -166,10 +170,14 @@ export function InvoiceDocument({ model }: InvoiceDocumentProps): React.JSX.Elem
           idKey="key"
           density="compact"
           columns={[
-            { key: 'description', header: 'Item', width: proportional(3) },
-            { key: 'quantity', header: 'Qty', width: proportional(1), align: 'end' },
-            { key: 'unitPrice', header: 'Unit price', width: proportional(1), align: 'end' },
-            { key: 'amount', header: 'Amount', width: proportional(1), align: 'end' },
+            // Only the description flexes. `proportional(n)` carries a 120px
+            // minimum per column, and four of those overflow the editor's
+            // preview panel, clipping Amount off the right edge — so the three
+            // numeric columns are budgeted in px instead.
+            { key: 'description', header: 'Item', width: proportional(1) },
+            { key: 'quantity', header: 'Qty', width: pixel(QTY_WIDTH), align: 'end' },
+            { key: 'unitPrice', header: 'Unit price', width: pixel(MONEY_WIDTH), align: 'end' },
+            { key: 'amount', header: 'Amount', width: pixel(MONEY_WIDTH), align: 'end' },
           ]}
         />
 

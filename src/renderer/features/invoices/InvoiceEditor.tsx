@@ -468,7 +468,10 @@ export function InvoiceEditor(): React.JSX.Element {
               </FieldValue>
             </HStack>
 
-            <HStack gap={2} align="start" wrap="wrap">
+            {/* Aligned to the end: the NumberInput's description line makes it
+                taller than the Selector, so only a bottom-aligned row puts the
+                two inputs themselves on one baseline. */}
+            <HStack gap={2} align="end" wrap="wrap">
               <Selector label="Currency" options={CURRENCIES} value={currency} onChange={setCurrency} />
               <NumberInput
                 label="Tax rate (bps)"
