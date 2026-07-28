@@ -13,10 +13,11 @@
  *     the contract's message schema does allow.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
 import type { ChatMessage } from '../../../shared/types';
 import type { LocalModel } from '../models/llmExtra';
+import { assistantAvailability, isDesktopOnlyError, type AssistantAvailability } from './availability';
 
 const THREAD_INDEX_KEY = 'llm.threadIndex';
 const THREAD_TRANSCRIPT_PREFIX = 'llm.thread.';
@@ -49,6 +50,8 @@ export interface AssistantState {
   readonly isStreaming: boolean;
   readonly isLoading: boolean;
   readonly error: string | null;
+  /** Why the assistant can or cannot answer right now — see `availability.ts`. */
+  readonly availability: AssistantAvailability;
   /** Mutating calls the model has proposed and the user has not answered yet. */
   readonly pendingApprovals: ToolCallRecord[];
   send(text: string): Promise<void>;
@@ -104,6 +107,14 @@ export function useAssistant(): AssistantState {
   const [requestId, setRequestId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isDesktopOnly, setIsDesktopOnly] = useState(false);
+
+  // The flag latches: the platform cannot stop being a browser mid-session, so
+  // a later, unrelated failure must not flip the page back to a generic error.
+  const reportError = useCallback((caught: unknown) => {
+    setError(errorText(caught));
+    setIsDesktopOnly((current) => current || isDesktopOnlyError(caught));
+  }, []);
 
   const readSetting = useCallback(async (key: string): Promise<string | null> => {
     const result = await window.api.invoke('settings:get', { key });
@@ -121,11 +132,11 @@ export function useAssistant(): AssistantState {
       setActiveModelId(active && active.length > 0 ? active : null);
       setThreads(parseJson<ThreadSummary[]>(index, []));
     } catch (caught) {
-      setError(errorText(caught));
+      reportError(caught);
     } finally {
       setIsLoading(false);
     }
-  }, [readSetting]);
+  }, [readSetting, reportError]);
 
   const refreshTranscript = useCallback(
     async (id: string | null) => {
@@ -175,13 +186,13 @@ export function useAssistant(): AssistantState {
           setError(response.message.content);
         }
       } catch (caught) {
-        setError(errorText(caught));
+        reportError(caught);
       } finally {
         setRequestId(null);
         setStreamingText('');
       }
     },
-    [threadId, refreshTranscript, refreshShell],
+    [threadId, refreshTranscript, refreshShell, reportError],
   );
 
   const send = useCallback(
@@ -221,9 +232,9 @@ export function useAssistant(): AssistantState {
     try {
       await window.api.invoke('llm:cancelChat', { requestId });
     } catch (caught) {
-      setError(errorText(caught));
+      reportError(caught);
     }
-  }, [requestId]);
+  }, [requestId, reportError]);
 
   const selectThread = useCallback((id: string | null) => {
     setThreadId(id);
@@ -243,10 +254,10 @@ export function useAssistant(): AssistantState {
         await window.api.invoke('llm:load', { modelId });
         await refreshShell();
       } catch (caught) {
-        setError(errorText(caught));
+        reportError(caught);
       }
     },
-    [refreshShell],
+    [refreshShell, reportError],
   );
 
   const dismissError = useCallback(() => {
@@ -268,6 +279,14 @@ export function useAssistant(): AssistantState {
     return [...pending.values()];
   }, [messages]);
 
+  const availability = assistantAvailability({
+    isLoading,
+    readyModelCount: readyModels.length,
+    activeModelId,
+    error,
+    isDesktopOnlyError: isDesktopOnly,
+  });
+
   return {
     threads,
     threadId,
@@ -278,6 +297,7 @@ export function useAssistant(): AssistantState {
     isStreaming: requestId !== null,
     isLoading,
     error,
+    availability,
     pendingApprovals,
     send,
     stop,
@@ -287,4 +307,29 @@ export function useAssistant(): AssistantState {
     selectModel,
     dismissError,
   };
+}
+
+/*
+  One instance, many consumers. The `/assistant` page and the floating chat
+  dock must show the same threads, messages, and streaming state, so the state
+  lives in a single provider instead of per-caller `useAssistant()` calls.
+  Built with `createElement` rather than JSX so this file can stay `.ts` and
+  no importer has to change.
+*/
+const AssistantContext = createContext<AssistantState | null>(null);
+
+export function AssistantProvider(props: { readonly children: React.ReactNode }): React.JSX.Element {
+  return createElement(AssistantContext.Provider, { value: useAssistant() }, props.children);
+}
+
+/** Throws a clear error when called outside AssistantProvider. */
+export function useAssistantContext(): AssistantState {
+  const state = useContext(AssistantContext);
+  if (state === null) {
+    // No silent fallback to a private `useAssistant()` here: two instances
+    // would be two chats that disagree about history, which is exactly the
+    // bug the provider exists to prevent.
+    throw new Error('useAssistantContext must be called inside <AssistantProvider>');
+  }
+  return state;
 }
