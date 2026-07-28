@@ -75,6 +75,21 @@
 # workflow will publish.
 #
 # NOTE: macOS runner minutes bill at 10x on private repositories.
+#
+# The release also publishes an auto-update feed — in CERTIFICATE MODE ONLY.
+# Each matrix leg emits a per-arch latest-mac.yml (electron-builder writes it
+# whenever a publish: block exists in electron-builder.yml, even under
+# --publish never), the release job merges the two with
+# scripts/merge-latest-mac.ts, and the merged latest-mac.yml is attached to
+# the GitHub release. electron-updater in the installed app polls exactly
+# that asset. If latest-mac.yml goes missing from a certificate-mode release,
+# every installed copy silently stops seeing updates — the checks below fail
+# the build instead of letting that happen.
+# An AD-HOC release publishes no feed at all, on purpose: Squirrel.Mac
+# refuses to install an update whose signature does not validate, so a feed
+# on an ad-hoc release would make every installed ad-hoc build download each
+# update and fail to install it, forever. Ad-hoc releases ship the .dmg and
+# .zip normally; their users update by hand.
 
 name: Build macOS app
 
@@ -210,7 +225,9 @@ jobs:
           npm run test:run
 
   build:
-    needs: [verify]
+    # `validate` is needed for the resolved tag (version stamping below);
+    # `verify` stays as the test gate.
+    needs: [verify, validate]
     strategy:
       fail-fast: false
       matrix:
@@ -354,6 +371,29 @@ jobs:
             echo "$CSC_PASSWORD_EOF"
           } >> "$GITHUB_ENV"
 
+      # app.getVersion() and latest-mac.yml's `version` are both read from
+      # package.json at package time. The repo does bump package.json through
+      # `chore(release): x.y.z` commits, so tag and file normally agree — but
+      # only by convention. Stamping the version from the tag makes the built
+      # version and the tag identical by construction, so a forgotten or
+      # mistyped bump cannot ship a release that advertises the wrong version
+      # and confuses electron-updater's comparison. This is a guard against
+      # tag/version drift, not a fix for a version that lags.
+      # The edit stays in this runner's checkout only — nothing is committed.
+      # Skipped on artifacts-only dispatches, which have no tag to stamp from.
+      - name: Set package version from the release tag
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid release tag. Expected v<major>.<minor>.<patch> with an optional pre-release suffix, e.g. v0.1.4 or v0.2.0-beta.1. The tag becomes the app version, so a malformed tag would ship a build electron-updater cannot compare."
+            exit 1
+          fi
+          npm version --no-git-tag-version --allow-same-version "${TAG#v}"
+          echo "package.json version set to ${TAG#v}"
+
       # `--mac dmg:<arch> zip:<arch>` overrides electron-builder.yml's target
       # list for this run: a target list carrying explicit types short-circuits
       # computeArchToTargetNamesMap (app-builder-lib/out/targets/targetFactory.js)
@@ -494,6 +534,38 @@ jobs:
               exit 1
             fi
           done
+
+      # electron-builder writes release/latest-mac.yml whenever a publish:
+      # block exists in electron-builder.yml, --publish never notwithstanding.
+      # If it is missing on a publishing run, the publish: block was removed
+      # and the release would ship binaries with no update feed — installed
+      # apps could never see another update. Fail here, loudly. Both legs
+      # write the SAME filename, so copy it to an arch-distinct name before
+      # upload; download-artifact's merge-multiple would otherwise clobber
+      # one leg's feed with the other's.
+      #
+      # CERTIFICATE MODE ONLY. Squirrel.Mac validates the downloaded update's
+      # code signature before installing it, and an ad-hoc signature never
+      # validates against a Developer ID chain — so an ad-hoc build that
+      # publishes latest-mac.yml condemns every installed copy to finding the
+      # update, downloading hundreds of MB, failing the install, and repeating
+      # forever. An ad-hoc release therefore publishes NO update feed at all:
+      # the .dmg and .zip ship normally, installed ad-hoc builds simply never
+      # see updates, and users update by downloading the next release by hand.
+      # The release job keys its feed handling on the same
+      # `secrets.MAC_CERT_P12 != ''` expression, so the two jobs agree on
+      # whether a feed exists by construction.
+      - name: Confirm and stage the update feed metadata
+        if: needs.validate.outputs.publish == 'true' && env.HAS_SIGNING_CERT == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [ ! -f release/latest-mac.yml ]; then
+            echo "::error::release/latest-mac.yml was not produced. electron-builder only writes it when electron-builder.yml has a publish: block — restore that block, or this release ships an update feed nobody can read and installed apps never update."
+            exit 1
+          fi
+          cp release/latest-mac.yml "release/latest-mac-$ARCH.yml"
 
       # Certificate mode only. In ad-hoc mode every one of these checks fails by
       # definition — there is no Developer ID chain, no notarisation ticket and
@@ -874,13 +946,28 @@ jobs:
           echo "$ZIP contains the outer bundle seal $OUTER"
 
       # v4 artifacts are immutable and names must be unique per job, so each
-      # matrix leg uploads under its own arch-suffixed name.
+      # matrix leg uploads under its own arch-suffixed name. The blockmap
+      # pattern may match nothing (electron-builder does not always emit
+      # them); that is fine — if-no-files-found only fires when the WHOLE
+      # path list matches nothing, and the dmg/zip always exist.
       - uses: actions/upload-artifact@v4
         with:
           name: invoiceapp-macos-${{ matrix.arch }}
           path: |
             release/InvoiceApp-mac-${{ matrix.arch }}.dmg
             release/InvoiceApp-mac-${{ matrix.arch }}.zip
+            release/InvoiceApp-mac-${{ matrix.arch }}.zip.blockmap
+          if-no-files-found: error
+          retention-days: 30
+
+      # Same gate as the staging step above: no feed artifact exists in ad-hoc
+      # mode, and if-no-files-found: error would fail the leg over a file that
+      # is deliberately absent.
+      - uses: actions/upload-artifact@v4
+        if: needs.validate.outputs.publish == 'true' && env.HAS_SIGNING_CERT == 'true'
+        with:
+          name: invoiceapp-update-meta-${{ matrix.arch }}
+          path: release/latest-mac-${{ matrix.arch }}.yml
           if-no-files-found: error
           retention-days: 30
 
@@ -924,25 +1011,78 @@ jobs:
     needs: [validate, build]
     if: needs.validate.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    # The exact expression the build job uses, evaluated from the same secrets
+    # context, so build and release can never disagree on whether this run
+    # produced an update feed. In ad-hoc mode (forks, or a rotated-out secret)
+    # the build legs upload no invoiceapp-update-meta-* artifacts, and every
+    # feed step below is skipped to match — the release ships binaries only.
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.MAC_CERT_P12 != '' && 'true' || 'false' }}
     steps:
+      # This job needs the repo (for scripts/merge-latest-mac.ts) and Node —
+      # neither was required back when it only shuffled artifacts. Same sha
+      # as verify/build so the merge script version matches what was tested.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # --ignore-scripts: this job only needs js-yaml and tsx. The postinstall
+      # rebuilds better-sqlite3 and pulls llama.cpp backends — minutes of work
+      # this Linux box would throw away.
+      - name: Install dependencies (scripts only)
+        run: npm ci --ignore-scripts
+
       - name: Collect artifacts from every arch
         uses: actions/download-artifact@v4
         with:
-          pattern: invoiceapp-macos-*
+          pattern: invoiceapp-*
           merge-multiple: true
           path: release-assets
 
-      - name: Confirm all four assets are present
+      # The two per-arch feeds are required only in certificate mode — ad-hoc
+      # legs deliberately upload none (see the build job), and demanding them
+      # here would fail every legitimately feed-less release. Conversely, a
+      # feed showing up in ad-hoc mode means the gates disagree; that is a
+      # workflow bug, so it fails rather than silently publishing a feed that
+      # points at uninstallable updates.
+      - name: Confirm all release inputs are present
         run: |
           set -euo pipefail
           ls -lh release-assets/
-          for f in InvoiceApp-mac-arm64.dmg InvoiceApp-mac-x64.dmg \
-                   InvoiceApp-mac-arm64.zip InvoiceApp-mac-x64.zip; do
+          REQUIRED='InvoiceApp-mac-arm64.dmg InvoiceApp-mac-x64.dmg InvoiceApp-mac-arm64.zip InvoiceApp-mac-x64.zip'
+          if [ "$HAS_SIGNING_CERT" = "true" ]; then
+            REQUIRED="$REQUIRED latest-mac-arm64.yml latest-mac-x64.yml"
+          fi
+          for f in $REQUIRED; do
             if [ ! -f "release-assets/$f" ]; then
               echo "::error::Missing $f — refusing to publish a partial release."
               exit 1
             fi
           done
+          if [ "$HAS_SIGNING_CERT" != "true" ] && ls release-assets/latest-mac-*.yml > /dev/null 2>&1; then
+            echo "::error::This is an ad-hoc (unsigned) run, but a latest-mac-*.yml feed artifact was uploaded anyway. Squirrel.Mac cannot install an ad-hoc update, so the feed gates in the build and release jobs must agree — fix the workflow before publishing."
+            exit 1
+          fi
+
+      # Each leg's latest-mac.yml names only its own zip; electron-updater
+      # needs one feed listing both so MacUpdater can pick by arch. The script
+      # also cross-checks that both legs built the same version.
+      # Certificate mode only: an ad-hoc run has no per-arch feeds to merge.
+      - name: Merge per-arch update metadata into one feed
+        if: env.HAS_SIGNING_CERT == 'true'
+        run: |
+          set -euo pipefail
+          node --import tsx scripts/merge-latest-mac.ts \
+            release-assets/latest-mac-arm64.yml \
+            release-assets/latest-mac-x64.yml \
+            release-assets/latest-mac.yml
+          echo "Merged update feed:"
+          cat release-assets/latest-mac.yml
 
       # `validate` ran up to an hour ago; a tag could have been created in the
       # meantime. Re-check immediately before publishing so the assets can never
@@ -980,7 +1120,19 @@ jobs:
           # `releases/latest/download/InvoiceApp-mac-<arch>.dmg`, and that
           # endpoint ignores drafts — a drafted release means every link 404s.
           draft: false
-          make_latest: 'true'
+          # A tag with a pre-release suffix (the regex admits e.g.
+          # v0.2.0-beta.1, and only such tags can contain '-') is published as
+          # a GitHub prerelease and never marked latest. Marking, rather than
+          # rejecting the tag, keeps betas cuttable for hand testing while
+          # protecting both consumers of `releases/latest`: electron-updater's
+          # GitHub provider resolves stable clients through /releases/latest,
+          # so `make_latest: true` on a beta would offer it to every 0.1.x
+          # install regardless of allowPrerelease, and the site's download
+          # buttons (`releases/latest/download/...`) would start serving the
+          # beta to the public. A plain vX.Y.Z tag behaves exactly as before:
+          # prerelease false, make_latest true.
+          prerelease: ${{ contains(needs.validate.outputs.tag, '-') }}
+          make_latest: ${{ contains(needs.validate.outputs.tag, '-') && 'false' || 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
@@ -988,3 +1140,47 @@ jobs:
             release-assets/InvoiceApp-mac-x64.dmg
             release-assets/InvoiceApp-mac-arm64.zip
             release-assets/InvoiceApp-mac-x64.zip
+
+      # latest-mac.yml is the auto-update feed — without it every installed
+      # app stops seeing updates. It is attached in its own step (same
+      # update-the-release pattern as the blockmaps below) because it only
+      # exists in certificate mode: putting it in the main `files:` list would
+      # trip fail_on_unmatched_files on every legitimately feed-less ad-hoc
+      # release. fail_on_unmatched_files here keeps the certificate-mode
+      # guarantee — if the merged feed is missing when it should exist, the
+      # release fails rather than shipping binaries no installed app can see.
+      - name: Attach the update feed
+        if: env.HAS_SIGNING_CERT == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: release-assets/latest-mac.yml
+
+      # Blockmaps are optional: electron-builder does not always emit them and
+      # macOS electron-updater downloads the full zip anyway. They cannot go
+      # in the list above — fail_on_unmatched_files (which must stay, it
+      # guards the required assets) would fail the release whenever the glob
+      # matches nothing. So attach them in a second, explicitly conditional
+      # step that only runs when blockmaps exist; it updates the release
+      # created above under the same tag.
+      - name: Check for blockmaps
+        id: blockmaps
+        run: |
+          set -euo pipefail
+          if compgen -G 'release-assets/*.blockmap' > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No blockmap files were produced; publishing without them."
+          fi
+
+      - name: Attach blockmaps
+        if: steps.blockmaps.outputs.present == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: release-assets/*.blockmap

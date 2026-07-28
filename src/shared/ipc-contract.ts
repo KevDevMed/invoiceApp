@@ -50,6 +50,34 @@ const DateRange = z.object({
 
 const DeleteResult = z.object({ id: Id, deleted: z.boolean() });
 
+/**
+ * Everything the renderer knows about the in-app updater, in one object.
+ *
+ * One snapshot type serves all four channels and the event, so the UI never has
+ * to reconcile a response with a stream — the last thing it received is the
+ * whole truth. `unsupported` is a normal phase, not a failure: a development run
+ * and any non-macOS build genuinely cannot update themselves, and `message` says
+ * which.
+ */
+export const UpdateState = z.object({
+  phase: z.enum([
+    'unsupported',
+    'idle',
+    'checking',
+    'available',
+    'downloading',
+    'downloaded',
+    'error',
+  ]),
+  currentVersion: z.string(),
+  availableVersion: z.string().nullable(),
+  progressPercent: z.number().min(0).max(100).nullable(),
+  transferredBytes: z.number().int().nonnegative().nullable(),
+  totalBytes: z.number().int().nonnegative().nullable(),
+  message: z.string().nullable(),
+});
+export type UpdateState = z.infer<typeof UpdateState>;
+
 const REVENUE_PERIODS = ['day', 'week', 'month', 'quarter', 'year'] as const;
 export const RevenuePeriod = z.enum(REVENUE_PERIODS);
 export type RevenuePeriod = z.infer<typeof RevenuePeriod>;
@@ -260,6 +288,35 @@ export const IPC_CONTRACT = {
     response: z.object({ requestId: Id, cancelled: z.boolean() }),
   },
 
+  // --- updates (implemented in src/main/ipc/updates.ts) --------------------
+  /** The current snapshot. Never throws: an updater that cannot run says so in `phase`. */
+  'updates:getState': {
+    request: NoPayload,
+    response: UpdateState,
+  },
+  /** Start a check. Resolves once the check has settled, with the resulting state. */
+  'updates:check': {
+    request: NoPayload,
+    response: UpdateState,
+  },
+  /**
+   * Start downloading the available update. Resolves as soon as the transfer is
+   * under way — a ~200 MB download would otherwise hold the call open for
+   * minutes. Progress arrives on `updates:state`.
+   */
+  'updates:download': {
+    request: NoPayload,
+    response: UpdateState,
+  },
+  /**
+   * Quit and install a downloaded update. Resolves with the state at the moment
+   * the install was handed to the OS; the app is on its way out after this.
+   */
+  'updates:install': {
+    request: NoPayload,
+    response: UpdateState,
+  },
+
   // --- shell-owned handlers (implemented in src/main/ipc/registry.ts) ------
   'settings:get': {
     request: z.object({ key: z.string().min(1).max(200) }),
@@ -318,6 +375,12 @@ export const IPC_EVENTS = {
     token: z.string(),
     done: z.boolean(),
   }),
+  /**
+   * Pushed on every updater transition, including download progress. Identical in
+   * shape to what `updates:getState` returns, so the renderer can hold one value
+   * and overwrite it from either source.
+   */
+  'updates:state': UpdateState,
 } as const satisfies Record<string, z.ZodTypeAny>;
 
 export type IpcEvents = typeof IPC_EVENTS;
