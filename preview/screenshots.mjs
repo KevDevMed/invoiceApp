@@ -27,6 +27,11 @@ import { chromium } from 'playwright';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ARTIFACTS = path.resolve(HERE, '.artifacts');
 const ORIGIN = process.env.PREVIEW_ORIGIN ?? 'http://127.0.0.1:4300';
+/**
+ * The renderer is served under `/app` (the site root is the marketing landing
+ * page). Renderer routing is hash-based, so every app route hangs off this.
+ */
+const APP_ORIGIN = `${ORIGIN}/app`;
 const DB_PATH = process.env.PREVIEW_DB_PATH ?? path.resolve(process.cwd(), 'preview-data/preview.db');
 
 const NODE_ABI_BINDING = path.resolve(
@@ -232,6 +237,62 @@ async function tileValue(page, label) {
   }, label);
 }
 
+/**
+ * Geometry of the shared content column (`src/renderer/ui/Page.tsx`) and of the
+ * scroll region that owns it, in CSS pixels:
+ *
+ *   { left, right }   the two gutters between the column and the region's
+ *                     padding box — equal when the column is centred
+ *   { columnWidth, availableWidth }  the column and the space it may occupy
+ *
+ * Found from the page's own h1 by walking up to the first scrolling ancestor,
+ * so nothing here keys off a design-system class name. `clientWidth` is used for
+ * the region so a vertical scrollbar is excluded from the available space.
+ * Returns null when the page has no h1 or no scrolling ancestor.
+ */
+async function contentColumnGutters(page) {
+  return page.evaluate(() => {
+    const heading = document.querySelector('h1');
+    if (!heading) return null;
+    let node = heading;
+    while (node.parentElement) {
+      const region = node.parentElement;
+      const styles = getComputedStyle(region);
+      if (styles.overflowY === 'auto' || styles.overflowY === 'scroll') {
+        const column = node.getBoundingClientRect();
+        const box = region.getBoundingClientRect();
+        const padLeft = parseFloat(styles.paddingLeft);
+        const padRight = parseFloat(styles.paddingRight);
+        const borderLeft = parseFloat(styles.borderLeftWidth);
+        const contentLeft = box.left + borderLeft + padLeft;
+        const availableWidth = region.clientWidth - padLeft - padRight;
+        const left = column.left - contentLeft;
+        return {
+          left,
+          right: availableWidth - left - column.width,
+          columnWidth: column.width,
+          availableWidth,
+          // Content inside the column must not move: the h1 still starts at the
+          // column's own left edge.
+          headingOffset: heading.getBoundingClientRect().left - column.left,
+          overflowsHorizontally: document.documentElement.scrollWidth > window.innerWidth,
+        };
+      }
+      node = region;
+    }
+    return null;
+  });
+}
+
+/** One line describing what contentColumnGutters measured, for check details. */
+function gutterDetail(gutters) {
+  if (gutters === null) return 'no scrolling ancestor found above the page h1';
+  return (
+    `left gutter: ${gutters.left.toFixed(1)}, right gutter: ${gutters.right.toFixed(1)}, ` +
+    `column: ${gutters.columnWidth.toFixed(1)}, available: ${gutters.availableWidth.toFixed(1)}`
+  );
+}
+
 async function shoot(page, name) {
   const file = path.join(ARTIFACTS, `${name}.png`);
   await page.screenshot({ path: file, fullPage: false });
@@ -434,7 +495,7 @@ async function main() {
 
   // --- Invoices: the list as it first renders ------------------------------
   console.log('Invoices list');
-  await page.goto(`${ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: 'Invoices', exact: true }).first().waitFor();
   await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
 
@@ -443,6 +504,72 @@ async function main() {
   check('footer range label', await rangeLabel(page), `1-10 of ${expected.listTotal}`);
   check('first row is the newest invoice', await firstRowNumber(page), expected.numbersInOrder[0]);
   await shoot(page, 'invoices');
+
+  // --- Content column centring ---------------------------------------------
+  // Every route renders through the shared Page (src/renderer/ui/Page.tsx),
+  // which caps its content column (1120 here, 860 on Settings). On a viewport
+  // wider than the cap the leftover space has to be split into two equal
+  // gutters; a column pinned to the left leaves the whole remainder on the
+  // right. Both halves of the contract are asserted: symmetry when the cap
+  // bites, and a full-width column when it does not.
+  console.log('\nContent column centring');
+  const CENTRE_TOLERANCE = 2;
+  const wide = await contentColumnGutters(page);
+  const wideCentred = checkTrue(
+    'invoices column is centred at 1440 wide',
+    wide !== null && Math.abs(wide.left - wide.right) <= CENTRE_TOLERANCE,
+    gutterDetail(wide),
+  );
+  checkTrue(
+    'invoices column cap actually bites at 1440 wide',
+    wide !== null && Math.min(wide.left, wide.right) >= CENTRE_TOLERANCE,
+    gutterDetail(wide),
+  );
+  checkTrue(
+    'heading still starts at the column left edge',
+    wide !== null && Math.abs(wide.headingOffset) <= CENTRE_TOLERANCE,
+    `h1 offset from column left: ${wide === null ? 'not measured' : wide.headingOffset.toFixed(1)}`,
+  );
+  // Photographed only once the centring it illustrates is proven on screen.
+  if (wideCentred) await shoot(page, 'invoices-centred');
+  else console.log('  screenshot skipped: invoices-centred (column was not centred)');
+
+  // A tighter cap on the same viewport — proof the gutters follow maxWidth
+  // rather than a single hardcoded number.
+  await page.goto(`${APP_ORIGIN}/#/settings`, { waitUntil: 'networkidle' });
+  await page.getByRole('heading', { name: 'Settings', exact: true }).first().waitFor({ timeout: 15_000 });
+  const settings = await contentColumnGutters(page);
+  checkTrue(
+    'settings column (cap 860) is centred at 1440 wide',
+    settings !== null &&
+      Math.abs(settings.left - settings.right) <= CENTRE_TOLERANCE &&
+      Math.min(settings.left, settings.right) > 100,
+    gutterDetail(settings),
+  );
+
+  // Narrow viewport: the cap no longer bites, so the column fills the region
+  // and nothing spills sideways.
+  await page.setViewportSize({ width: 900, height: 960 });
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+  const narrow = await contentColumnGutters(page);
+  checkTrue(
+    'column still fills the width at 900 wide',
+    narrow !== null &&
+      Math.abs(narrow.columnWidth - narrow.availableWidth) <= CENTRE_TOLERANCE &&
+      narrow.left <= CENTRE_TOLERANCE,
+    gutterDetail(narrow),
+  );
+  checkTrue(
+    'no horizontal page scrollbar at 900 wide',
+    narrow !== null && !narrow.overflowsHorizontally,
+    `document scrollWidth exceeds the viewport: ${narrow === null ? 'not measured' : narrow.overflowsHorizontally}`,
+  );
+
+  // Back to the viewport and the page the rest of the run expects.
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
 
   // --- Pagination ----------------------------------------------------------
   console.log('\nPagination');
@@ -686,7 +813,7 @@ async function main() {
   }
 
   // --- Clients -------------------------------------------------------------
-  await page.goto(`${ORIGIN}/#/clients`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/clients`, { waitUntil: 'networkidle' });
   await page.getByText(FILTER_CLIENT).first().waitFor({ timeout: 15_000 });
   check(
     'clients page renders one page of clients',
@@ -697,7 +824,7 @@ async function main() {
 
   // --- Reports -------------------------------------------------------------
   console.log('\nReports tiles vs SQLite');
-  await page.goto(`${ORIGIN}/#/reports`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/reports`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: /Revenue by month/ }).waitFor({ timeout: 15_000 });
   const chartBars = await page.locator('svg rect, svg path').count();
   checkTrue('revenue chart renders shapes', chartBars > 0, `svg shapes: ${chartBars}`);
@@ -711,7 +838,7 @@ async function main() {
 
   // --- Models (desktop-only) ----------------------------------------------
   console.log('\nDesktop-only surfaces');
-  await page.goto(`${ORIGIN}/#/models`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/models`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: /Models/ }).first().waitFor({ timeout: 15_000 });
   await page.waitForTimeout(1500);
   const modelsText = await page.locator('body').innerText();
@@ -734,7 +861,7 @@ async function main() {
 
   // --- Dark mode ----------------------------------------------------------
   console.log('\nDark mode');
-  await page.goto(`${ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
   await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   // The theme mode is persisted in the database, so a previous run may have
   // left it dark. Start from a known light baseline.
@@ -761,7 +888,7 @@ async function main() {
   if (repaintOk && rowsOk) await shoot(page, 'invoices-dark');
   else console.log('  screenshot skipped: invoices-dark (page was not dark)');
 
-  await page.goto(`${ORIGIN}/#/reports`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP_ORIGIN}/#/reports`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: /Revenue by month/ }).waitFor({ timeout: 15_000 });
   // The mode is persisted, but the reports route paints its own surface: wait
   // for that repaint too rather than assuming the previous page's state.

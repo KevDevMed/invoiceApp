@@ -33,11 +33,14 @@ export interface PageProps {
 /**
  * The scrolling content container. Render it as the root of a route element;
  * it owns the page padding, the max content width and the gap between blocks.
+ * The column is centred in the content area (`align="center"`), so a viewport
+ * wider than `maxWidth` splits the leftover space into two equal gutters
+ * instead of one on the right; narrower viewports still fill the width.
  * Do not nest one Page inside another.
  */
 export function Page({ children, maxWidth = 1120 }: PageProps): React.JSX.Element {
   return (
-    <VStack height="100%" isScrollable paddingInline={6} paddingBlock={5}>
+    <VStack height="100%" isScrollable paddingInline={6} paddingBlock={5} align="center">
       <VStack gap={5} width="100%" maxWidth={maxWidth}>
         {children}
       </VStack>
