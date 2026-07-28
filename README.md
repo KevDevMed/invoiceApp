@@ -137,9 +137,10 @@ https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-
 https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-x64.dmg
 ```
 
-The published build is unsigned unless the Apple signing secrets are
-configured, so Gatekeeper quarantines it on first launch — the preview's
-`/download` page walks users through the workaround.
+The published build is ad-hoc signed but not notarised (no Apple Developer ID),
+so Gatekeeper interrupts the first launch — the user approves it via System
+Settings > Privacy & Security > Open Anyway. The preview's `/download` page
+walks users through it.
 
 ## Browser preview
 

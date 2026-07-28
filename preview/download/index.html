@@ -228,26 +228,36 @@
       </div>
 
       <section class="card card--warning">
-        <h2>If macOS says the app is damaged or from an unidentified developer</h2>
+        <h2>macOS will warn you the first time — here is the way through</h2>
         <p>
-          <strong>The app is fine.</strong> Depending on how the build was packaged, macOS may show
-          this dialog the first time you open the app. If it appears, the steps below let the app
-          through once — after that it opens normally. If the app opens without any warning, you
-          have nothing to do and can skip this section.
+          <strong>The app is fine.</strong> The build is signed, but not notarised by Apple —
+          notarisation requires a paid Apple Developer ID that this project does not have. So the
+          first launch is interrupted by a Gatekeeper dialog saying macOS could not verify the app
+          (the exact wording varies by macOS version). The steps below let it through once — after
+          that it opens normally.
         </p>
         <ol>
           <li>Drag <strong>InvoiceApp</strong> into your <strong>Applications</strong> folder.</li>
+          <li>Double-click the app. When the warning dialog appears, dismiss it.</li>
           <li>
-            <strong>Right-click</strong> (or Control-click) the app icon and choose
-            <strong>Open</strong>. Do not double-click it — double-clicking gives you the dialog
-            with no way through.
+            Open <strong>System Settings &rarr; Privacy &amp; Security</strong>, scroll down to the
+            <strong>Security</strong> section, and click <strong>Open Anyway</strong> next to the
+            message about InvoiceApp.
           </li>
-          <li>Click <strong>Open</strong> again in the dialog that appears.</li>
+          <li>Confirm in the dialog that follows. The app opens and stays allowed.</li>
         </ol>
         <p style="margin-top: var(--spacing-4)">
-          If macOS still refuses, clear the quarantine flag from Terminal and open the app again:
+          On some older macOS versions, right-clicking the app and choosing <strong>Open</strong>
+          also works, but recent versions removed that shortcut — use Privacy &amp; Security first.
+          If macOS still refuses, clear the quarantine flag from Terminal (this assumes the app is
+          already in <code>/Applications</code> — adjust the path if not) and open the app again:
         </p>
         <pre><code>xattr -dr com.apple.quarantine /Applications/InvoiceApp.app</code></pre>
+        <p style="margin-top: var(--spacing-4)">
+          <strong>Downloaded v0.1.0 and got &ldquo;InvoiceApp is damaged and can&rsquo;t be
+          opened&rdquo;?</strong> That build shipped without a signature and cannot be repaired by
+          the steps above. Delete your copy, then download again once the next release is out.
+        </p>
       </section>
 
       <section class="card">
