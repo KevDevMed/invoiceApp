@@ -135,6 +135,8 @@ const SIGNATURE =
 const DISK_FULL =
   'There is not enough free disk space for the update. Free up some space and try again.';
 const UNKNOWN = 'The update could not be completed. Please try again later.';
+const HANDOFF =
+  'The update was downloaded but could not be installed. Quit InvoiceApp and open it again to finish installing — the update is already downloaded, so there is nothing to download again.';
 
 const realPlatform = process.platform;
 
@@ -515,31 +517,36 @@ describe('install', () => {
     expect(updater.getUpdateState().phase).toBe('downloaded');
   });
 
-  it('stays installable when quitAndInstall throws', async () => {
+  /**
+   * F3. The reason none of the tests below ever expect a second call:
+   * `MacUpdater.quitAndInstall()` subscribes to the native `update-downloaded`
+   * (electron-updater 6.8.9, `out/MacUpdater.js:247`) and never unsubscribes. A
+   * second handoff that succeeded would therefore run Electron's native
+   * `quitAndInstall()` once per surviving listener, racing two ShipIt handovers
+   * during termination. One attempt per process is the only safe number.
+   */
+  it('parks the feature instead of retrying when quitAndInstall throws', async () => {
     const updater = await readyToInstall();
     h.autoUpdater.quitAndInstall.mockImplementation(() => {
       throw new Error('ShipIt could not be launched');
     });
 
-    expect(updater.installUpdate()).toMatchObject({ phase: 'error' });
+    expect(updater.installUpdate()).toMatchObject({ phase: 'unsupported', message: HANDOFF });
 
     h.autoUpdater.quitAndInstall.mockImplementation(() => undefined);
-    // The error phase is not `downloaded`, so a retry needs the state back first;
-    // what matters is that the one-shot guard was released.
     h.emit('update-downloaded', { version: '2.0.0' });
     updater.installUpdate();
-    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
   });
 
   /**
-   * F1. `quitAndInstall()` returns immediately and the handoff runs on inside
+   * `quitAndInstall()` returns immediately and the handoff runs on inside
    * Squirrel — fetching the zip from the proxy server, checking the signature.
-   * When that dies it arrives as an `error` event, never as a throw, so the
-   * synchronous `catch` above is not what releases the one-shot guard. Without a
-   * release here the app is un-installable until it is restarted, however many
-   * times the user downloads again.
+   * When that dies it arrives as an `error` event, never as a throw. It must not
+   * put an installable state back on screen.
    */
-  it('stays installable when the handoff dies asynchronously', async () => {
+  it('does not hand off a second time when the handoff dies asynchronously', async () => {
     const updater = await readyToInstall();
 
     updater.installUpdate();
@@ -547,47 +554,107 @@ describe('install', () => {
 
     // Squirrel's own checkForUpdates() giving up on the proxy server.
     h.emit('error', new Error('Error: Could not get code signature for running application'));
-    expect(updater.getUpdateState().phase).toBe('error');
+    expect(updater.getUpdateState().phase).toBe('unsupported');
 
-    // The user does what the UI offers: download again, install again.
-    h.emit('update-downloaded', { version: '2.0.0' });
-    expect(updater.getUpdateState().phase).toBe('downloaded');
-    updater.installUpdate();
-
-    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
-  });
-
-  /**
-   * F1, the other side. Releasing on anything looser than "the handoff is dead"
-   * would let a second `quitAndInstall()` race one that is merely slow — a ~200 MB
-   * zip over a local socket is not instant, and nothing is emitted while it works.
-   */
-  it('does not restart a handoff that is still in flight', async () => {
-    const updater = await readyToInstall();
-
-    updater.installUpdate();
-    // No error: the handoff is running. Squirrel re-dispatching `update-downloaded`
-    // must not look like a fresh, installable state either.
+    // Whatever arrives next, and whatever the user presses.
     h.emit('update-downloaded', { version: '2.0.0' });
     updater.installUpdate();
     updater.installUpdate();
 
     expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
-    expect(updater.getUpdateState().phase).toBe('downloaded');
   });
 
-  it('holds the guard again once a retried handoff is under way', async () => {
+  it('tells the user, in sanitised copy, that a restart is what retries it', async () => {
+    const window = fakeWindow();
+    h.windows.push(window);
+    const updater = await readyToInstall();
+
+    updater.installUpdate();
+    h.emit(
+      'error',
+      new Error('Cannot pipe "/Users/alice/Library/Caches/InvoiceApp/update.zip": Error: EPIPE'),
+    );
+
+    const state = updater.getUpdateState();
+    expect(state.message).toBe(HANDOFF);
+    expect(state.message).not.toContain('/Users/alice');
+    expect(state.message).toMatch(/quit invoiceapp and open it again/i);
+    // The user is told the retry is cheap, because the bytes are already on disk.
+    expect(state.message).toMatch(/nothing to download again/i);
+
+    // And it is the same text every window was handed.
+    const broadcast = window.webContents.send.mock.calls.at(-1);
+    expect((broadcast?.[1] as { message: string }).message).toBe(HANDOFF);
+  });
+
+  /**
+   * The state a failed handoff lands in has to be one the renderer already draws
+   * correctly. `unsupported` is the only phase `actionView` in
+   * `src/renderer/features/updates/updateRows.ts` renders with `kind: 'none'` —
+   * no button — which is the truth here, since nothing this process can be asked
+   * to do will install anything. (That file belongs to the other side of the IPC
+   * boundary and cannot be imported into a main-process test, so the phase is
+   * what is pinned.)
+   */
+  it('leaves no control to press after a failed handoff', async () => {
     const updater = await readyToInstall();
 
     updater.installUpdate();
     h.emit('error', new Error('ENOTFOUND 127.0.0.1'));
+
+    const state = updater.getUpdateState();
+    expect(state.phase).toBe('unsupported');
+
+    // Every remaining entry point agrees with that button: nothing happens.
+    h.autoUpdater.checkForUpdates.mockClear();
+    h.autoUpdater.downloadUpdate.mockClear();
+    await expect(updater.checkForUpdates()).resolves.toMatchObject({ phase: 'unsupported' });
+    expect(updater.downloadUpdate()).toMatchObject({ phase: 'unsupported' });
+    expect(h.autoUpdater.checkForUpdates).not.toHaveBeenCalled();
+    expect(h.autoUpdater.downloadUpdate).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The other side of the guard: a handoff that is merely slow — a ~200 MB zip
+   * over a local socket is not instant — emits nothing at all. Silence must not
+   * be read as failure, so the phase stays `downloaded` and the copy stays quiet.
+   */
+  it('does not restart, or bury, a handoff that is still in flight', async () => {
+    const updater = await readyToInstall();
+
+    updater.installUpdate();
+    // Squirrel re-dispatching `update-downloaded` is not a fresh installable state.
     h.emit('update-downloaded', { version: '2.0.0' });
     updater.installUpdate();
-    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
-
-    // The second handoff is now the one in flight, and it gets the same protection.
     updater.installUpdate();
-    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
+    expect(updater.getUpdateState()).toMatchObject({ phase: 'downloaded', message: null });
+  });
+
+  it('calls quitAndInstall at most once across any sequence of events', async () => {
+    const updater = await readyToInstall();
+
+    // Every order the outside world can put these in, on one instance.
+    for (const step of [
+      () => updater.installUpdate(),
+      () => h.emit('error', new Error('ENOTFOUND 127.0.0.1')),
+      () => h.emit('update-downloaded', { version: '2.0.0' }),
+      () => updater.installUpdate(),
+      () => h.emit('update-available', { version: '2.1.0' }),
+      () => updater.downloadUpdate(),
+      () => h.emit('download-progress', { percent: 50, transferred: 5, total: 10 }),
+      () => h.emit('update-downloaded', { version: '2.1.0' }),
+      () => updater.installUpdate(),
+      () => updater.shutdownUpdater(),
+      () => updater.installUpdate(),
+    ]) {
+      step();
+    }
+    await updater.checkForUpdates();
+    updater.installUpdate();
+
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
   });
 });
 

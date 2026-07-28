@@ -61,6 +61,16 @@ const FAILURE_MESSAGES = {
     'The update could not be verified, so it was not installed. Please try again, or download the latest version from the InvoiceApp website.',
   diskFull: 'There is not enough free disk space for the update. Free up some space and try again.',
   unknown: 'The update could not be completed. Please try again later.',
+  /**
+   * The one message `classify` never returns.
+   *
+   * A dead install handoff is not classified, because what caused it does not
+   * change what the user can do about it: the retry is a restart either way (see
+   * `installUpdate`). It lives here so the sanitising rule still holds — the
+   * renderer prints `message`, and nothing raw is ever what it prints.
+   */
+  handoff:
+    'The update was downloaded but could not be installed. Quit InvoiceApp and open it again to finish installing — the update is already downloaded, so there is nothing to download again.',
 } as const;
 
 type FailureCause = keyof typeof FAILURE_MESSAGES;
@@ -78,7 +88,14 @@ let state: UpdateState | null = null;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let periodicTimer: ReturnType<typeof setInterval> | null = null;
 let listenersAttached = false;
-let installRequested = false;
+
+/**
+ * Whether `quitAndInstall()` has been called on this process's updater.
+ *
+ * Set once and never cleared, which is the whole point: see `installUpdate` for
+ * why a second handoff is not something this module is allowed to attempt.
+ */
+let handoffAttempted = false;
 
 /**
  * True only while a check started by the timers is in flight.
@@ -230,17 +247,61 @@ function describe(error: unknown): string {
 }
 
 /**
+ * Land a dead install handoff in a state the user can act on.
+ *
+ * `unsupported` rather than `error`, and that is a deliberate reading of what the
+ * phase means: for the rest of this process's life this app genuinely cannot
+ * install an update (`installUpdate` will never call `quitAndInstall()` again).
+ * `error` would be a lie by omission — the renderer draws a "Try again" button
+ * from it (`src/renderer/features/updates/updateRows.ts`), and that path leads
+ * back to a "Restart and install" button that would do nothing at all.
+ * `unsupported` is the one phase that renders no action control, and it is also
+ * the phase `checkForUpdates` and `downloadUpdate` refuse to leave, so the whole
+ * feature comes to rest here instead of walking the user into a dead button.
+ *
+ * The message carries the recovery, because the state itself no longer can: quit
+ * and reopen. It costs nothing but the relaunch — the downloaded update is still
+ * on disk and a fresh process picks it straight back up.
+ */
+function failHandoff(error: unknown): UpdateState {
+  console.error('[updates] install handoff failed:', error);
+  return setState({
+    phase: 'unsupported',
+    progressPercent: null,
+    message: FAILURE_MESSAGES.handoff,
+  });
+}
+
+/**
+ * Whether the feature has come to rest after a dead handoff.
+ *
+ * `failHandoff` is the only thing that can produce this combination, and it is
+ * meant to be the last word for the process: no later event may quietly walk the
+ * UI back to a phase that offers a button, because `installUpdate` will refuse
+ * every one of them from here on.
+ */
+function parked(): boolean {
+  return handoffAttempted && current().phase === 'unsupported';
+}
+
+/** A transition driven by an electron-updater event, dropped once parked. */
+function applyEvent(patch: Partial<UpdateState>): void {
+  if (parked()) return;
+  setState(patch);
+}
+
+/**
  * Whether an install handoff is outstanding right now.
  *
- * Both halves are needed. `installRequested` alone would be released by an error
- * that has nothing to do with the install; the `downloaded` phase is what says
- * the install is the only thing this module currently has in flight, because
- * `checkForUpdates` and `downloadUpdate` both refuse to start from that phase.
- * Once `fail` has moved the phase to `error` this is false again, so the release
- * happens once and a genuinely running handoff is never disturbed.
+ * Both halves are needed. `handoffAttempted` alone would claim every later error
+ * for the install, including one raised by a check that has nothing to do with
+ * it; the `downloaded` phase is what says the install is the only thing this
+ * module currently has in flight, because `checkForUpdates` and `downloadUpdate`
+ * both refuse to start from that phase. Once `failHandoff` has moved the phase
+ * this is false again, so the handoff is buried once.
  */
 function handoffInFlight(): boolean {
-  return installRequested && current().phase === 'downloaded';
+  return handoffAttempted && current().phase === 'downloaded';
 }
 
 /** The contract caps this at 0..100, and electron-updater has been seen to overshoot. */
@@ -331,10 +392,11 @@ function updater(): AppUpdater {
   instance.autoInstallOnAppQuit = false;
 
   instance.on('checking-for-update', () => {
-    setState({ phase: 'checking', message: null });
+    applyEvent({ phase: 'checking', message: null });
   });
 
   instance.on('update-available', (info) => {
+    if (parked()) return;
     setState({
       phase: 'available',
       availableVersion: info.version,
@@ -348,7 +410,7 @@ function updater(): AppUpdater {
   });
 
   instance.on('update-not-available', () => {
-    setState({
+    applyEvent({
       phase: 'idle',
       availableVersion: null,
       progressPercent: null,
@@ -359,7 +421,7 @@ function updater(): AppUpdater {
   });
 
   instance.on('download-progress', (progress) => {
-    setState({
+    applyEvent({
       phase: 'downloading',
       progressPercent: toPercent(progress.percent),
       transferredBytes: toByteCount(progress.transferred),
@@ -369,6 +431,13 @@ function updater(): AppUpdater {
   });
 
   instance.on('update-downloaded', (info) => {
+    // Once a handoff has been attempted, `downloaded` is no longer a state the
+    // user can act on: either Squirrel is re-dispatching under a handoff that is
+    // still running, or the handoff is dead and `failHandoff` has parked the
+    // feature. Rewriting the phase would put an install button back on screen
+    // that `installUpdate` is guaranteed to ignore.
+    if (handoffAttempted) return;
+
     setState({
       phase: 'downloaded',
       availableVersion: info.version,
@@ -382,8 +451,17 @@ function updater(): AppUpdater {
   // never a throw.
   instance.on('error', (error) => {
     // An error that arrives while a handoff is outstanding is the handoff dying;
-    // see `installUpdate`. Read the guard before `fail` moves the phase.
-    if (handoffInFlight()) installRequested = false;
+    // see `installUpdate`. It gets its own terminal state rather than `error`.
+    if (handoffInFlight()) {
+      failHandoff(error);
+      return;
+    }
+    // Anything arriving after that is trailing noise from the same corpse: the
+    // log wants it, the user has already been told what to do.
+    if (parked()) {
+      console.error('[updates] ignored after a failed install handoff:', error);
+      return;
+    }
     fail(error);
   });
 
@@ -527,35 +605,51 @@ export function downloadUpdate(): UpdateState {
  * entirely, skipping the shutdown hooks and leaving the database open. So it
  * delegates and returns, exactly once.
  *
- * Exactly once — but not once per process. Step 1 is asynchronous, and on macOS
- * that is where the real failures live: Squirrel pulling the zip from the proxy
- * server, or refusing its code signature. Those surface as an `error` event, not
- * a throw, so the synchronous `catch` below never sees them and a guard released
- * only there would stay set for the life of the app: check, download and
- * `downloaded` would all work again while `updates:install` quietly did nothing.
+ * Exactly once, and once per process — `handoffAttempted` is set before the call
+ * and never cleared, by anything.
  *
- * The `error` handler therefore releases the guard too, under `handoffInFlight()`.
- * That is narrow on purpose. After `quitAndInstall()` returns, the only
- * electron-updater work left is `nativeUpdater.checkForUpdates()` and the proxy
- * server serving it, and the only thing still able to emit `error` is the
- * `nativeUpdater.on("error", …)` forwarder set up in `MacUpdater`'s constructor —
- * every other emitter belongs to a check or a download, and this module starts
- * neither from the `downloaded` phase. So an `error` in that window *is* Squirrel
- * saying the handoff is dead, and releasing on it cannot let a second
- * `quitAndInstall()` race a handoff that is still running. A handoff that is
- * merely slow emits nothing, the guard stays set, and a second press is ignored.
+ * That is the part worth defending, because the obvious kindness is to release it
+ * when a handoff dies and let the user press install again. Step 1 is
+ * asynchronous, and on macOS that is where the real failures live: Squirrel
+ * pulling the zip from the proxy server, or refusing its code signature. Those
+ * surface as an `error` event, not a throw, and a user stuck in `downloaded` with
+ * an inert button is a genuine defect.
+ *
+ * But a retry against electron-updater 6.8.9 is worse than the stall it fixes.
+ * `MacUpdater.quitAndInstall()` (`out/MacUpdater.js:247`) does
+ * `this.nativeUpdater.on("update-downloaded", () => this.handleUpdateDownloaded())`
+ * and never removes that subscription — not on error, not on any path. So the
+ * first handoff leaves a listener behind, a second attaches another, and if the
+ * second one then succeeds the single native `update-downloaded` runs both:
+ * Electron's native `quitAndInstall()` fires twice, two ShipIt handovers race
+ * each other while the app is terminating. Removing the stale listener would mean
+ * reaching into another package's private emitter, which is a worse bug in
+ * waiting than the one it patches.
+ *
+ * So a dead handoff is terminal for this process. `failHandoff` moves the state
+ * somewhere the UI offers nothing to press and says, in copy the user can act on,
+ * that quitting and reopening will let them try again — cheap, since the update
+ * is already on disk. That leaves `quitAndInstall()` reachable exactly once: the
+ * guard is set on the only path that reaches the call, and nothing anywhere
+ * clears it.
+ *
+ * A handoff that is merely slow is left alone: it emits nothing, the phase stays
+ * `downloaded`, the guard stays set, and a second press is ignored without
+ * pretending the first one failed.
  */
 export function installUpdate(): UpdateState {
   const snapshot = current();
-  if (snapshot.phase !== 'downloaded' || installRequested) return snapshot;
+  if (snapshot.phase !== 'downloaded' || handoffAttempted) return snapshot;
 
-  installRequested = true;
+  handoffAttempted = true;
   try {
     updater().quitAndInstall();
   } catch (error) {
-    // The install never started, so let the user try again.
-    installRequested = false;
-    return fail(error);
+    // A synchronous throw gets the same treatment. `quitAndInstall()` attaches
+    // its listener before the call that can throw, and there is no way from out
+    // here to tell how far in it got, so "it never started" is not a claim this
+    // code is in a position to make.
+    return failHandoff(error);
   }
   return snapshot;
 }
