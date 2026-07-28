@@ -12,9 +12,10 @@
  *      call, with a `Db` passed in. That is the whole reason a preview is
  *      possible without forking the app.
  *
- * Two groups of channels cannot work in a browser and are not faked:
- * `invoices:exportPdf` needs Electron's `printToPDF`, and every `llm:*` channel
- * needs the desktop app's native llama.cpp runtime. Both return a typed
+ * Three groups of channels cannot work in a browser and are not faked:
+ * `invoices:exportPdf` needs Electron's `printToPDF`, every `llm:*` channel
+ * needs the desktop app's native llama.cpp runtime, and every `updates:*`
+ * channel needs electron-updater driving a real installer. All return a typed
  * `DESKTOP_ONLY` error. A preview that pretends to run a local model would be
  * worse than one that says plainly that it cannot.
  */
@@ -71,15 +72,23 @@ const LLM_DESKTOP_MESSAGE =
   'Local models are desktop-only. They run on the app’s native llama.cpp runtime, on your own machine. ' +
   'The browser preview cannot download or run a model. Download the macOS app to use the assistant.';
 
+const UPDATES_DESKTOP_MESSAGE =
+  'Auto-update is desktop-only. It runs through electron-updater, which downloads and swaps the installed ' +
+  'app bundle. The browser preview has nothing to update. Download the macOS app to receive updates.';
+
 /**
  * Channels the preview refuses, with the reason the UI shows the user.
- * Derived from the contract so a new `llm:*` channel is covered automatically.
+ * Derived from the contract so a new `llm:*` or `updates:*` channel is covered
+ * automatically.
  */
 export const DESKTOP_ONLY_CHANNELS: ReadonlyMap<IpcChannel, string> = new Map<IpcChannel, string>([
   ['invoices:exportPdf', PDF_DESKTOP_MESSAGE],
   ...(Object.keys(IPC_CONTRACT) as IpcChannel[])
     .filter((channel) => channel.startsWith('llm:'))
     .map((channel) => [channel, LLM_DESKTOP_MESSAGE] as [IpcChannel, string]),
+  ...(Object.keys(IPC_CONTRACT) as IpcChannel[])
+    .filter((channel) => channel.startsWith('updates:'))
+    .map((channel) => [channel, UPDATES_DESKTOP_MESSAGE] as [IpcChannel, string]),
 ]);
 
 export function isDesktopOnly(channel: IpcChannel): boolean {
