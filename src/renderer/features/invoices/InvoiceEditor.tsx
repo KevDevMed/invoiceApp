@@ -1,10 +1,16 @@
 /**
  * Invoice editor: a two-column maker. The left column is a single "Invoice
- * details" card — client, derived billing address, dates with derived payment
- * terms, currency, tax, an editable line-item grid, live totals, and notes.
- * The right column is a live preview: the same `InvoiceDocument` the detail
- * page renders, rebuilt from the draft on every keystroke, floating on a
- * recessed surface. The columns stack when the window is narrow.
+ * details" card — the customer as an identity row, the derived billing address,
+ * dates with the derived payment term, currency, tax, an editable line-item
+ * table, live totals, notes, and a settled action row at the bottom. The right
+ * column is a live preview: the same `InvoiceDocument` the detail page renders,
+ * rebuilt from the draft on every keystroke, drawn at a fixed paper width and
+ * uniformly scaled to the pane (see ./previewScale). The columns stack when the
+ * window is narrow.
+ *
+ * A client can be created without leaving the page: the Customer field opens the
+ * clients feature's own `ClientForm` in a dialog and folds the saved client into
+ * the local list, so no draft field is lost and nothing is re-fetched.
  *
  * Live totals use the exact same integer math the backend persists
  * (`computeInvoiceTotals` from src/shared/money.ts), so the preview and the
@@ -14,16 +20,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 
+import { Avatar } from '@astryxdesign/core/Avatar';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import type { ISODateString } from '@astryxdesign/core/Calendar';
 import { Card } from '@astryxdesign/core/Card';
 import { DateInput } from '@astryxdesign/core/DateInput';
 import { Divider } from '@astryxdesign/core/Divider';
+import { FormLayout } from '@astryxdesign/core/FormLayout';
 import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Icon } from '@astryxdesign/core/Icon';
 import { IconButton } from '@astryxdesign/core/IconButton';
+import { Item } from '@astryxdesign/core/Item';
 import { NumberInput } from '@astryxdesign/core/NumberInput';
 import { Section } from '@astryxdesign/core/Section';
 import { Selector } from '@astryxdesign/core/Selector';
@@ -42,13 +51,29 @@ import {
 } from '../../../shared/money';
 import type { Client, InvoiceItemInput, InvoiceStatus } from '../../../shared/types';
 import { SETTINGS_KEYS } from '../../../shared/types';
+import { ClientForm } from '../clients/ClientForm';
 import { Page, PageHeader } from '../../ui/Page';
 import { normaliseNotes } from './detail';
+import type { InvoiceDocumentModel } from './document';
 import { buildDocumentModel, netTermDays } from './document';
 import { STATUS_OPTIONS, money, todayIso } from './format';
 import { InvoiceDocument } from './InvoiceDocument';
+import { PAPER_WIDTH_PX, previewScale, scaledPreviewHeight } from './previewScale';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
+
+/**
+ * Budgeted widths for the line table's columns, in px. The header row and every
+ * data row read the same four numbers, which is what makes the grid line up as a
+ * table instead of a stack of unrelated rows.
+ */
+const QTY_WIDTH = 64;
+const COST_WIDTH = 92;
+const AMOUNT_WIDTH = 84;
+const ROW_ACTIONS_WIDTH = 88;
+
+/** Budgeted width of the read-only payment-terms field beside the two dates. */
+const PAYMENT_TERMS_WIDTH = 148;
 
 interface LineDraft {
   key: number;
@@ -120,8 +145,36 @@ export function emptyDraft(): InvoiceDraft {
   };
 }
 
+/**
+ * The client list with `saved` in it — replacing the entry of the same id, or
+ * inserted in the list's own order.
+ *
+ * A client created from inside the invoice must appear in the Customer list
+ * without a re-fetch: refetching would be a second source of truth for a list
+ * the dialog already returned, and any in-flight draft field would be racing it.
+ * The order matches the repository's `ORDER BY name COLLATE NOCASE, id`
+ * (src/domain/clients/repository.ts), so the inserted row sits exactly where a
+ * reload would later put it.
+ */
+export function upsertClient(clients: readonly Client[], saved: Client): Client[] {
+  const existing = clients.findIndex((client) => client.id === saved.id);
+  if (existing >= 0) {
+    const next = [...clients];
+    next[existing] = saved;
+    return next;
+  }
+  const isAfter = (client: Client): boolean => {
+    const byName = client.name.toLowerCase().localeCompare(saved.name.toLowerCase());
+    return byName === 0 ? client.id > saved.id : byName > 0;
+  };
+  const at = clients.findIndex(isAfter);
+  const next = [...clients];
+  next.splice(at < 0 ? next.length : at, 0, saved);
+  return next;
+}
+
 /** One line of the read-only billing address, joined from the client's non-blank fields. */
-function billingAddressFor(client: Client | null): string | null {
+export function billingAddressFor(client: Client | null): string | null {
   if (!client) return null;
   const parts = [
     client.addressLine1,
@@ -135,7 +188,7 @@ function billingAddressFor(client: Client | null): string | null {
 }
 
 /** Derived payment-terms label for the date row: `Net 14`, `Due on receipt`, or an em dash. */
-function paymentTermsLabel(issueDate: string, dueDate: string): string {
+export function paymentTermsLabel(issueDate: string, dueDate: string): string {
   const days = netTermDays(issueDate, dueDate);
   if (days === null || days < 0) return '—';
   if (days === 0) return 'Due on receipt';
@@ -155,6 +208,71 @@ function FieldValue({
         {label}
       </Text>
       {children}
+    </VStack>
+  );
+}
+
+/**
+ * The preview sheet: `InvoiceDocument` drawn at one fixed paper width and
+ * scaled, never reflowed. Narrowing the pane shrinks the whole page — column
+ * proportions and internal type scale intact — instead of re-wrapping it into a
+ * layout the exported PDF would never produce.
+ *
+ * Two boxes, because a `transform: scale()` is paint-only and the scaled sheet
+ * still occupies its full unscaled box in layout: the frame is given the scaled
+ * height and clips, the sheet inside it is the fixed-width, transformed one.
+ *
+ * `ResizeObserver` is present in Electron and in the browser preview harness;
+ * where it is not, both measurements stay at 0, which `previewScale` reads as
+ * "not measured" and answers with scale 1. Missing observer degrades to an
+ * unscaled sheet rather than a crash.
+ */
+function PaperPreview({ model }: { readonly model: InvoiceDocumentModel }): React.JSX.Element {
+  const frameRef = useRef<HTMLElement | null>(null);
+  const sheetRef = useRef<HTMLElement | null>(null);
+  const [paneWidth, setPaneWidth] = useState(0);
+  const [naturalHeight, setNaturalHeight] = useState(0);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    const sheet = sheetRef.current;
+    if (!frame || !sheet) return;
+    if (typeof ResizeObserver === 'undefined') return;
+
+    // `clientWidth`/`offsetHeight` rather than the entry's rects: both are
+    // untransformed layout numbers, which is what the scale is computed from.
+    // A `getBoundingClientRect` height here would already carry the scale and
+    // feed itself.
+    const measure = (): void => {
+      setPaneWidth(frame.clientWidth);
+      setNaturalHeight(sheet.offsetHeight);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    observer.observe(sheet);
+    measure();
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  const scale = previewScale(paneWidth);
+  const height = scaledPreviewHeight(naturalHeight, scale);
+
+  return (
+    <VStack
+      ref={frameRef}
+      style={{ overflow: 'hidden', height: height > 0 ? `${String(height)}px` : undefined }}
+    >
+      <VStack
+        ref={sheetRef}
+        width={PAPER_WIDTH_PX}
+        // Top-inline-start origin: the sheet shrinks towards the corner it is
+        // aligned to, so it never drifts away from the pane's edge.
+        style={{ transform: `scale(${String(scale)})`, transformOrigin: 'top left' }}
+      >
+        <InvoiceDocument model={model} />
+      </VStack>
     </VStack>
   );
 }
@@ -180,6 +298,9 @@ export function InvoiceEditor(): React.JSX.Element {
   const [taxRateBps, setTaxRateBps] = useState(blank.taxRateBps);
   const [notes, setNotes] = useState(blank.notes);
   const [lines, setLines] = useState<LineDraft[]>(blank.lines);
+
+  // null when the dialog is closed; `client` null inside it means "create".
+  const [clientDialog, setClientDialog] = useState<{ readonly client: Client | null } | null>(null);
 
   const [isSaving, setIsSaving] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -352,6 +473,17 @@ export function InvoiceEditor(): React.JSX.Element {
     setLines((prev) => (prev.length > 1 ? prev.filter((line) => line.key !== key) : prev));
   };
 
+  /**
+   * A client saved from the dialog folds straight into the list and becomes the
+   * invoice's customer. Nothing else in the draft is touched, and nothing is
+   * re-fetched: the dialog already returned the saved row.
+   */
+  const acceptClient = (saved: Client): void => {
+    setClients((prev) => upsertClient(prev, saved));
+    setClientId(saved.id);
+    setClientDialog(null);
+  };
+
   const buildItems = (): InvoiceItemInput[] | string => {
     if (clientId === '') return 'Pick a client before saving.';
     const items: InvoiceItemInput[] = [];
@@ -491,58 +623,130 @@ export function InvoiceEditor(): React.JSX.Element {
       {actionError ? <Banner status="error" title={actionError} isDismissable /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable /> : null}
 
-      <Grid columns={{ minWidth: 460, max: 2 }} gap={4} align="start">
-        <Card padding={4}>
-          <VStack gap={3}>
+      {/* `align` left at its default `stretch`: both columns take the row's full
+          height, so the two cards end level however tall either one's content
+          gets. On one column the stretch is a no-op and the cards simply stack. */}
+      <Grid columns={{ minWidth: 460, max: 2 }} gap={4}>
+        <Card padding={4} height="100%">
+          <VStack gap={4} height="100%">
             <Heading level={2}>Invoice details</Heading>
 
-            <Selector
-              label="Customer"
-              placeholder="Choose a client"
-              options={clients.map((client) => ({ value: client.id, label: client.name }))}
-              value={clientId || null}
-              hasSearch
-              hasClear
-              onChange={(value) => {
-                setClientId(value ?? '');
-              }}
-            />
-
-            <FieldValue label="Billing address">
-              {billingAddress ? (
-                <Text type="supporting">{billingAddress}</Text>
+            {/* Who — the client, as an identity row once one is chosen. */}
+            <VStack gap={2}>
+              {selectedClient ? (
+                <FieldValue label="Customer">
+                  {/* Card, not Section: Section is a page region and bleeds to
+                      its container's edges, which inside this card reads as a
+                      full-width grey band rather than one identity row. */}
+                  <Card variant="muted" padding={2}>
+                    <VStack gap={1}>
+                      <Item
+                      startContent={<Avatar size="sm" name={selectedClient.name} />}
+                      label={selectedClient.name}
+                      description={selectedClient.email ?? 'No email on file'}
+                      density="compact"
+                      endContent={
+                        <HStack gap={1} vAlign="center">
+                          <Button
+                            label="Edit"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setClientDialog({ client: selectedClient })}
+                          />
+                          <Button
+                            label="Change"
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setClientId('')}
+                          />
+                        </HStack>
+                      }
+                      />
+                      {/* Inside the identity block, not below it: the address
+                          belongs to the client shown above it, and when there is
+                          no address the row simply is not rendered — an empty
+                          "choose a client to see their address" line is dead
+                          vertical space in the state the form is usually in. */}
+                      {billingAddress ? (
+                        <Text type="supporting" color="secondary">
+                          {billingAddress}
+                        </Text>
+                      ) : null}
+                    </VStack>
+                  </Card>
+                </FieldValue>
               ) : (
-                <Text type="supporting" color="placeholder">
-                  {selectedClient ? 'No address on file for this client' : 'Choose a client to see their address'}
-                </Text>
+                <HStack gap={2} align="end" wrap="wrap">
+                  <StackItem size="fill">
+                    <Selector
+                      label="Customer"
+                      placeholder="Choose a client"
+                      options={clients.map((client) => ({ value: client.id, label: client.name }))}
+                      value={clientId || null}
+                      hasSearch
+                      hasClear
+                      onChange={(value) => {
+                        setClientId(value ?? '');
+                      }}
+                    />
+                  </StackItem>
+                  <Button
+                    label="New client"
+                    variant="secondary"
+                    onClick={() => setClientDialog({ client: null })}
+                  />
+                </HStack>
               )}
-            </FieldValue>
+            </VStack>
 
+            <Divider />
+
+            {/* When — three columns of equal structure, so the derived term
+                reads as a (read-only) field beside the two dates instead of a
+                sentence dropped into their row. Neither DateInput carries a
+                description, which is what keeps the three boxes on one line. */}
             <HStack gap={2} align="start" wrap="wrap">
-              <DateInput
-                label="Issue date"
-                value={issueDate as ISODateString}
-                onChange={(value) => {
-                  if (value) setIssueDate(value);
-                }}
-              />
-              <DateInput
-                label="Due date"
-                value={dueDate as ISODateString}
-                onChange={(value) => {
-                  if (value) setDueDate(value);
-                }}
-              />
-              <FieldValue label="Payment terms">
-                <Text>{paymentTermsLabel(issueDate, dueDate)}</Text>
-              </FieldValue>
+              <StackItem size="fill">
+                <DateInput
+                  label="Issue date"
+                  value={issueDate as ISODateString}
+                  onChange={(value) => {
+                    if (value) setIssueDate(value);
+                  }}
+                />
+              </StackItem>
+              <StackItem size="fill">
+                <DateInput
+                  label="Due date"
+                  value={dueDate as ISODateString}
+                  onChange={(value) => {
+                    if (value) setDueDate(value);
+                  }}
+                />
+              </StackItem>
+              {/* Budgeted rather than filling: when the pane is too narrow for
+                  three fields the readout wraps to the next line at its own
+                  small width instead of stretching into a full-width banner. */}
+              <VStack width={PAYMENT_TERMS_WIDTH}>
+                <FieldValue label="Payment terms">
+                  <Card variant="muted" padding={2}>
+                    <Text>{paymentTermsLabel(issueDate, dueDate)}</Text>
+                  </Card>
+                </FieldValue>
+              </VStack>
             </HStack>
 
-            {/* Aligned to the end: the NumberInput's description line makes it
-                taller than the Selector, so only a bottom-aligned row puts the
-                two inputs themselves on one baseline. */}
-            <HStack gap={2} align="end" wrap="wrap">
-              <Selector label="Currency" options={CURRENCIES} value={currency} onChange={setCurrency} />
+            {/* Each field owns its own column, and both carry a description, so
+                the tax hint sits under its own input instead of floating above
+                and to the right of the Currency selector. */}
+            <FormLayout direction="horizontal">
+              <Selector
+                label="Currency"
+                description="Used for every amount"
+                options={CURRENCIES}
+                value={currency}
+                onChange={setCurrency}
+              />
               <NumberInput
                 label="Tax rate (bps)"
                 description="825 = 8.25%"
@@ -555,103 +759,146 @@ export function InvoiceEditor(): React.JSX.Element {
                   setTaxRateBps(Math.max(0, Math.trunc(value)));
                 }}
               />
-            </HStack>
+            </FormLayout>
 
             <Divider />
-            <Heading level={3}>Item details</Heading>
-            {lines.map((line, index) => {
-              const lineParsed = parsed[index];
-              const amount =
-                lineParsed &&
-                lineParsed.quantityMilli !== null &&
-                lineParsed.quantityMilli > 0 &&
-                lineParsed.unitPriceCents !== null
-                  ? money(
-                      computeInvoiceTotals(
-                        [
-                          {
-                            quantityMilli: lineParsed.quantityMilli,
-                            unitPriceCents: lineParsed.unitPriceCents,
-                          },
-                        ],
-                        0,
-                      ).subtotalCents,
-                      currency,
-                    )
-                  : '—';
-              return (
-                <HStack key={line.key} gap={2} align="end">
-                  <StackItem size="fill">
-                    <TextInput
-                      label={index === 0 ? 'Item' : `Item ${index + 1}`}
-                      isLabelHidden={index > 0}
-                      value={line.description}
-                      placeholder="What was delivered?"
-                      onChange={(value) => updateLine(line.key, { description: value })}
-                    />
-                  </StackItem>
-                  <VStack width={72}>
-                    <TextInput
-                      label={index === 0 ? 'Qty' : `Qty ${index + 1}`}
-                      isLabelHidden={index > 0}
-                      value={line.quantity}
-                      status={
-                        lineParsed && (lineParsed.quantityMilli === null || lineParsed.quantityMilli <= 0)
-                          ? { type: 'error' }
-                          : undefined
-                      }
-                      onChange={(value) => updateLine(line.key, { quantity: value })}
-                    />
-                  </VStack>
-                  <VStack width={104}>
-                    <TextInput
-                      label={index === 0 ? 'Cost' : `Cost ${index + 1}`}
-                      isLabelHidden={index > 0}
-                      value={line.unitPrice}
-                      status={lineParsed && lineParsed.unitPriceCents === null ? { type: 'error' } : undefined}
-                      onChange={(value) => updateLine(line.key, { unitPrice: value })}
-                    />
-                  </VStack>
-                  <VStack width={88} hAlign="end" paddingBlock={1}>
-                    <Text type="supporting" hasTabularNumbers>
-                      {amount}
-                    </Text>
-                  </VStack>
-                  <IconButton
-                    label={`Move line ${index + 1} up`}
-                    icon={<Icon icon="arrowUp" size="sm" />}
-                    size="sm"
-                    isDisabled={index === 0}
-                    onClick={() => moveLine(index, -1)}
-                  />
-                  <IconButton
-                    label={`Move line ${index + 1} down`}
-                    icon={<Icon icon="arrowDown" size="sm" />}
-                    size="sm"
-                    isDisabled={index === lines.length - 1}
-                    onClick={() => moveLine(index, 1)}
-                  />
-                  <IconButton
-                    label={`Remove line ${index + 1}`}
-                    icon={<Icon icon="close" size="sm" />}
-                    size="sm"
-                    variant="ghost"
-                    isDisabled={lines.length === 1}
-                    onClick={() => removeLine(line.key)}
-                  />
-                </HStack>
-              );
-            })}
-            <HStack gap={2}>
-              <Button
-                label="Add item"
-                variant="secondary"
-                size="sm"
-                onClick={() => setLines((prev) => [...prev, emptyLine()])}
-              />
-            </HStack>
+
+            {/* What — a table: the column headers are rendered once, above every
+                row, and every row's own labels are hidden but still announced. */}
+            <VStack gap={2}>
+              <Heading level={3}>Item details</Heading>
+              <HStack gap={2} vAlign="center">
+                <StackItem size="fill">
+                  <Text type="label" color="secondary">
+                    Item
+                  </Text>
+                </StackItem>
+                <VStack width={QTY_WIDTH}>
+                  <Text type="label" color="secondary">
+                    Qty
+                  </Text>
+                </VStack>
+                <VStack width={COST_WIDTH}>
+                  <Text type="label" color="secondary">
+                    Cost
+                  </Text>
+                </VStack>
+                <VStack width={AMOUNT_WIDTH} hAlign="end">
+                  <Text type="label" color="secondary">
+                    Amount
+                  </Text>
+                </VStack>
+                <VStack width={ROW_ACTIONS_WIDTH} hAlign="end">
+                  <Text type="label" color="secondary">
+                    Actions
+                  </Text>
+                </VStack>
+              </HStack>
+              <Divider variant="subtle" />
+
+              {lines.map((line, index) => {
+                const lineParsed = parsed[index];
+                const amount =
+                  lineParsed &&
+                  lineParsed.quantityMilli !== null &&
+                  lineParsed.quantityMilli > 0 &&
+                  lineParsed.unitPriceCents !== null
+                    ? money(
+                        computeInvoiceTotals(
+                          [
+                            {
+                              quantityMilli: lineParsed.quantityMilli,
+                              unitPriceCents: lineParsed.unitPriceCents,
+                            },
+                          ],
+                          0,
+                        ).subtotalCents,
+                        currency,
+                      )
+                    : '—';
+                return (
+                  <HStack key={line.key} gap={2} vAlign="center">
+                    <StackItem size="fill">
+                      <TextInput
+                        label={`Item ${index + 1}`}
+                        isLabelHidden
+                        value={line.description}
+                        placeholder="What was delivered?"
+                        onChange={(value) => updateLine(line.key, { description: value })}
+                      />
+                    </StackItem>
+                    <VStack width={QTY_WIDTH}>
+                      <TextInput
+                        label={`Qty ${index + 1}`}
+                        isLabelHidden
+                        value={line.quantity}
+                        status={
+                          lineParsed &&
+                          (lineParsed.quantityMilli === null || lineParsed.quantityMilli <= 0)
+                            ? { type: 'error' }
+                            : undefined
+                        }
+                        onChange={(value) => updateLine(line.key, { quantity: value })}
+                      />
+                    </VStack>
+                    <VStack width={COST_WIDTH}>
+                      <TextInput
+                        label={`Cost ${index + 1}`}
+                        isLabelHidden
+                        value={line.unitPrice}
+                        status={
+                          lineParsed && lineParsed.unitPriceCents === null
+                            ? { type: 'error' }
+                            : undefined
+                        }
+                        onChange={(value) => updateLine(line.key, { unitPrice: value })}
+                      />
+                    </VStack>
+                    <VStack width={AMOUNT_WIDTH} hAlign="end">
+                      <Text hasTabularNumbers>{amount}</Text>
+                    </VStack>
+                    <HStack gap={0.5} width={ROW_ACTIONS_WIDTH} hAlign="end" vAlign="center">
+                      <IconButton
+                        label={`Move line ${index + 1} up`}
+                        icon={<Icon icon="arrowUp" size="sm" />}
+                        size="sm"
+                        variant="ghost"
+                        isDisabled={index === 0}
+                        onClick={() => moveLine(index, -1)}
+                      />
+                      <IconButton
+                        label={`Move line ${index + 1} down`}
+                        icon={<Icon icon="arrowDown" size="sm" />}
+                        size="sm"
+                        variant="ghost"
+                        isDisabled={index === lines.length - 1}
+                        onClick={() => moveLine(index, 1)}
+                      />
+                      <IconButton
+                        label={`Remove line ${index + 1}`}
+                        icon={<Icon icon="close" size="sm" />}
+                        size="sm"
+                        variant="ghost"
+                        isDisabled={lines.length === 1}
+                        onClick={() => removeLine(line.key)}
+                      />
+                    </HStack>
+                  </HStack>
+                );
+              })}
+
+              <HStack gap={2}>
+                <Button
+                  label="Add item"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setLines((prev) => [...prev, emptyLine()])}
+                />
+              </HStack>
+            </VStack>
 
             <Divider />
+
             <HStack gap={5} justify="end" wrap="wrap">
               <FieldValue label="Subtotal">
                 <Text type="supporting" hasTabularNumbers>
@@ -670,9 +917,19 @@ export function InvoiceEditor(): React.JSX.Element {
               </FieldValue>
             </HStack>
 
-            <TextArea label="Notes to customer" value={notes} rows={2} isOptional onChange={setNotes} />
+            <TextArea
+              label="Notes to customer"
+              value={notes}
+              rows={2}
+              isOptional
+              onChange={setNotes}
+            />
 
-            <HStack gap={2}>
+            {/* Takes up whatever height the stretched column has spare, so the
+                action row settles at the bottom of the card. */}
+            <StackItem size="fill" />
+            <Divider />
+            <HStack gap={2} justify="end">
               <Button
                 label={isNew ? 'Create invoice' : 'Save changes'}
                 variant="primary"
@@ -685,15 +942,28 @@ export function InvoiceEditor(): React.JSX.Element {
           </VStack>
         </Card>
 
-        <Card padding={4}>
-          <VStack gap={3}>
+        <Card padding={4} height="100%">
+          <VStack gap={3} height="100%">
             <Heading level={2}>Preview</Heading>
-            <Section variant="muted" padding={4}>
-              <InvoiceDocument model={documentModel} />
-            </Section>
+            {/* The sheet's height is deterministic, so the row it is in is at
+                least as tall as it needs — but the region scrolls anyway rather
+                than let a taller sheet spill out of the card. */}
+            <StackItem size="fill" isScrollable>
+              <Section variant="muted" padding={4}>
+                <PaperPreview model={documentModel} />
+              </Section>
+            </StackItem>
           </VStack>
         </Card>
       </Grid>
+
+      {clientDialog ? (
+        <ClientForm
+          client={clientDialog.client}
+          onClose={() => setClientDialog(null)}
+          onSaved={acceptClient}
+        />
+      ) : null}
     </Page>
   );
 }
