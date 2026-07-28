@@ -84,6 +84,42 @@ function emptyLine(): LineDraft {
   return { key: nextKey++, description: '', quantity: '1', unitPrice: '0.00' };
 }
 
+/** Every editable field of the draft, in one shape. */
+export interface InvoiceDraft {
+  invoiceNumber: string | null;
+  status: InvoiceStatus;
+  clientId: string;
+  issueDate: string;
+  dueDate: string;
+  currency: string;
+  taxRateBps: number;
+  notes: string;
+  lines: LineDraft[];
+}
+
+/**
+ * The blank form, as one value. Both the initial state and the reset at the top
+ * of the load effect come from here, so "empty" cannot drift between the two —
+ * a field added to the editor is either in this object or it is in neither.
+ *
+ * Fresh on every call: the line it carries needs its own `key`, and `todayIso()`
+ * has to be read when the form opens, not when the module loads.
+ */
+export function emptyDraft(): InvoiceDraft {
+  const today = todayIso();
+  return {
+    invoiceNumber: null,
+    status: 'draft',
+    clientId: '',
+    issueDate: today,
+    dueDate: today,
+    currency: 'USD',
+    taxRateBps: 0,
+    notes: '',
+    lines: [emptyLine()],
+  };
+}
+
 /** One line of the read-only billing address, joined from the client's non-blank fields. */
 function billingAddressFor(client: Client | null): string | null {
   if (!client) return null;
@@ -134,15 +170,16 @@ export function InvoiceEditor(): React.JSX.Element {
   const [businessName, setBusinessName] = useState<string | null>(null);
   const [businessAddress, setBusinessAddress] = useState<string | null>(null);
 
-  const [invoiceNumber, setInvoiceNumber] = useState<string | null>(null);
-  const [status, setStatus] = useState<InvoiceStatus>('draft');
-  const [clientId, setClientId] = useState('');
-  const [issueDate, setIssueDate] = useState(todayIso());
-  const [dueDate, setDueDate] = useState(todayIso());
-  const [currency, setCurrency] = useState('USD');
-  const [taxRateBps, setTaxRateBps] = useState(0);
-  const [notes, setNotes] = useState('');
-  const [lines, setLines] = useState<LineDraft[]>([emptyLine()]);
+  const [blank] = useState(emptyDraft);
+  const [invoiceNumber, setInvoiceNumber] = useState<string | null>(blank.invoiceNumber);
+  const [status, setStatus] = useState<InvoiceStatus>(blank.status);
+  const [clientId, setClientId] = useState(blank.clientId);
+  const [issueDate, setIssueDate] = useState(blank.issueDate);
+  const [dueDate, setDueDate] = useState(blank.dueDate);
+  const [currency, setCurrency] = useState(blank.currency);
+  const [taxRateBps, setTaxRateBps] = useState(blank.taxRateBps);
+  const [notes, setNotes] = useState(blank.notes);
+  const [lines, setLines] = useState<LineDraft[]>(blank.lines);
 
   const [isSaving, setIsSaving] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -158,6 +195,28 @@ export function InvoiceEditor(): React.JSX.Element {
 
   useEffect(() => {
     let cancelled = false;
+
+    // The route table keys this component by invoice id, so in practice this
+    // effect runs once per mount. It still clears the form itself: its own
+    // dependencies say it handles an `id` change, and a component whose loader
+    // only half-populates the form is a trap for the next caller that mounts it
+    // without a key. Everything the previous invoice could have left behind —
+    // draft fields, banners, the spinner — goes first, before the await.
+    const draft = emptyDraft();
+    setInvoiceNumber(draft.invoiceNumber);
+    setStatus(draft.status);
+    setClientId(draft.clientId);
+    setIssueDate(draft.issueDate);
+    setDueDate(draft.dueDate);
+    setCurrency(draft.currency);
+    setTaxRateBps(draft.taxRateBps);
+    setNotes(draft.notes);
+    setLines(draft.lines);
+    setLoadError(null);
+    setActionError(null);
+    setNotice(null);
+    setIsLoading(true);
+
     void (async () => {
       try {
         const [clientResult, nameRow, addressRow] = await Promise.all([
