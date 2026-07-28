@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import type { ChatMessage } from '../../../shared/types';
 import { SECTION_ROUTES } from '../../chrome';
+import type { AssistantAvailability } from '../../features/assistant/availability';
 import {
+  isDockComposerDisabled,
   isDockVisible,
   isReplyUnread,
   latestReplyId,
@@ -96,6 +98,48 @@ describe('launcherBeam', () => {
     expect(launcherBeam({ ...base, isOpen: true, isStreaming: true })).toBe('launcher-idle');
     expect(launcherBeam({ ...base, isOpen: true, pendingApprovalCount: 3 })).toBe('launcher-idle');
     expect(launcherBeam({ ...base, isOpen: true, hasUnreadReply: true })).toBe('launcher-idle');
+  });
+});
+
+describe('isDockComposerDisabled', () => {
+  const AVAILABILITIES: readonly AssistantAvailability[] = [
+    'loading',
+    'desktop-only',
+    'no-model',
+    'no-selection',
+    'ready',
+  ];
+
+  it('allows input only when the assistant is ready and idle', () => {
+    expect(isDockComposerDisabled({ availability: 'ready', isStreaming: false })).toBe(false);
+  });
+
+  it('refuses input while a reply is streaming, so two composers cannot share one slot', () => {
+    // The dock and the /assistant page hold the same provider and the same
+    // single request slot; a live dock composer mid-stream races the page's.
+    expect(isDockComposerDisabled({ availability: 'ready', isStreaming: true })).toBe(true);
+  });
+
+  it('refuses input in the browser preview, where no llm:* call can be answered', () => {
+    expect(isDockComposerDisabled({ availability: 'desktop-only', isStreaming: false })).toBe(true);
+  });
+
+  it('refuses input in every state that is not ready, streaming or not', () => {
+    for (const availability of AVAILABILITIES) {
+      if (availability === 'ready') continue;
+      expect(isDockComposerDisabled({ availability, isStreaming: false })).toBe(true);
+      expect(isDockComposerDisabled({ availability, isStreaming: true })).toBe(true);
+    }
+  });
+
+  it('refuses input across the whole availability x streaming matrix except ready-and-idle', () => {
+    for (const availability of AVAILABILITIES) {
+      for (const isStreaming of [false, true]) {
+        expect(isDockComposerDisabled({ availability, isStreaming })).toBe(
+          !(availability === 'ready' && !isStreaming),
+        );
+      }
+    }
   });
 });
 

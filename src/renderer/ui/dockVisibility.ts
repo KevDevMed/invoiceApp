@@ -10,6 +10,7 @@
  */
 
 import type { ChatMessage } from '../../shared/types';
+import type { AssistantAvailability } from '../features/assistant/availability';
 import type { BeamPreset } from './beam/presets';
 
 /**
@@ -86,6 +87,35 @@ export function launcherBeam(input: LauncherBeamInput): BeamPreset {
  */
 export function panelBeam(isStreaming: boolean): BeamPreset {
   return isStreaming ? 'panel-streaming' : 'panel-idle';
+}
+
+/**
+ * Whether the dock's composer refuses input right now.
+ *
+ * Two reasons, and they are different in kind:
+ *
+ * 1. `availability !== 'ready'` — there is nothing on the other end. The
+ *    browser preview has no runtime, and a desktop app with no model chosen has
+ *    nothing to send to. A composer that accepts text it can never answer lies.
+ * 2. `isStreaming` — a reply is already in flight. The dock and the `/assistant`
+ *    page share one provider and therefore one request slot, so two composers
+ *    are live at once; letting either submit mid-stream races a single-slot
+ *    lifecycle. Disabling here is the surface half of that guard (the hook
+ *    enforces single-flight on its own side).
+ *
+ * The Stop button is deliberately *not* covered by this: `ChatComposer` keeps
+ * it reachable via `isStopShown` while the input is disabled, so a user who
+ * changes their mind mid-generation is never stuck waiting it out.
+ *
+ * Only `desktop-only` and `ready` actually reach a composer today — the other
+ * three states render an empty state instead — but the rule is stated over the
+ * whole union so a new branch cannot quietly acquire a live composer.
+ */
+export function isDockComposerDisabled(input: {
+  readonly availability: AssistantAvailability;
+  readonly isStreaming: boolean;
+}): boolean {
+  return input.availability !== 'ready' || input.isStreaming;
 }
 
 /** Id of the newest assistant reply in a transcript, or null if there is none. */

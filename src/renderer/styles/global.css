@@ -63,8 +63,8 @@ body {
  */
 .assistant-dock-launcher {
   position: fixed;
-  inset-block-end: var(--spacing-6, 24px);
-  inset-inline-end: var(--spacing-6, 24px);
+  inset-block-end: var(--spacing-6);
+  inset-inline-end: var(--spacing-6);
   /* Above page content. The panel itself needs no z-index: usePopover promotes
      it into the browser's top layer, which sits above every stacking context. */
   z-index: 10;
@@ -74,23 +74,27 @@ body {
    the beam auto-detects its child's computed radius — so setting it here is
    also what makes the halo round instead of a rounded rectangle. */
 .assistant-dock-launcher-button {
-  border-radius: var(--radius-full, 9999px);
+  border-radius: var(--radius-full);
 }
 
 /*
- * There is no width token, so the panel's size is built from the spacing scale
- * instead of a bare number. The block-size cap is the important half: the panel
- * is anchored to a fixed launcher and nothing above it constrains its height,
- * so on a short window it would otherwise run off the top of the screen. The
- * ChatLayout message list inside is the flex scroll region that absorbs it.
+ * No fallbacks on these: `--spacing-6`, `--spacing-10`, `--spacing-12` and
+ * `--radius-full` are all defined on `:root` by astryx.css, which this very
+ * file `@import`s at the top, so a fallback could only ever mask that import
+ * failing — in which case nothing else in the app is styled either.
+ *
+ * The design system ships no width or panel-size token — the size scale is for
+ * controls, not for a viewport-relative surface — so the panel's size is
+ * multiplied out of the spacing scale rather than written as a bare number.
+ * The block-size cap is the important half: the panel is anchored to a fixed
+ * launcher and nothing above it constrains its height, so on a short window it
+ * would otherwise run off the top of the screen. The ChatLayout message list
+ * inside is the flex scroll region that absorbs it.
  */
 .assistant-dock-panel {
-  inline-size: min(
-    calc(var(--spacing-12, 48px) * 8),
-    calc(100vw - var(--spacing-10, 40px))
-  );
-  block-size: calc(var(--spacing-12, 48px) * 13);
-  max-block-size: calc(100dvh - var(--spacing-12, 48px) * 3);
+  inline-size: min(calc(var(--spacing-12) * 8), calc(100vw - var(--spacing-10)));
+  block-size: calc(var(--spacing-12) * 13);
+  max-block-size: calc(100dvh - var(--spacing-12) * 3);
 }
 
 .app-page {

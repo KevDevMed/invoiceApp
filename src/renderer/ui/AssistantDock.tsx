@@ -42,7 +42,7 @@ import {
 import { Divider } from '@astryxdesign/core/Divider';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
 import { Icon } from '@astryxdesign/core/Icon';
-import { usePopover } from '@astryxdesign/core/Popover';
+import { useLayer } from '@astryxdesign/core/Layer';
 import { Section } from '@astryxdesign/core/Section';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
@@ -59,12 +59,36 @@ import {
 } from '../features/assistant/useAssistant';
 import { AppBeam } from './beam';
 import {
+  isDockComposerDisabled,
   isReplyUnread,
   latestReplyId,
   launcherBeam,
   panelBeam,
   type DockReadCursor,
 } from './dockVisibility';
+
+/**
+ * What counts as "the first thing in the panel" when it opens.
+ *
+ * The design system keeps its own copy of this selector private
+ * (`hooks/focusableSelector`, not exported from the package), and the dock
+ * needs exactly one thing from it: something to hand focus to on open. This is
+ * the ordinary tabbable set, minus `tabindex="-1"` and minus disabled controls
+ * — a disabled composer is skipped, so the header buttons take the focus.
+ */
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+/** True for an Escape keydown that is only cancelling an IME composition. */
+function isImeKey(event: KeyboardEvent): boolean {
+  return event.isComposing || event.keyCode === 229;
+}
 
 /**
  * The launcher glyph. The design system's 26 semantic icon names have no
@@ -123,36 +147,101 @@ export function AssistantDock(): React.JSX.Element {
   }, []);
 
   /*
-    A persistent dock, not a menu. Each of these is a deliberate departure from
-    `usePopover`'s defaults, and each default would be actively wrong here:
+    `useLayer`, not `usePopover`, and the reason is the dock's whole contract.
 
-    - hasLightDismiss: false — the default closes the popover on any outside
-      click. A chat panel that vanishes when the user clicks the invoice row
-      they are asking about is not a dock; the whole point is that it survives
-      the user working behind it.
-    - isModal: false — the default marks the dialog aria-modal, which tells
-      assistive tech the rest of the app is unavailable. It isn't. The user is
-      expected to keep using the app with the chat open.
-    - hasEscapeDismiss: true — nominally the default, but stated explicitly
-      because it only becomes *our* behaviour once light dismiss is off: with
-      light dismiss on, Escape closing is the browser's native popover=auto
-      behaviour rather than the hook's.
-    - dialogLabel — the panel has no visible heading element to name it, so
-      without this the dialog announces as unlabelled.
-    - hasSurface: false — the default paints a background, radius and shadow on
-      the hook's own wrapper. The dock's surface is the `Card` inside the beam;
-      two stacked surfaces would put the beam's border *inside* a visible edge.
+    `usePopover` calls `useFocusTrap` unconditionally (usePopover.tsx:340) — no
+    option turns it off — while `isModal` only decides whether `aria-modal` is
+    emitted (usePopover.tsx:415). So `isModal: false` used to tell assistive
+    tech "the rest of the app is still available" on a panel that physically
+    would not let a keyboard user Tab out of it. A mouse user could click the
+    invoice behind the dock; a keyboard user could not reach it. The ARIA and
+    the behaviour contradicted each other, and the behaviour was the wrong half:
+    a persistent dock is by definition non-modal.
+
+    Resolved by keeping the non-modal promise and dropping the trap. `useLayer`
+    is the primitive underneath `usePopover` — same Popover API top layer, same
+    CSS anchor positioning, no focus management of any kind (useLayer.tsx has no
+    focus code at all). `lightDismiss: false` renders `popover="manual"`, which
+    is what makes clicking the app behind the panel leave it open.
+
+    Everything the trap used to provide, this component now owns explicitly:
+
+    - the dialog role and its accessible name, on the panel `Card` below — the
+      panel has no visible heading, so without the label it announces unnamed.
+      No `aria-modal`, which is now the truth rather than a claim.
+    - Escape-to-close, scoped to keydowns inside the panel rather than the
+      document. Document-wide was only defensible for a modal; a non-modal dock
+      that swallowed Escape from the whole app would break every surface behind
+      it (`useFocusTrap` calls `stopPropagation`, but listener order is
+      registration order, and the dock mounts first).
+    - focus into the panel on open, and back to the launcher on close.
   */
-  const { triggerRef, triggerProps, render, toggle, hide, isOpen } = usePopover({
-    dialogLabel: 'Assistant chat',
-    closeButtonLabel: 'Close the assistant chat',
-    hasLightDismiss: false,
-    hasEscapeDismiss: true,
-    isModal: false,
-    hasSurface: false,
+  const layer = useLayer({
+    mode: 'context',
+    lightDismiss: false,
     onShow: markSeen,
     onHide: markSeen,
   });
+  const { isOpen } = layer;
+
+  const launcherRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  // The launcher is both the layer's anchor and the element focus comes back
+  // to, so the two refs are merged into one callback.
+  const setLauncherRef = useCallback(
+    (element: HTMLButtonElement | null) => {
+      launcherRef.current = element;
+      layer.ref(element);
+    },
+    [layer],
+  );
+
+  /*
+    Focus return, done the way `useFocusTrap` does it (useFocusTrap.ts:238-267):
+    only when focus would otherwise be lost. If the user closed the panel by
+    clicking a button on the page behind it, that button keeps focus — yanking
+    it back to the launcher would be the non-modal version of a focus trap.
+    Read *before* `hide()`, because hiding a popover drops focus to <body>.
+  */
+  const close = useCallback(() => {
+    const panel = panelRef.current;
+    const active = document.activeElement;
+    const isFocusOurs =
+      active === null ||
+      active === document.body ||
+      active === document.documentElement ||
+      (panel !== null && panel.contains(active));
+
+    layer.hide();
+
+    if (isFocusOurs) launcherRef.current?.focus();
+  }, [layer]);
+
+  const toggle = useCallback(() => {
+    if (layer.isOpen) {
+      close();
+    } else {
+      layer.show();
+    }
+  }, [layer, close]);
+
+  /*
+    Opening with the keyboard has to land focus somewhere inside the panel, or
+    Enter on the launcher would leave the user's focus on a button whose panel
+    they cannot reach without Tabbing through the rest of the page. One frame's
+    delay because the layer is promoted to the top layer after the render that
+    opens it, matching what `usePopover` did.
+  */
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const frame = requestAnimationFrame(() => {
+      panelRef.current?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)?.focus();
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+    };
+  }, [isOpen]);
 
   const launcherPreset = launcherBeam({
     isOpen,
@@ -177,7 +266,7 @@ export function AssistantDock(): React.JSX.Element {
     <VStack className="assistant-dock-launcher" gap={0}>
       <AppBeam preset={launcherPreset}>
         <Button
-          ref={triggerRef}
+          ref={setLauncherRef}
           className="assistant-dock-launcher-button"
           label={isOpen ? 'Close the assistant' : 'Open the assistant'}
           tooltip={isOpen ? 'Close the assistant' : 'Open the assistant'}
@@ -186,13 +275,37 @@ export function AssistantDock(): React.JSX.Element {
           size="lg"
           variant="primary"
           onClick={toggle}
-          {...triggerProps}
+          // The trigger half of the dialog relationship, which `usePopover`
+          // used to assemble. No `aria-modal` anywhere: see the hook comment.
+          aria-haspopup="dialog"
+          aria-expanded={isOpen}
+          aria-controls={layer.id}
         />
       </AppBeam>
 
-      {render(
+      {layer.render(
         <AppBeam preset={panelBeam(assistant.isStreaming)}>
-          <Card className="assistant-dock-panel" padding={0} variant="default">
+          <Card
+            ref={panelRef}
+            className="assistant-dock-panel"
+            padding={0}
+            variant="default"
+            role="dialog"
+            aria-label="Assistant chat"
+            /*
+              Escape closes, scoped to the panel's own subtree. React's
+              synthetic keydown bubbles from whatever inside the panel has
+              focus, so this fires for the composer, the header buttons and the
+              approval card alike — and never for a keypress aimed at the app
+              behind the dock.
+            */
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape' || isImeKey(event.nativeEvent)) return;
+              event.preventDefault();
+              event.stopPropagation();
+              close();
+            }}
+          >
             <VStack gap={0} height="100%">
               <StackItem size="static">
                 <HStack gap={2} paddingInline={3} paddingBlock={2} align="center">
@@ -210,13 +323,13 @@ export function AssistantDock(): React.JSX.Element {
                     variant="ghost"
                     size="sm"
                     href="#/assistant"
-                    onClick={hide}
+                    onClick={close}
                   />
                   <Button
                     label="Close"
                     variant="ghost"
                     size="sm"
-                    onClick={hide}
+                    onClick={close}
                   />
                 </HStack>
                 <Divider />
@@ -279,10 +392,6 @@ function DockBody({
         onDraftChange={onDraftChange}
         isComposerFocused={isComposerFocused}
         onComposerFocusChange={onComposerFocusChange}
-        // Not disabled as a punishment — there is nothing on the other end of
-        // the send button in a browser, and a composer that accepts text it
-        // can never answer is a lie.
-        isComposerDisabled
         emptyState={
           <EmptyState
             title={copy.title}
@@ -344,11 +453,21 @@ function DockChat({
   isComposerFocused,
   onComposerFocusChange,
   emptyState,
-  isComposerDisabled = false,
 }: DockBodyProps & {
   readonly emptyState: React.ReactNode;
-  readonly isComposerDisabled?: boolean;
 }): React.JSX.Element {
+  /*
+    Both reasons the composer refuses input — no runtime on the other end, and
+    a reply already in flight — decided in one pure place. The streaming half
+    matters most here: the dock and the `/assistant` page share one provider,
+    so without it two composers can submit into one request slot. See
+    `isDockComposerDisabled`.
+  */
+  const isComposerDisabled = isDockComposerDisabled({
+    availability: assistant.availability,
+    isStreaming: assistant.isStreaming,
+  });
+
   /*
     Decided out here, not inside `<DockTranscript/>`: `ChatLayout` swaps in its
     `emptyState` only when `children` is literally `null`, and a component that
