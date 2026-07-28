@@ -46,6 +46,57 @@ body {
   -webkit-app-region: no-drag;
 }
 
+/*
+ * The floating assistant dock. Two things here have no design-system
+ * equivalent, which is the only sanctioned reason for app-level CSS: fixed
+ * positioning (no Astryx layout component exposes it) and sizing measured
+ * against the viewport rather than a parent.
+ *
+ * The positioning sits on this wrapper rather than on the AppBeam element:
+ * `border-beam` injects `[data-beam="…"] { position: relative }` from a <style>
+ * tag mounted with the component, so it lands after this file in document order
+ * at equal specificity and would win.
+ *
+ * Bottom-right is the safe corner. The macOS traffic lights are top-left (see
+ * `chrome.ts`) and the sidebar's resize handle rides the sidebar's inline edge,
+ * so nothing the dock can cover is interactive.
+ */
+.assistant-dock-launcher {
+  position: fixed;
+  inset-block-end: var(--spacing-6);
+  inset-inline-end: var(--spacing-6);
+  /* Above page content. The panel itself needs no z-index: usePopover promotes
+     it into the browser's top layer, which sits above every stacking context. */
+  z-index: 10;
+}
+
+/* Circular, per the launcher's design. Button's own radius is rectangular, and
+   the beam auto-detects its child's computed radius — so setting it here is
+   also what makes the halo round instead of a rounded rectangle. */
+.assistant-dock-launcher-button {
+  border-radius: var(--radius-full);
+}
+
+/*
+ * No fallbacks on these: `--spacing-6`, `--spacing-10`, `--spacing-12` and
+ * `--radius-full` are all defined on `:root` by astryx.css, which this very
+ * file `@import`s at the top, so a fallback could only ever mask that import
+ * failing — in which case nothing else in the app is styled either.
+ *
+ * The design system ships no width or panel-size token — the size scale is for
+ * controls, not for a viewport-relative surface — so the panel's size is
+ * multiplied out of the spacing scale rather than written as a bare number.
+ * The block-size cap is the important half: the panel is anchored to a fixed
+ * launcher and nothing above it constrains its height, so on a short window it
+ * would otherwise run off the top of the screen. The ChatLayout message list
+ * inside is the flex scroll region that absorbs it.
+ */
+.assistant-dock-panel {
+  inline-size: min(calc(var(--spacing-12) * 8), calc(100vw - var(--spacing-10)));
+  block-size: calc(var(--spacing-12) * 13);
+  max-block-size: calc(100dvh - var(--spacing-12) * 3);
+}
+
 .app-page {
   display: flex;
   flex-direction: column;

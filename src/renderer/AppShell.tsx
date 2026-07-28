@@ -16,7 +16,6 @@
  * lives in `./ui/Page`.
  */
 
-import { createContext, useContext } from 'react';
 import { Outlet, useLocation } from 'react-router';
 
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
@@ -45,8 +44,23 @@ import {
   titleBarInset,
   type NavGroup,
 } from './chrome';
+import { isDockVisible } from './ui/dockVisibility';
+import { useThemeMode } from './ui/themeMode';
+import { AssistantDock } from './ui/AssistantDock';
+import { AssistantProvider } from './features/assistant/useAssistant';
 
 export type { NavGroup } from './chrome';
+
+/*
+  The appearance context moved to `./ui/themeMode` so `ui/beam` can read it
+  without importing this file — see that module's header for the cycle it
+  breaks. These re-exports keep `App.tsx`'s existing import path working.
+*/
+export {
+  ThemeModeContext,
+  useThemeMode,
+  type ThemeModeContextValue,
+} from './ui/themeMode';
 
 /**
  * Nav icons.
@@ -182,20 +196,6 @@ export const NAV_ITEMS: readonly NavItem[] = SECTION_ROUTES.map((route) => ({
   ...(NAV_ICONS[route.path] ?? FALLBACK_ICONS),
 }));
 
-export interface ThemeModeContextValue {
-  readonly mode: ThemeMode;
-  readonly setMode: (mode: ThemeMode) => void;
-}
-
-export const ThemeModeContext = createContext<ThemeModeContextValue>({
-  mode: 'system',
-  setMode: () => undefined,
-});
-
-export function useThemeMode(): ThemeModeContextValue {
-  return useContext(ThemeModeContext);
-}
-
 function navItem(item: NavItem, pathname: string): React.JSX.Element {
   return (
     <SideNavItem
@@ -253,76 +253,93 @@ export function AppShell(): React.JSX.Element {
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
 
   return (
-    <AstryxAppShell
-      height="fill"
-      contentPadding={0}
-      variant="section"
-      sideNav={
-        <SideNav
-          header={
-            <VStack gap={0}>
-              <TitleBarInset height={inset} />
-              <SideNavHeading
-                icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
-                heading="InvoiceApp"
-                headingHref="#/invoices"
-              />
-            </VStack>
-          }
-          footer={
-            <VStack gap={0}>
-              <Divider />
-              {footerItems.map((item) => navItem(item, pathname))}
-            </VStack>
-          }
-          collapsible
-          resizable={{
-            defaultWidth: SIDE_NAV_WIDTH.default,
-            minWidth: SIDE_NAV_WIDTH.min,
-            maxWidth: SIDE_NAV_WIDTH.max,
-            autoSaveId: SIDE_NAV_WIDTH_STORAGE_ID,
-          }}
-        >
-          {NAV_GROUPS.map((group) => (
-            <SideNavSection key={group} title={group}>
-              {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
-                navItem(item, pathname),
-              )}
-            </SideNavSection>
-          ))}
-        </SideNav>
-      }
-    >
-      <VStack gap={0} height="100%">
-        <TitleBarInset height={inset} />
-        <StackItem size="static">
-          <HStack
-            as="header"
-            className="app-drag-region"
-            gap={4}
-            paddingInline={5}
-            paddingBlock={2}
-            align="center"
+    /*
+      One assistant, two surfaces. The provider sits above `<Outlet/>` so the
+      `/assistant` page and the floating dock read the *same* state — same
+      threads, same transcript, same stream. Two `useAssistant()` calls would be
+      two chats that disagree about history.
+    */
+    <AssistantProvider>
+      <AstryxAppShell
+        height="fill"
+        contentPadding={0}
+        variant="section"
+        sideNav={
+          <SideNav
+            header={
+              <VStack gap={0}>
+                <TitleBarInset height={inset} />
+                <SideNavHeading
+                  icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
+                  heading="InvoiceApp"
+                  headingHref="#/invoices"
+                />
+              </VStack>
+            }
+            footer={
+              <VStack gap={0}>
+                <Divider />
+                {footerItems.map((item) => navItem(item, pathname))}
+              </VStack>
+            }
+            collapsible
+            resizable={{
+              defaultWidth: SIDE_NAV_WIDTH.default,
+              minWidth: SIDE_NAV_WIDTH.min,
+              maxWidth: SIDE_NAV_WIDTH.max,
+              autoSaveId: SIDE_NAV_WIDTH_STORAGE_ID,
+            }}
           >
-            <StackItem size="fill">
-              {trail.length === 0 ? null : (
-                <Breadcrumbs variant="supporting">
-                  {trail.map((crumb) => (
-                    <BreadcrumbItem key={crumb.label} href={crumb.href} isCurrent={crumb.isCurrent}>
-                      {crumb.label}
-                    </BreadcrumbItem>
-                  ))}
-                </Breadcrumbs>
-              )}
-            </StackItem>
-            <ThemeControl />
-          </HStack>
-          <Divider />
-        </StackItem>
-        <StackItem size="fill">
-          <Outlet />
-        </StackItem>
-      </VStack>
-    </AstryxAppShell>
+            {NAV_GROUPS.map((group) => (
+              <SideNavSection key={group} title={group}>
+                {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
+                  navItem(item, pathname),
+                )}
+              </SideNavSection>
+            ))}
+          </SideNav>
+        }
+      >
+        <VStack gap={0} height="100%">
+          <TitleBarInset height={inset} />
+          <StackItem size="static">
+            <HStack
+              as="header"
+              className="app-drag-region"
+              gap={4}
+              paddingInline={5}
+              paddingBlock={2}
+              align="center"
+            >
+              <StackItem size="fill">
+                {trail.length === 0 ? null : (
+                  <Breadcrumbs variant="supporting">
+                    {trail.map((crumb) => (
+                      <BreadcrumbItem key={crumb.label} href={crumb.href} isCurrent={crumb.isCurrent}>
+                        {crumb.label}
+                      </BreadcrumbItem>
+                    ))}
+                  </Breadcrumbs>
+                )}
+              </StackItem>
+              <ThemeControl />
+            </HStack>
+            <Divider />
+          </StackItem>
+          <StackItem size="fill">
+            <Outlet />
+          </StackItem>
+          {/*
+            Deliberately a sibling of the content outlet and *outside* both
+            `.app-drag-region` bands above it. An element inside a drag region
+            stops receiving clicks unless it appears in the `:where(...)` opt-out
+            list in `styles/global.css`; the launcher is a fixed-position element
+            in the bottom-right corner, nowhere near the draggable top bands, so
+            it never has to opt back out.
+          */}
+          {isDockVisible(pathname) ? <AssistantDock /> : null}
+        </VStack>
+      </AstryxAppShell>
+    </AssistantProvider>
   );
 }

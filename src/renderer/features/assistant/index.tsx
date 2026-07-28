@@ -37,15 +37,37 @@ import { Text } from '@astryxdesign/core/Text';
 import type { ChatMessage } from '../../../shared/types';
 import { Page, PageHeader } from '../../ui/Page';
 import { describeSmokeTest, readSmokeTest } from '../models/llmExtra';
+import { availabilityCopy } from './availability';
 import { hasTranscriptContent, visibleMessages } from './transcript';
-import { parseToolCalls, useAssistant, type ToolCallRecord } from './useAssistant';
+import {
+  parseToolCalls,
+  useAssistantContext,
+  type AssistantState,
+  type ToolCallRecord,
+} from './useAssistant';
 
 const DESCRIPTION =
   'Reads your invoices and clients locally. Any change it wants to make needs your approval.';
 
 export function AssistantPage(): React.JSX.Element {
-  const assistant = useAssistant();
+  const assistant = useAssistantContext();
   const [draft, setDraft] = useState('');
+
+  /*
+    Checked before the spinner: `availability` puts desktop-only above loading,
+    because once the host has refused `llm:*` no amount of waiting produces a
+    model. In the browser preview this is the whole page — not an error, just
+    a capability this platform does not have.
+  */
+  if (assistant.availability === 'desktop-only') {
+    const copy = availabilityCopy('desktop-only');
+    return (
+      <Page>
+        <PageHeader title="Assistant" description={DESCRIPTION} />
+        <EmptyState title={copy.title} description={copy.description} headingLevel={2} />
+      </Page>
+    );
+  }
 
   if (assistant.isLoading) {
     return (
@@ -55,13 +77,14 @@ export function AssistantPage(): React.JSX.Element {
     );
   }
 
-  if (assistant.readyModels.length === 0) {
+  if (assistant.availability === 'no-model') {
+    const copy = availabilityCopy('no-model');
     return (
       <Page>
         <PageHeader title="Assistant" description={DESCRIPTION} />
         <EmptyState
-          title="No model downloaded yet"
-          description="The assistant runs a local model on this machine. Download one to get started."
+          title={copy.title}
+          description={copy.description}
           headingLevel={2}
           actions={
             <RouterLink to="/models">
@@ -167,7 +190,7 @@ export function AssistantPage(): React.JSX.Element {
                   value={draft}
                   onChange={setDraft}
                   placeholder="Ask about invoices, clients, or totals…"
-                  isDisabled={!hasModel}
+                  isDisabled={!hasModel || assistant.isStreaming}
                   isStopShown={assistant.isStreaming}
                   onStop={() => {
                     void assistant.stop();
@@ -191,7 +214,7 @@ export function AssistantPage(): React.JSX.Element {
 // ---------------------------------------------------------------------------
 
 interface AssistantProps {
-  readonly assistant: ReturnType<typeof useAssistant>;
+  readonly assistant: AssistantState;
 }
 
 function ThreadSidebar({ assistant }: AssistantProps): React.JSX.Element {
@@ -254,7 +277,7 @@ function MessageRow({
   assistant,
 }: {
   readonly message: ChatMessage;
-  readonly assistant: ReturnType<typeof useAssistant>;
+  readonly assistant: AssistantState;
 }): React.JSX.Element {
   const calls = parseToolCalls(message);
 
