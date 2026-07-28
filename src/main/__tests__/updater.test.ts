@@ -122,6 +122,20 @@ vi.mock('electron-updater', () => ({ autoUpdater: h.autoUpdater }));
 // Harness
 // ---------------------------------------------------------------------------
 
+/**
+ * The only four sentences a failure is allowed to put in front of a user, plus
+ * the fallback. Spelled out here rather than imported so that changing the copy
+ * in the module is a deliberate act with a test to match, not a silent edit.
+ */
+const OFFLINE =
+  'InvoiceApp could not reach the update server. Check your internet connection and try again.';
+const BUSY = 'The update server is busy right now. Please try again in a few minutes.';
+const SIGNATURE =
+  'The update could not be verified, so it was not installed. Please try again, or download the latest version from the InvoiceApp website.';
+const DISK_FULL =
+  'There is not enough free disk space for the update. Free up some space and try again.';
+const UNKNOWN = 'The update could not be completed. Please try again later.';
+
 const realPlatform = process.platform;
 
 function setPlatform(value: string): void {
@@ -385,7 +399,7 @@ describe('failures', () => {
 
     const state = await updater.checkForUpdates();
     expect(state.phase).toBe('error');
-    expect(state.message).toBe('net::ERR_INTERNET_DISCONNECTED');
+    expect(state.message).toBe(OFFLINE);
   });
 
   it('turns an emitted error into the error phase', async () => {
@@ -395,7 +409,7 @@ describe('failures', () => {
     h.emit('error', new Error('Cannot find latest-mac.yml in the latest release'));
     const state = updater.getUpdateState();
     expect(state.phase).toBe('error');
-    expect(state.message).toContain('latest-mac.yml');
+    expect(state.message).toBe(UNKNOWN);
   });
 
   it('turns a rejected download into the error phase', async () => {
@@ -410,7 +424,7 @@ describe('failures', () => {
     await vi.waitFor(() => {
       expect(updater.getUpdateState().phase).toBe('error');
     });
-    expect(updater.getUpdateState().message).toBe('sha512 checksum mismatch');
+    expect(updater.getUpdateState().message).toBe(SIGNATURE);
   });
 
   it('recovers from an error on the next check', async () => {
@@ -516,6 +530,145 @@ describe('install', () => {
     updater.installUpdate();
     expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
   });
+
+  /**
+   * F1. `quitAndInstall()` returns immediately and the handoff runs on inside
+   * Squirrel — fetching the zip from the proxy server, checking the signature.
+   * When that dies it arrives as an `error` event, never as a throw, so the
+   * synchronous `catch` above is not what releases the one-shot guard. Without a
+   * release here the app is un-installable until it is restarted, however many
+   * times the user downloads again.
+   */
+  it('stays installable when the handoff dies asynchronously', async () => {
+    const updater = await readyToInstall();
+
+    updater.installUpdate();
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
+
+    // Squirrel's own checkForUpdates() giving up on the proxy server.
+    h.emit('error', new Error('Error: Could not get code signature for running application'));
+    expect(updater.getUpdateState().phase).toBe('error');
+
+    // The user does what the UI offers: download again, install again.
+    h.emit('update-downloaded', { version: '2.0.0' });
+    expect(updater.getUpdateState().phase).toBe('downloaded');
+    updater.installUpdate();
+
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * F1, the other side. Releasing on anything looser than "the handoff is dead"
+   * would let a second `quitAndInstall()` race one that is merely slow — a ~200 MB
+   * zip over a local socket is not instant, and nothing is emitted while it works.
+   */
+  it('does not restart a handoff that is still in flight', async () => {
+    const updater = await readyToInstall();
+
+    updater.installUpdate();
+    // No error: the handoff is running. Squirrel re-dispatching `update-downloaded`
+    // must not look like a fresh, installable state either.
+    h.emit('update-downloaded', { version: '2.0.0' });
+    updater.installUpdate();
+    updater.installUpdate();
+
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(1);
+    expect(updater.getUpdateState().phase).toBe('downloaded');
+  });
+
+  it('holds the guard again once a retried handoff is under way', async () => {
+    const updater = await readyToInstall();
+
+    updater.installUpdate();
+    h.emit('error', new Error('ENOTFOUND 127.0.0.1'));
+    h.emit('update-downloaded', { version: '2.0.0' });
+    updater.installUpdate();
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+
+    // The second handoff is now the one in flight, and it gets the same protection.
+    updater.installUpdate();
+    expect(h.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * F2. `src/main/ipc/registry.ts:51-62` refuses to forward the message of an
+ * unplanned error because it may quote SQL, a schema or a path. electron-updater
+ * errors are exactly that kind of error — `MacUpdater.updateDownloaded()` builds
+ * `Cannot pipe "<cache path>": …` out of the user's home directory — and the
+ * renderer renders `message` straight to the screen. So nothing raw crosses, and
+ * the full text lives in the main-process log instead.
+ */
+describe('error messages crossing to the renderer', () => {
+  const PIPE_FAILURE =
+    'Cannot pipe "/Users/alice/Library/Application Support/InvoiceApp/pending/update.zip": Error: EPIPE';
+
+  it('never lets a filesystem path reach the broadcast state', async () => {
+    const window = fakeWindow();
+    h.windows.push(window);
+    const updater = await load();
+    await updater.checkForUpdates();
+
+    h.emit('error', new Error(PIPE_FAILURE));
+
+    const state = updater.getUpdateState();
+    expect(state.message).not.toContain('/Users/alice');
+    expect(state.message).not.toContain('update.zip');
+    expect(state.message).toBe(UNKNOWN);
+
+    // The same text is what every window was handed.
+    const broadcast = window.webContents.send.mock.calls.at(-1);
+    expect(broadcast?.[0]).toBe('updates:state');
+    expect((broadcast?.[1] as { message: string }).message).toBe(UNKNOWN);
+  });
+
+  it('still gives the main-process log the whole error', async () => {
+    const updater = await load();
+    await updater.checkForUpdates();
+
+    const raw = new Error(PIPE_FAILURE);
+    h.emit('error', raw);
+
+    expect(console.error).toHaveBeenCalledWith('[updates] failed:', raw);
+  });
+
+  it.each([
+    ['net::ERR_INTERNET_DISCONNECTED', OFFLINE],
+    ['getaddrinfo EAI_AGAIN github.com', OFFLINE],
+    ['connect ECONNREFUSED 127.0.0.1:52341', OFFLINE],
+    ['Cannot download "https://github.com/…/latest-mac.yml", status 503 Service Unavailable', BUSY],
+    ['HTTP 429 too many requests: {"message":"API rate limit exceeded for 203.0.113.7"}', BUSY],
+    ['sha512 checksum mismatch, expected abc, got def', SIGNATURE],
+    ['Code signature at URL file:///… did not pass validation', SIGNATURE],
+    [PIPE_FAILURE, UNKNOWN],
+    ['Cannot find latest-mac.yml in the latest release', UNKNOWN],
+    ['', UNKNOWN],
+  ])('classifies %j as a message written for a person', async (raw, expected) => {
+    const updater = await load();
+    await updater.checkForUpdates();
+
+    h.emit('error', new Error(raw));
+    expect(updater.getUpdateState().message).toBe(expected);
+  });
+
+  it('reads the error code as well as the message', async () => {
+    const updater = await load();
+    await updater.checkForUpdates();
+
+    const full = Object.assign(new Error('Cannot write to /Users/alice/Library/Caches/x.zip'), {
+      code: 'ENOSPC',
+    });
+    h.emit('error', full);
+
+    expect(updater.getUpdateState().message).toBe(DISK_FULL);
+  });
+
+  it('leaves the unsupported copy alone, which is written for a person already', async () => {
+    h.app.isPackaged = false;
+    const updater = await load();
+
+    expect(updater.getUpdateState().message).toMatch(/development run/i);
+  });
 });
 
 describe('scheduling', () => {
@@ -579,10 +732,7 @@ describe('scheduling', () => {
     updater.startUpdater();
     await vi.advanceTimersByTimeAsync(updater.STARTUP_CHECK_DELAY_MS);
 
-    expect(updater.getUpdateState()).toMatchObject({
-      phase: 'error',
-      message: 'EAI_AGAIN api.github.com',
-    });
+    expect(updater.getUpdateState()).toMatchObject({ phase: 'error', message: OFFLINE });
   });
 });
 

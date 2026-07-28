@@ -44,8 +44,26 @@ export const STARTUP_CHECK_DELAY_MS = 10_000;
  */
 export const BACKGROUND_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
-/** Shown when a failure carries no message of its own. */
-const GENERIC_FAILURE = 'The update could not be completed. Please try again later.';
+/**
+ * Everything the renderer is ever allowed to be told about a failure.
+ *
+ * `src/main/ipc/registry.ts:51-62` draws this line for every other channel: a
+ * message only reaches the renderer if it was written for a person. An
+ * electron-updater message was not — it interpolates the cache path (`Cannot
+ * pipe "/Users/alice/Library/…"`), the feed URL, and whole response bodies. So
+ * the raw text is classified into one of these and never forwarded; the detail
+ * goes to the main-process log, where debugging wants it anyway.
+ */
+const FAILURE_MESSAGES = {
+  offline: 'InvoiceApp could not reach the update server. Check your internet connection and try again.',
+  busy: 'The update server is busy right now. Please try again in a few minutes.',
+  signature:
+    'The update could not be verified, so it was not installed. Please try again, or download the latest version from the InvoiceApp website.',
+  diskFull: 'There is not enough free disk space for the update. Free up some space and try again.',
+  unknown: 'The update could not be completed. Please try again later.',
+} as const;
+
+type FailureCause = keyof typeof FAILURE_MESSAGES;
 
 /** Notification copy. One line of body: name the version, say where to go. */
 const NOTIFICATION_TITLE = 'Update available';
@@ -144,20 +162,85 @@ function setState(patch: Partial<UpdateState>): UpdateState {
 /**
  * Land any failure in the `error` phase.
  *
- * electron-updater's messages are already written for humans ("Cannot find
- * latest-mac.yml", "net::ERR_INTERNET_DISCONNECTED") and reference only this
- * app's own release feed, so they pass through — capped in length, because a
- * differential-download failure can quote a whole JSON body.
+ * The full error — message, stack, whatever it carries — is logged here and only
+ * here. What crosses to the renderer is one of `FAILURE_MESSAGES`, chosen by
+ * `classify`, because the renderer renders `message` straight to the user and
+ * electron-updater's own text quotes paths, URLs and response bodies.
  */
 function fail(error: unknown): UpdateState {
   console.error('[updates] failed:', error);
   return setState({ phase: 'error', progressPercent: null, message: describe(error) });
 }
 
+/**
+ * Everything `classify` reads. The `code` matters as much as the message:
+ * electron-updater tags its own failures (`ERR_UPDATER_*`, `ERR_CHECKSUM_MISMATCH`)
+ * and Node tags the OS ones (`ENOSPC`, `ENOTFOUND`), and those tags are stable
+ * where the prose around them is not.
+ */
+function signature(error: unknown): string {
+  const parts: string[] = [];
+  if (error instanceof Error) {
+    parts.push(error.message);
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string') parts.push(code);
+  } else {
+    parts.push(String(error));
+  }
+  return parts.join(' ').toLowerCase();
+}
+
+/**
+ * Sort a failure into the handful of things a person can act on.
+ *
+ * Order matters: a rejected signature and a full disk are specific and worth
+ * saying out loud, while "the network is unhappy" is the common case that
+ * everything else falls back through. Anything unrecognised is `unknown` — a
+ * wrong-but-safe guess is worse than an honest generic line.
+ */
+function classify(error: unknown): FailureCause {
+  const text = signature(error);
+  if (text.length === 0) return 'unknown';
+
+  if (
+    /err_updater_invalid_signature|err_checksum_mismatch|checksum mismatch|signature|did not pass validation|code sign/.test(
+      text,
+    )
+  ) {
+    return 'signature';
+  }
+  if (/enospc|no space left|not enough (free )?(disk )?space|disk (is )?full/.test(text)) {
+    return 'diskFull';
+  }
+  if (
+    /err_internet_disconnected|err_name_not_resolved|err_network_changed|err_connection_|err_address_unreachable|enotfound|eai_again|econnrefused|econnreset|etimedout|enetunreach|ehostunreach|network is unreachable|socket hang up/.test(
+      text,
+    )
+  ) {
+    return 'offline';
+  }
+  if (/\b(429|502|503)\b|rate limit|too many requests|service unavailable|bad gateway/.test(text)) {
+    return 'busy';
+  }
+  return 'unknown';
+}
+
 function describe(error: unknown): string {
-  const raw = (error instanceof Error ? error.message : String(error)).trim();
-  if (raw.length === 0) return GENERIC_FAILURE;
-  return raw.length > 300 ? `${raw.slice(0, 299)}…` : raw;
+  return FAILURE_MESSAGES[classify(error)];
+}
+
+/**
+ * Whether an install handoff is outstanding right now.
+ *
+ * Both halves are needed. `installRequested` alone would be released by an error
+ * that has nothing to do with the install; the `downloaded` phase is what says
+ * the install is the only thing this module currently has in flight, because
+ * `checkForUpdates` and `downloadUpdate` both refuse to start from that phase.
+ * Once `fail` has moved the phase to `error` this is false again, so the release
+ * happens once and a genuinely running handoff is never disturbed.
+ */
+function handoffInFlight(): boolean {
+  return installRequested && current().phase === 'downloaded';
 }
 
 /** The contract caps this at 0..100, and electron-updater has been seen to overshoot. */
@@ -298,6 +381,9 @@ function updater(): AppUpdater {
   // the only place that turns such a failure into something visible, and it is
   // never a throw.
   instance.on('error', (error) => {
+    // An error that arrives while a handoff is outstanding is the handoff dying;
+    // see `installUpdate`. Read the guard before `fail` moves the phase.
+    if (handoffInFlight()) installRequested = false;
     fail(error);
   });
 
@@ -440,6 +526,24 @@ export function downloadUpdate(): UpdateState {
  * or `app.exit()` here would either race Squirrel or bypass `before-quit`
  * entirely, skipping the shutdown hooks and leaving the database open. So it
  * delegates and returns, exactly once.
+ *
+ * Exactly once — but not once per process. Step 1 is asynchronous, and on macOS
+ * that is where the real failures live: Squirrel pulling the zip from the proxy
+ * server, or refusing its code signature. Those surface as an `error` event, not
+ * a throw, so the synchronous `catch` below never sees them and a guard released
+ * only there would stay set for the life of the app: check, download and
+ * `downloaded` would all work again while `updates:install` quietly did nothing.
+ *
+ * The `error` handler therefore releases the guard too, under `handoffInFlight()`.
+ * That is narrow on purpose. After `quitAndInstall()` returns, the only
+ * electron-updater work left is `nativeUpdater.checkForUpdates()` and the proxy
+ * server serving it, and the only thing still able to emit `error` is the
+ * `nativeUpdater.on("error", …)` forwarder set up in `MacUpdater`'s constructor —
+ * every other emitter belongs to a check or a download, and this module starts
+ * neither from the `downloaded` phase. So an `error` in that window *is* Squirrel
+ * saying the handoff is dead, and releasing on it cannot let a second
+ * `quitAndInstall()` race a handoff that is still running. A handoff that is
+ * merely slow emits nothing, the guard stays set, and a second press is ignored.
  */
 export function installUpdate(): UpdateState {
   const snapshot = current();
