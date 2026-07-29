@@ -200,6 +200,93 @@ describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
   });
 });
 
+/*
+  The window's own colours, declared as custom properties on the app-shell rather
+  than in `tokens` (defineTheme types that map to Astryx's own closed token set).
+  Asserted here, and asserted *literally*: these are the macOS system colours,
+  and a placeholder cluster in some other palette is a preview of a window that
+  does not exist.
+*/
+describe('window-control and update-pending colours', () => {
+  const windowControls = rule('app-shell', 'base');
+
+  it('paints the three macOS traffic-light colours', () => {
+    expect(windowControls['--color-window-control-close']).toBe('#FF5F57');
+    expect(windowControls['--color-window-control-minimize']).toBe('#FEBC2E');
+    expect(windowControls['--color-window-control-zoom']).toBe('#28C840');
+  });
+
+  it('keeps the light colours mode-independent, because macOS does', () => {
+    // A `light-dark()` pair here would be the mistake: the dots stand in for OS
+    // chrome, which does not follow the app's appearance.
+    for (const name of [
+      '--color-window-control-close',
+      '--color-window-control-minimize',
+      '--color-window-control-zoom',
+    ]) {
+      expect(windowControls[name]).toMatch(/^#[0-9A-F]{6}$/);
+    }
+  });
+
+  it('reaches the stylesheet on the element everything inherits from', () => {
+    // Declared, not merely written: the whole mechanism is inheritance from
+    // `.astryx-app-shell` down to the sidebar's band.
+    const emitted = generateThemeCSS(appTheme).component;
+    const body = emitted.split('.astryx-app-shell {')[1]?.split('}')[0];
+    if (body === undefined) throw new Error('no emitted rule for .astryx-app-shell');
+    for (const name of [
+      '--color-window-control-close',
+      '--color-window-control-minimize',
+      '--color-window-control-zoom',
+      '--color-icon-update-pending',
+    ]) {
+      expect(body).toContain(`${name}:`);
+    }
+  });
+
+  /*
+    The update glyph's blue is non-text ink, so WCAG 1.4.11 applies: 3:1 against
+    the surface behind it. It can land on either end of the panel gradient — the
+    head is `--color-background-surface`, the foot is the window body — so both
+    are measured, in both modes. This is the reason the blue is a light/dark pair
+    rather than one colour: #0064E0 measures 1.94:1 on the dark panel head.
+  */
+  it('keeps the pending blue legible on the panel head and foot, both modes', () => {
+    const AA_NON_TEXT = 3;
+    const [inkLight, inkDark] = splitLightDark(
+      String(windowControls['--color-icon-update-pending']),
+    );
+    const [headLight, headDark] = splitLightDark(token('--color-background-surface'));
+    const [footLight, footDark] = splitLightDark(token('--color-background-body'));
+    for (const [ink, surface] of [
+      [inkLight, headLight],
+      [inkLight, footLight],
+      [inkDark, headDark],
+      [inkDark, footDark],
+    ] as const) {
+      expect(contrastRatio(ink, surface)).toBeGreaterThanOrEqual(AA_NON_TEXT);
+    }
+  });
+
+  it('is a blue, not neutral’s monochrome accent ink', () => {
+    // The trap this pins: `<Icon color="accent">` resolves to
+    // --color-icon-accent, which in this theme is light-dark(#262626, #ebebeb).
+    // A "blue" equal to that token is the bug, not the fix.
+    const [inkLight, inkDark] = splitLightDark(
+      String(windowControls['--color-icon-update-pending']),
+    );
+    for (const ink of [inkLight, inkDark]) {
+      const hex = /^#([0-9a-f]{6})$/i.exec(ink)?.[1] ?? '';
+      const [red, green, blue] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+      expect(blue).toBeGreaterThan((red ?? 0) + 60);
+      expect(blue).toBeGreaterThan((green ?? 0) + 60);
+    }
+    expect(String(windowControls['--color-icon-update-pending'])).not.toBe(
+      token('--color-icon-accent'),
+    );
+  });
+});
+
 const PANEL_GRADIENT =
   'linear-gradient(180deg, ' +
   'var(--color-background-surface) 0%, ' +
@@ -309,6 +396,10 @@ describe('the panel carries the gradient and the window does not', () => {
     expect(rule('app-shell', 'base')).toEqual({
       backgroundColor: 'var(--color-background-body)',
       backgroundImage: 'none',
+      '--color-window-control-close': '#FF5F57',
+      '--color-window-control-minimize': '#FEBC2E',
+      '--color-window-control-zoom': '#28C840',
+      '--color-icon-update-pending': 'light-dark(#0064E0, #2694FE)',
     });
   });
 

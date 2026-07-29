@@ -8,15 +8,19 @@ import {
   collapsedRailWidth,
   DEFAULT_COLLAPSED_RAIL_PX,
   DEFAULT_COLLAPSED_RAIL_WIDTH,
+  hasPlaceholderWindowControls,
   isSectionSelected,
   NO_TITLE_BAR_INSET,
   OVERLAY_COLLAPSED_RAIL_WIDTH,
   OVERLAY_TITLE_BAR_INSET,
+  PANEL_BORDER_PX,
   PANEL_INSET,
   PANEL_INSET_PX,
   PANEL_INSET_TOTAL,
   PANEL_INSET_TOTAL_PX,
+  placeholderClusterPx,
   readDesktopInfo,
+  reservesTrafficLightBand,
   SECTION_ROUTES,
   RESIZABLE_STORAGE_PREFIX,
   SIDE_NAV_CONTROL_ROW_MIN_HEIGHT,
@@ -26,13 +30,26 @@ import {
   SIDE_NAV_WIDTH_STORAGE_KEY,
   sideNavControlRowHeight,
   sideNavPanelGeometry,
+  SIDE_NAV_HEADER_PADDING_INLINE_PX,
   titleBarInset,
+  TRAFFIC_LIGHT_DOT_COUNT,
+  TRAFFIC_LIGHT_DOT_GAP_PX,
+  TRAFFIC_LIGHT_DOT_SIZE_PX,
   TRAFFIC_LIGHT_ZONE_END_PX,
   wasSideNavCollapsed,
   WEB_DESKTOP_INFO,
 } from '../chrome';
 
 const DARWIN = { platform: 'darwin', hasOverlayWindowControls: true } as const;
+const WIN32 = { platform: 'win32', hasOverlayWindowControls: false } as const;
+const LINUX = { platform: 'linux', hasOverlayWindowControls: false } as const;
+
+/**
+ * The two platforms the OS gives a real title bar to (`src/main/window.ts` only
+ * applies `hiddenInset` on darwin). They are the *only* two that reserve
+ * nothing: darwin has real lights, and web paints placeholders for them.
+ */
+const REAL_TITLE_BAR = [WIN32, LINUX] as const;
 
 // Same reasoning as APPROVED_OVERLAY_INSET below: asserting the fallback
 // against WEB_DESKTOP_INFO only proves readDesktopInfo returns whatever that
@@ -89,6 +106,62 @@ describe('readDesktopInfo', () => {
 const APPROVED_OVERLAY_INSET = 'var(--spacing-11)';
 const APPROVED_NO_INSET = 'var(--spacing-0)';
 
+describe('hasPlaceholderWindowControls', () => {
+  it('paints fake lights in the browser preview and nowhere else', () => {
+    expect(hasPlaceholderWindowControls(WEB_DESKTOP_INFO)).toBe(true);
+    expect(hasPlaceholderWindowControls(DARWIN)).toBe(false);
+    // The bug this pins: gating on `!hasOverlayWindowControls` instead of on the
+    // platform. win32 and linux also have no overlay controls — they have a real
+    // OS title bar — so they would get three macOS dots under a Windows frame.
+    expect(hasPlaceholderWindowControls(WIN32)).toBe(false);
+    expect(hasPlaceholderWindowControls(LINUX)).toBe(false);
+  });
+
+  it('paints them even when the web info claims overlay controls', () => {
+    // Only the platform decides. `hasOverlayWindowControls` is about who paints
+    // the *real* lights, and in a browser nobody does.
+    expect(hasPlaceholderWindowControls({ platform: 'web', hasOverlayWindowControls: true })).toBe(
+      true,
+    );
+  });
+});
+
+describe('reservesTrafficLightBand', () => {
+  it('is true wherever a cluster is painted, by macOS or by us', () => {
+    expect(reservesTrafficLightBand(DARWIN)).toBe(true);
+    expect(reservesTrafficLightBand(WEB_DESKTOP_INFO)).toBe(true);
+  });
+
+  it('is false where the OS draws its own title bar', () => {
+    for (const info of REAL_TITLE_BAR) expect(reservesTrafficLightBand(info)).toBe(false);
+  });
+});
+
+describe('placeholderClusterPx', () => {
+  // The whole point of the placeholders: they have to land where macOS's own
+  // lights land, or the preview is a picture of a layout that never ships.
+  it('starts near the real cluster and ends inside its zone', () => {
+    const { startPx, endPx } = placeholderClusterPx();
+    expect(startPx).toBe(PANEL_INSET_PX + PANEL_BORDER_PX + SIDE_NAV_HEADER_PADDING_INLINE_PX);
+    expect(startPx).toBeGreaterThanOrEqual(8);
+    expect(startPx).toBeLessThanOrEqual(20);
+    expect(endPx).toBeLessThanOrEqual(TRAFFIC_LIGHT_ZONE_END_PX);
+  });
+
+  it('is three 12px dots with 8px gaps, matching macOS', () => {
+    expect(TRAFFIC_LIGHT_DOT_COUNT).toBe(3);
+    expect(TRAFFIC_LIGHT_DOT_SIZE_PX).toBe(12);
+    expect(TRAFFIC_LIGHT_DOT_GAP_PX).toBe(8);
+    const { startPx, endPx } = placeholderClusterPx();
+    expect(endPx - startPx).toBe(3 * 12 + 2 * 8);
+  });
+
+  // The cluster sits inside the collapsed rail, not merely inside the window.
+  it('fits inside the collapsed rail', () => {
+    expect(placeholderClusterPx().endPx).toBeLessThan(collapsedRailInlineEndPx(WEB_DESKTOP_INFO));
+  });
+});
+
 describe('titleBarInset', () => {
   it('reserves the approved 44px band when the OS overlays window controls', () => {
     expect(titleBarInset({ platform: 'darwin', hasOverlayWindowControls: true })).toBe(
@@ -96,14 +169,15 @@ describe('titleBarInset', () => {
     );
   });
 
-  it('reserves nothing on web, Windows and Linux', () => {
-    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(APPROVED_NO_INSET);
-    expect(titleBarInset({ platform: 'win32', hasOverlayWindowControls: false })).toBe(
-      APPROVED_NO_INSET,
-    );
-    expect(titleBarInset({ platform: 'linux', hasOverlayWindowControls: false })).toBe(
-      APPROVED_NO_INSET,
-    );
+  // The band is where the lights go, and on web *we* put lights there. Reserving
+  // nothing would paint 12px dots into a 0px band.
+  it('reserves the same band on web, so the preview mirrors macOS', () => {
+    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(APPROVED_OVERLAY_INSET);
+    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(titleBarInset(DARWIN));
+  });
+
+  it('reserves nothing on Windows and Linux, which have a real title bar', () => {
+    for (const info of REAL_TITLE_BAR) expect(titleBarInset(info)).toBe(APPROVED_NO_INSET);
   });
 
   it('exports the approved spacing tokens, never raw pixels', () => {
@@ -167,14 +241,19 @@ describe('collapsedRailWidth', () => {
     expect(resolvePx(width)).toBeGreaterThanOrEqual(88);
   });
 
-  it('keeps the design system width where there are no overlay controls', () => {
-    expect(collapsedRailWidth(WEB_DESKTOP_INFO)).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
-    expect(collapsedRailWidth({ platform: 'win32', hasOverlayWindowControls: false })).toBe(
-      DEFAULT_COLLAPSED_RAIL_WIDTH,
+  // A 48px rail with a 12px cluster in it is the bug: the dots would straddle
+  // the panel's edge in the preview exactly as they used to on macOS.
+  it('widens the same rail on web, so the placeholders have the room macOS needs', () => {
+    expect(collapsedRailWidth(WEB_DESKTOP_INFO)).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
+    expect(resolvePx(collapsedRailWidth(WEB_DESKTOP_INFO))).toBe(
+      resolvePx(collapsedRailWidth(DARWIN)),
     );
-    expect(collapsedRailWidth({ platform: 'linux', hasOverlayWindowControls: false })).toBe(
-      DEFAULT_COLLAPSED_RAIL_WIDTH,
-    );
+  });
+
+  it('keeps the design system width where the OS draws its own title bar', () => {
+    for (const info of REAL_TITLE_BAR) {
+      expect(collapsedRailWidth(info)).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+    }
   });
 
   it('is built from spacing tokens, never raw pixels', () => {
@@ -278,7 +357,8 @@ describe('sideNavPanelGeometry', () => {
 
   it('keeps the collapsed-rail floor as the only width lever', () => {
     expect(sideNavPanelGeometry(DARWIN).minInlineSize).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
-    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).minInlineSize).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).minInlineSize).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
+    expect(sideNavPanelGeometry(WIN32).minInlineSize).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
   });
 
   // Radius, background, shadow and border belong to the theme. An inline style
@@ -314,10 +394,15 @@ describe('collapsedRailInlineEndPx', () => {
     expect(TRAFFIC_LIGHT_ZONE_END_PX).toBe(70);
   });
 
-  it('uses the design system rail where there are no overlay controls', () => {
-    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBe(
-      PANEL_INSET_PX + DEFAULT_COLLAPSED_RAIL_PX,
-    );
+  it('clears the placeholder cluster in the browser preview too', () => {
+    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBe(PANEL_INSET_PX + COLLAPSED_RAIL_MIN_PX);
+    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBeGreaterThan(TRAFFIC_LIGHT_ZONE_END_PX);
+  });
+
+  it('uses the design system rail where the OS draws its own title bar', () => {
+    for (const info of REAL_TITLE_BAR) {
+      expect(collapsedRailInlineEndPx(info)).toBe(PANEL_INSET_PX + DEFAULT_COLLAPSED_RAIL_PX);
+    }
     expect(resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH)).toBe(DEFAULT_COLLAPSED_RAIL_PX);
   });
 });
@@ -330,14 +415,18 @@ describe('sideNavControlRowHeight', () => {
     expect(resolvePx(sideNavControlRowHeight(DARWIN))).toBe(44);
   });
 
-  // The bug this pins: `titleBarInset` is 0 off macOS. Reuse it for the control
-  // row and the row collapses to nothing, hiding the only collapse toggle.
+  // The third of the three geometry values the preview has to agree with darwin
+  // on: a 12px cluster in a 36px band is not the 44px band that ships.
+  it('gives web the same band as macOS, not the shorter fallback', () => {
+    expect(sideNavControlRowHeight(WEB_DESKTOP_INFO)).toBe(sideNavControlRowHeight(DARWIN));
+    expect(resolvePx(sideNavControlRowHeight(WEB_DESKTOP_INFO))).toBe(44);
+  });
+
+  // The bug this pins: `titleBarInset` is 0 where the OS draws its own title
+  // bar. Reuse it for the control row and the row collapses to nothing, hiding
+  // the only collapse toggle.
   it('never collapses to zero where there is no title-bar band', () => {
-    for (const info of [
-      WEB_DESKTOP_INFO,
-      { platform: 'win32', hasOverlayWindowControls: false } as const,
-      { platform: 'linux', hasOverlayWindowControls: false } as const,
-    ]) {
+    for (const info of REAL_TITLE_BAR) {
       expect(titleBarInset(info)).toBe(NO_TITLE_BAR_INSET);
       expect(sideNavControlRowHeight(info)).not.toBe(NO_TITLE_BAR_INSET);
       expect(resolvePx(sideNavControlRowHeight(info))).toBeGreaterThanOrEqual(
@@ -400,5 +489,42 @@ describe('AppShell consumes the chrome helpers', () => {
   it('keeps the toggle name fixed and moves its state to aria-expanded', () => {
     expect(source).toMatch(/SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar'/);
     expect(source).toMatch(/aria-expanded=\{!isCollapsed\}/);
+  });
+
+  it('gates the traffic-light placeholders on the platform predicate', () => {
+    // The bug: rendering them unconditionally, or on `!hasOverlayWindowControls`
+    // — which would paint macOS dots under a real Windows title bar.
+    expect(source).toMatch(/hasPlaceholderWindowControls\(desktop\)/);
+    expect(source).not.toMatch(/!\s*desktop\.hasOverlayWindowControls/);
+  });
+
+  it('renders the update control unconditionally', () => {
+    // The regression: `badge.isVisible ? <IconButton .../> : null`, which is how
+    // the top row used to change shape under the user.
+    expect(source).toMatch(/const updateButton = \(\s*<IconButton/);
+    expect(source).not.toMatch(/badge\.isVisible/);
+    // ...and the highlight is the class, not a hardcoded colour.
+    expect(source).toMatch(/badge\.isHighlighted \? 'app-update-button-pending' : undefined/);
+  });
+
+  it('has no footerIcons bar left to hide the top controls in', () => {
+    // The prop, not the word: the comment explaining its removal may stay.
+    expect(source).not.toMatch(/footerIcons=/);
+  });
+
+  it('puts all three controls in the title band, panel toggle last', () => {
+    // Order asserted as one match so a reshuffle fails: update, appearance,
+    // panel toggle, ending at the row's inline end.
+    expect(source).toMatch(
+      /\{updateButton\}\s*<ThemeToggleButton \/>\s*\{collapseToggle\}/,
+    );
+  });
+
+  it('keeps the collapse toggle first in reading order on the collapsed rail', () => {
+    // Collapsed, the rows are below the light band and the way out is topmost.
+    const collapsedRows = source.slice(source.indexOf('{isCollapsed ? ('));
+    expect(collapsedRows.indexOf('{collapseToggle}')).toBeLessThan(
+      collapsedRows.indexOf('{updateButton}'),
+    );
   });
 });

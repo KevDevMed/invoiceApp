@@ -514,6 +514,121 @@ async function setAppearance(page, mode, returnTo = '#/invoices') {
 }
 
 /**
+ * The sidebar's top-row chrome, measured off the real DOM.
+ *
+ * Everything here is geometry and identity, so it is read in one pass:
+ *
+ *   dots       one entry per `.app-window-control-dot`, in DOM order, with the
+ *              painted colour, the box, whether it is inside the sidebar's
+ *              drag-region band, and whether it could take focus or a tooltip
+ *   band       the title band's own box, drag region and aria-hidden state
+ *   bandButtons  the buttons *inside* the band, in DOM order, by accessible
+ *              name, with the computed `-webkit-app-region` each one resolves to
+ *   controls   every one of the three chrome controls wherever it is, so the
+ *              collapsed layout can be checked against the light band
+ *   footer     the interactive elements in the panel's foot — the nearest
+ *              ancestor of the Settings link that is a direct child of the panel
+ *   rail       the panel's box and its scroll overflow
+ *
+ * `.app-side-nav` and `.app-window-control-dot` are app-owned class names (the
+ * shell sets them); everything else is found by role, name or structure.
+ */
+async function sideNavChrome(page) {
+  return page.evaluate(() => {
+    const nav = document.querySelector('.app-side-nav');
+    if (!nav) return null;
+    const box = (element) => {
+      const rect = element.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+    };
+    const band = nav.querySelector('.app-drag-region');
+    const cluster = nav.querySelector('.app-window-controls');
+
+    const dots = [...nav.querySelectorAll('.app-window-control-dot')].map((dot) => ({
+      color: getComputedStyle(dot).backgroundColor,
+      appRegion: getComputedStyle(dot).webkitAppRegion,
+      inBand: band !== null && band.contains(dot),
+      focusable: dot.matches('a, button, input, select, textarea, [tabindex], [role="button"], [role="link"]'),
+      hasTitle: dot.hasAttribute('title'),
+      ...box(dot),
+    }));
+
+    const buttonName = (element) => element.getAttribute('aria-label') ?? element.textContent?.trim() ?? '';
+    const bandButtons =
+      band === null
+        ? []
+        : [...band.querySelectorAll('button')].map((button) => ({
+            name: buttonName(button),
+            appRegion: getComputedStyle(button).webkitAppRegion,
+            ...box(button),
+          }));
+
+    const controls = [...nav.querySelectorAll('button')].map((button) => ({
+      name: buttonName(button),
+      inBand: band !== null && band.contains(button),
+      ...box(button),
+    }));
+
+    // The foot of the panel: the nearest ancestor of the Settings link that is a
+    // direct child of the panel itself. Structural, so no design-system class
+    // name is a contract here.
+    const settings = [...nav.querySelectorAll('a')].find((link) => buttonName(link) === 'Settings') ?? null;
+    let footerRoot = settings;
+    while (footerRoot !== null && footerRoot.parentElement !== nav) footerRoot = footerRoot.parentElement;
+    const footer =
+      footerRoot === null
+        ? null
+        : [...footerRoot.querySelectorAll('a, button, input, select, textarea, [tabindex], [role="button"]')].map(
+            (element) => ({ tag: element.tagName.toLowerCase(), name: buttonName(element) }),
+          );
+
+    return {
+      dots,
+      cluster: cluster === null ? null : { ariaHidden: cluster.getAttribute('aria-hidden'), ...box(cluster) },
+      band:
+        band === null
+          ? null
+          : { appRegion: getComputedStyle(band).webkitAppRegion, ariaHidden: band.getAttribute('aria-hidden'), ...box(band) },
+      bandButtons,
+      controls,
+      footer,
+      rail: { ...box(nav), scrollWidth: nav.scrollWidth, clientWidth: nav.clientWidth },
+    };
+  });
+}
+
+/** Computed colour of the sidebar's update control, and its accessible name. */
+async function updateControl(page) {
+  return page.evaluate(() => {
+    const nav = document.querySelector('.app-side-nav');
+    const button = [...(nav?.querySelectorAll('button') ?? [])].find((element) => {
+      const name = element.getAttribute('aria-label') ?? '';
+      return !/sidebar|theme/i.test(name);
+    });
+    if (!button) return null;
+    const glyph = button.querySelector('svg');
+    return {
+      name: button.getAttribute('aria-label'),
+      // Icon's colour is `inherit`, so the button's `color` is the glyph's ink.
+      color: getComputedStyle(button).color,
+      glyphColor: glyph === null ? null : getComputedStyle(glyph).color,
+      // The declared token, inherited from the app-shell. Not resolved —
+      // `light-dark()` is only resolved on real properties — so it is reported
+      // for the failure message rather than compared against a computed rgb.
+      pendingToken: getComputedStyle(button).getPropertyValue('--color-icon-update-pending').trim(),
+    };
+  });
+}
+
+/** Is a computed `rgb(...)` colour recognisably blue rather than a grey ink? */
+function isBlue(color) {
+  const parts = (color.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+  if (parts.length < 3) return false;
+  const [red, green, blue] = parts;
+  return blue > red + 60 && blue > green + 60;
+}
+
+/**
  * Where the gradient is painted, as two independent readings.
  *
  * The design's whole claim is a *contrast*: the panel carries a vertical wash
@@ -932,7 +1047,7 @@ async function main() {
     await setAppearance(page, 'Light');
     const darkToggle = page.getByRole('button', { name: 'Switch to dark theme' });
     const toggleFound = checkTrue(
-      'sidebar footer offers a "Switch to dark theme" control',
+      'sidebar offers a "Switch to dark theme" control',
       (await darkToggle.count()) > 0,
       `buttons named "Switch to dark theme": ${await darkToggle.count()}`,
     );
@@ -986,8 +1101,267 @@ async function main() {
     fail('sidebar pill panel section did not complete', String(error));
   }
 
+  // --- Sidebar top-row chrome ----------------------------------------------
+  // The band at the head of the panel: three traffic-light placeholders at its
+  // start (web only — macOS paints real ones and this build must mirror their
+  // geometry, not draw over them), and the update / appearance / panel-toggle
+  // glyphs at its end. Collapsed, the same three controls move *below* the
+  // reserved light band, because an 88px rail has no room beside the lights.
+  console.log('\nSidebar top-row chrome');
+  try {
+    await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+
+    const expandedChrome = await sideNavChrome(page);
+    const dots = expandedChrome?.dots ?? [];
+    check('web build paints exactly three window-control placeholders', dots.length, 3);
+    checkTrue(
+      'placeholders are the macOS palette, in macOS order',
+      dots.map((dot) => dot.color).join(' ') ===
+        'rgb(255, 95, 87) rgb(254, 188, 46) rgb(40, 200, 64)',
+      dots.map((dot) => dot.color).join(' ') || 'no dots found',
+    );
+    checkTrue(
+      'placeholders are 12px circles, 8px apart',
+      dots.length === 3 &&
+        dots.every((dot) => Math.abs(dot.width - 12) <= 0.5 && Math.abs(dot.height - 12) <= 0.5) &&
+        Math.abs(dots[1].left - dots[0].right - 8) <= 0.5 &&
+        Math.abs(dots[2].left - dots[1].right - 8) <= 0.5,
+      dots.map((dot) => `${dot.left.toFixed(1)}-${dot.right.toFixed(1)}`).join(' '),
+    );
+    // The whole reason the placeholders exist: they have to occupy the window
+    // corner macOS occupies (x 13-70), inside the sidebar's own drag band.
+    checkTrue(
+      'placeholder cluster sits where the macOS lights do',
+      dots.length === 3 && dots[0].left >= 8 && dots[0].left <= 20 && dots[2].right <= 70,
+      dots.length === 3
+        ? `cluster: ${dots[0].left.toFixed(1)} to ${dots[2].right.toFixed(1)} (want left 8-20, right <= 70)`
+        : 'no cluster measured',
+    );
+    checkTrue(
+      'placeholders are inside the sidebar title band',
+      dots.length === 3 && dots.every((dot) => dot.inBand),
+      `in band: ${dots.map((dot) => dot.inBand).join(',')}`,
+    );
+    // Decoration standing in for OS chrome: not a focus stop, no tooltip, hidden
+    // from assistive tech, and *inside* the drag region so the corner still
+    // drags. `drag` on the band, `none` on the dots is what the last two mean.
+    checkTrue(
+      'placeholders are inert decoration',
+      dots.length === 3 &&
+        dots.every((dot) => !dot.focusable && !dot.hasTitle) &&
+        expandedChrome?.cluster?.ariaHidden === 'true',
+      `focusable: ${dots.map((dot) => dot.focusable).join(',')}, titles: ${dots.map((dot) => dot.hasTitle).join(',')}, cluster aria-hidden: ${expandedChrome?.cluster?.ariaHidden}`,
+    );
+    checkTrue(
+      'the band drags and the dots do not carve a hole in it',
+      expandedChrome?.band?.appRegion === 'drag' && dots.every((dot) => dot.appRegion === 'none'),
+      `band: ${expandedChrome?.band?.appRegion}, dots: ${dots.map((dot) => dot.appRegion).join(',')}`,
+    );
+
+    // Expanded: all three controls in the band, in this DOM order, and every one
+    // of them opted out of the drag region or it would stop receiving clicks.
+    const bandNames = (expandedChrome?.bandButtons ?? []).map((button) => button.name);
+    checkTrue(
+      'expanded band holds update, appearance and panel toggle in that order',
+      bandNames.length === 3 &&
+        /update/i.test(bandNames[0]) &&
+        /^Switch to (dark|light) theme$/.test(bandNames[1]) &&
+        bandNames[2] === 'Toggle sidebar',
+      `band buttons: ${JSON.stringify(bandNames)}`,
+    );
+    checkTrue(
+      'every band control opts out of the drag region',
+      (expandedChrome?.bandButtons ?? []).length === 3 &&
+        expandedChrome.bandButtons.every((button) => button.appRegion === 'no-drag'),
+      (expandedChrome?.bandButtons ?? []).map((button) => `${button.name}: ${button.appRegion}`).join(', '),
+    );
+    // ...and the panel's foot is back to one nav link and nothing else.
+    checkTrue(
+      'panel foot holds the Settings link and nothing else interactive',
+      expandedChrome?.footer?.length === 1 &&
+        expandedChrome.footer[0].name === 'Settings' &&
+        expandedChrome.footer[0].tag === 'a',
+      JSON.stringify(expandedChrome?.footer),
+    );
+
+    // Collapsed: 88px rail, lights own x 13-70 of it, so the controls go under
+    // the band. All three still present, none of them overlapping a dot.
+    const collapseToggle = page.getByRole('button', { name: 'Toggle sidebar' });
+    await collapseToggle.first().click();
+    await page.waitForTimeout(600);
+    const collapsedChrome = await sideNavChrome(page);
+    const collapsedControls = collapsedChrome?.controls ?? [];
+    const named = (pattern) => collapsedControls.filter((control) => pattern.test(control.name));
+    checkTrue(
+      'collapsed rail keeps all three controls',
+      named(/update/i).length === 1 &&
+        named(/^Switch to (dark|light) theme$/).length === 1 &&
+        named(/^Toggle sidebar$/).length === 1,
+      collapsedControls.map((control) => control.name).join(', ') || 'no controls found',
+    );
+    const bandBottom = collapsedChrome?.band?.bottom ?? Number.NaN;
+    checkTrue(
+      'collapsed controls sit below the reserved light band',
+      collapsedControls.length > 0 && collapsedControls.every((control) => control.top > bandBottom),
+      `band bottom: ${bandBottom}, control tops: ${collapsedControls.map((control) => control.top.toFixed(1)).join(',')}`,
+    );
+    const collapsedDots = collapsedChrome?.dots ?? [];
+    const overlaps = (a, b) =>
+      a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    checkTrue(
+      'no collapsed control overlaps the placeholder cluster',
+      collapsedDots.length === 3 &&
+        collapsedControls.every((control) => collapsedDots.every((dot) => !overlaps(control, dot))),
+      `dots y: ${collapsedDots.map((dot) => `${dot.top}-${dot.bottom}`).join(',')}, controls y: ${collapsedControls
+        .map((control) => `${control.top}-${control.bottom}`)
+        .join(',')}`,
+    );
+    // The rail may not widen past 88px + the panel's 8px inset, and it may not
+    // grow a horizontal scroll range doing it.
+    checkTrue(
+      'collapsed rail ends within 96px of the window edge',
+      (collapsedChrome?.rail.right ?? Number.NaN) <= 96,
+      `rail: ${collapsedChrome?.rail.left.toFixed(1)} to ${collapsedChrome?.rail.right.toFixed(1)}`,
+    );
+    checkTrue(
+      'collapsed rail has no horizontal scroll range',
+      collapsedChrome?.rail.scrollWidth === collapsedChrome?.rail.clientWidth,
+      `scrollWidth: ${collapsedChrome?.rail.scrollWidth}, clientWidth: ${collapsedChrome?.rail.clientWidth}`,
+    );
+    checkTrue(
+      'expanded rail has no horizontal scroll range either',
+      expandedChrome?.rail.scrollWidth === expandedChrome?.rail.clientWidth,
+      `scrollWidth: ${expandedChrome?.rail.scrollWidth}, clientWidth: ${expandedChrome?.rail.clientWidth}`,
+    );
+    await shoot(page, 'sidebar-chrome-collapsed-light');
+    await collapseToggle.first().click();
+    await page.waitForTimeout(600);
+    await shoot(page, 'sidebar-chrome-expanded-light');
+
+    // Both modes, both states — the dots and the glyphs have to read on the
+    // panel's head in dark mode too.
+    await setAppearance(page, 'Dark');
+    await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+    const darkChrome = await sideNavChrome(page);
+    checkTrue(
+      'placeholders keep the macOS palette in dark mode',
+      (darkChrome?.dots ?? []).map((dot) => dot.color).join(' ') ===
+        'rgb(255, 95, 87) rgb(254, 188, 46) rgb(40, 200, 64)',
+      (darkChrome?.dots ?? []).map((dot) => dot.color).join(' '),
+    );
+    await shoot(page, 'sidebar-chrome-expanded-dark');
+    await collapseToggle.first().click();
+    await page.waitForTimeout(600);
+    const darkCollapsed = await sideNavChrome(page);
+    checkTrue(
+      'collapsed dark rail still ends within 96px and does not scroll sideways',
+      (darkCollapsed?.rail.right ?? Number.NaN) <= 96 &&
+        darkCollapsed?.rail.scrollWidth === darkCollapsed?.rail.clientWidth,
+      `rail right: ${darkCollapsed?.rail.right}, scrollWidth: ${darkCollapsed?.rail.scrollWidth}, clientWidth: ${darkCollapsed?.rail.clientWidth}`,
+    );
+    await shoot(page, 'sidebar-chrome-collapsed-dark');
+    await collapseToggle.first().click();
+    await page.waitForTimeout(600);
+    await setAppearance(page, 'Light');
+    await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+
+    // --- The update control: permanent, and blue only when one is waiting.
+    const resting = await updateControl(page);
+    checkTrue(
+      'update control is always rendered, resting',
+      resting !== null && resting.name === 'Update status unavailable',
+      `name: ${resting?.name ?? 'no control found'}`,
+    );
+    // `error` is this preview's normal phase — every `updates:*` channel answers
+    // 501 — so the resting reading is taken from exactly the state that must not
+    // light up.
+    checkTrue(
+      'resting update control is not blue',
+      resting !== null && !isBlue(resting.color) && !isBlue(resting.glyphColor ?? resting.color),
+      `color: ${resting?.color}, glyph: ${resting?.glyphColor}, token: ${resting?.pendingToken}`,
+    );
+
+    /*
+      The pending state cannot be reached through the preview server: it answers
+      `updates:getState` with 501, which is what makes `error` the resting phase
+      above. So it is driven at the seam the renderer actually reads — a wrapper
+      installed on `window.api` before the app boots, answering that one channel
+      with an `available` snapshot and delegating everything else to the real
+      shim. Nothing in `src/**` is stubbed: the phase comes from main in the real
+      app, and this is the same value arriving on the same channel.
+    */
+    const pendingPage = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    pendingPage.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    await pendingPage.addInitScript((snapshot) => {
+      // `preview/web-shim.ts` installs the object with a `value` descriptor, so
+      // an accessor planted here would simply be replaced. The definition itself
+      // is therefore what gets intercepted — once, for `window.api` only.
+      const defineProperty = Object.defineProperty;
+      Object.defineProperty = function patched(target, property, descriptor) {
+        if (target === window && property === 'api' && descriptor && 'value' in descriptor) {
+          const real = descriptor.value;
+          return defineProperty(target, property, {
+            ...descriptor,
+            value: {
+              ...real,
+              invoke: (channel, payload) =>
+                channel === 'updates:getState'
+                  ? Promise.resolve(snapshot)
+                  : real.invoke(channel, payload),
+              on: (channel, listener) => real.on(channel, listener),
+            },
+          });
+        }
+        return defineProperty(target, property, descriptor);
+      };
+    }, {
+      phase: 'available',
+      currentVersion: '0.1.7',
+      availableVersion: '0.1.8',
+      progressPercent: null,
+      transferredBytes: null,
+      totalBytes: null,
+      message: null,
+    });
+    await pendingPage.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    await pendingPage.getByRole('button', { name: 'Update available' }).first().waitFor({ timeout: 15_000 });
+    const pending = await updateControl(pendingPage);
+    checkTrue(
+      'a waiting update relabels the control',
+      pending !== null && pending.name === 'Update available',
+      `name: ${pending?.name}`,
+    );
+    checkTrue(
+      'a waiting update paints the control blue',
+      pending !== null && isBlue(pending.color) && isBlue(pending.glyphColor ?? pending.color),
+      `color: ${pending?.color}, glyph: ${pending?.glyphColor}, token: ${pending?.pendingToken}`,
+    );
+    checkTrue(
+      'the blue is a different colour from the resting ink',
+      pending !== null && resting !== null && pending.color !== resting.color,
+      `pending: ${pending?.color}, resting: ${resting?.color}`,
+    );
+    // Both states go to the same place: the real update UI on Settings.
+    await pendingPage.getByRole('button', { name: 'Update available' }).first().click();
+    await pendingPage.waitForTimeout(700);
+    checkTrue(
+      'the update control navigates to Settings',
+      new URL(pendingPage.url()).hash.startsWith('#/settings'),
+      `hash: ${new URL(pendingPage.url()).hash}`,
+    );
+    await shoot(pendingPage, 'sidebar-chrome-update-pending');
+    await pendingPage.close();
+  } catch (error) {
+    fail('sidebar top-row chrome section did not complete', String(error));
+  }
+
   // --- Pagination ----------------------------------------------------------
   console.log('\nPagination');
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   await page.getByRole('button', { name: 'Go to next page' }).click();
   await page.waitForTimeout(400);
   check('page 2 range label', await rangeLabel(page), `11-20 of ${expected.listTotal}`);

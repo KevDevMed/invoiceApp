@@ -103,6 +103,43 @@ const PANEL_SHADOW =
  */
 const NAV_SELECTED_TINT = 'color-mix(in srgb, var(--color-text-primary) 8%, transparent)';
 
+/**
+ * The three macOS traffic-light colours, and the one blue in the app.
+ *
+ * Declared as custom properties on the app-shell rather than in `tokens`:
+ * `defineTheme`'s `tokens` map is typed to Astryx's own closed set of token
+ * names, and none of these is one of them. A component override's rule body is
+ * emitted verbatim, so declaring them on the outermost element the theme owns
+ * puts them in the inheritance path of everything inside the window — which is
+ * what lets `styles/global.css` and the components reference `var(--...)` and
+ * keeps every literal colour in this file, the token pipeline.
+ *
+ * The light colours are the macOS system values (Close/Minimize/Zoom in their
+ * focused state) and are *not* mode-dependent: macOS paints the same three dots
+ * whatever the app's appearance is, and the placeholders exist to mirror macOS,
+ * not to match the theme.
+ *
+ * `--color-icon-update-pending` is the exception and is a `light-dark()` pair.
+ * It is not `--color-icon-accent`: in this theme (neutral) that token resolves
+ * to light-dark(#262626, #ebebeb) — a monochrome ink, not a blue — so
+ * `<Icon color="accent">` would paint the pending glyph the same colour as
+ * every other glyph. A blue defined here is scoped to the one control that
+ * needs it instead of turning every accent icon in the app blue.
+ *
+ * Contrast, measured against both surfaces the glyph can land on (the panel's
+ * head `--color-background-surface` and its foot, the window body). Non-text
+ * ink, so the floor is WCAG 1.4.11's 3:1:
+ *   light #0064E0: 5.39:1 on #ffffff, 4.42:1 on #E4E9F0
+ *   dark  #2694FE: 4.87:1 on #262626, 6.42:1 on #08080A
+ * `theme/__tests__/appTheme.test.ts` asserts all four.
+ */
+const WINDOW_CONTROL_COLORS = {
+  '--color-window-control-close': '#FF5F57',
+  '--color-window-control-minimize': '#FEBC2E',
+  '--color-window-control-zoom': '#28C840',
+  '--color-icon-update-pending': 'light-dark(#0064E0, #2694FE)',
+} as const;
+
 export const appTheme = defineTheme({
   name: 'invoiceapp',
   extends: neutralTheme,
@@ -146,6 +183,11 @@ export const appTheme = defineTheme({
       base: {
         backgroundColor: 'var(--color-background-body)',
         backgroundImage: 'none',
+        /* The window's own colours: the traffic lights it does (or, in the
+           browser preview, does not) carry, and the blue the update glyph turns
+           when one is waiting. Custom properties, so they inherit down to the
+           sidebar rather than styling anything here. */
+        ...WINDOW_CONTROL_COLORS,
       },
     },
     /*

@@ -47,6 +47,56 @@ body {
 }
 
 /*
+ * Traffic-light placeholders — the browser preview only (see
+ * `chrome.ts`, `hasPlaceholderWindowControls`).
+ *
+ * Here rather than in a component because the design system has no primitive
+ * for a fixed-size disc in an arbitrary colour: StatusDot is the closest, and
+ * its colour comes from a five-value semantic variant (success/warning/error/
+ * accent/neutral). Painting the macOS palette through it would either misuse
+ * three status meanings or need a theme override that recolours every StatusDot
+ * in the app. Every value below is a token: --spacing-3 is 12px, and the three
+ * colours are declared once in `theme/appTheme.ts`.
+ *
+ * `flex: none` because the cluster is a flex row: without it the discs would
+ * shrink under the row's own width pressure and stop being circles.
+ */
+.app-window-control-dot {
+  inline-size: var(--spacing-3);
+  block-size: var(--spacing-3);
+  border-radius: var(--radius-full);
+  flex: none;
+}
+
+.app-window-control-dot-close {
+  background-color: var(--color-window-control-close);
+}
+
+.app-window-control-dot-minimize {
+  background-color: var(--color-window-control-minimize);
+}
+
+.app-window-control-dot-zoom {
+  background-color: var(--color-window-control-zoom);
+}
+
+/*
+ * The update control, while an update is actually waiting.
+ *
+ * The theme paints every ghost button `--color-icon-secondary` at rest and
+ * `--color-text-primary` on hover; this has to beat both. It does so by being
+ * *unlayered*: theme overrides are injected into `@layer astryx-theme`, and
+ * unlayered author CSS outranks every layer regardless of specificity. Staying
+ * blue on hover is intended — the highlight is state, not decoration.
+ *
+ * Icon's default `color="inherit"` resolves to currentColor, so colouring the
+ * button is what colours the glyph.
+ */
+.app-update-button-pending {
+  color: var(--color-icon-update-pending);
+}
+
+/*
  * The sidebar's scroll region keeps scrolling; it just stops drawing a bar.
  * `scrollbar-width` and the `::-webkit-scrollbar` pseudo-element are browser
  * chrome with no design-system equivalent — the same reason `-webkit-app-region`
