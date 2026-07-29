@@ -600,6 +600,212 @@ async function main() {
   await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
   await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
 
+  // --- Sidebar pill panel ---------------------------------------------------
+  // The sidebar is a floating pill: inset from every window edge, rounded,
+  // shadowed, sitting on a gradient backdrop, with a toggle and a download
+  // control in its top band. Geometry is measured off the real `.app-side-nav`
+  // element — the class is the one contract the shell exposes for the panel
+  // itself; everything interactive still goes through roles. The whole section
+  // is guarded so a missing panel yields named FAILs, not a dead run.
+  console.log('\nSidebar pill panel');
+  try {
+    const INSET_TOLERANCE = 1;
+
+    /**
+     * The panel's box against the viewport and against the content region: the
+     * region is the first `overflow-y: auto|scroll` ancestor of the page h1,
+     * same discovery rule as contentColumnGutters, so the "gap to the content"
+     * is measured against what actually holds the page, not a class name.
+     * Also walks `.app-side-nav` and its ancestors up to (not including) body
+     * for sideways overflow that could render a scrollbar, naming the first
+     * offender by class; clipped overhangs are reported informationally.
+     */
+    const panel = await page.evaluate(() => {
+      const nav = document.querySelector('.app-side-nav');
+      if (!nav) return null;
+      const box = nav.getBoundingClientRect();
+
+      let contentLeft = null;
+      let node = document.querySelector('h1');
+      while (node?.parentElement) {
+        const styles = getComputedStyle(node.parentElement);
+        if (styles.overflowY === 'auto' || styles.overflowY === 'scroll') {
+          contentLeft = node.parentElement.getBoundingClientRect().left;
+          break;
+        }
+        node = node.parentElement;
+      }
+
+      // Only an `overflow-x: auto|scroll` box is a scroll container, so only
+      // those can paint a horizontal bar; a `clip`/`hidden` box still reports
+      // the clipped content through scrollWidth without ever scrolling. The
+      // first kind is a failure, the second is noted so growth stays visible.
+      let overflowing = null;
+      const clippedOverhangs = [];
+      for (let element = nav; element && element !== document.body; element = element.parentElement) {
+        if (element.scrollWidth > element.clientWidth + 1) {
+          const description = `<${element.tagName.toLowerCase()} class="${element.getAttribute('class') ?? ''}"> ` +
+            `scrollWidth ${element.scrollWidth} > clientWidth ${element.clientWidth} + 1`;
+          const overflowX = getComputedStyle(element).overflowX;
+          if (overflowX === 'auto' || overflowX === 'scroll') {
+            if (overflowing === null) overflowing = description;
+          } else {
+            clippedOverhangs.push(`${description} (overflow-x: ${overflowX}, cannot scroll)`);
+          }
+        }
+      }
+
+      const styles = getComputedStyle(nav);
+      return {
+        top: box.top,
+        left: box.left,
+        bottom: window.innerHeight - box.bottom,
+        rightGap: contentLeft === null ? null : contentLeft - box.right,
+        borderRadius: styles.borderRadius,
+        boxShadow: styles.boxShadow,
+        overflowing,
+        clippedOverhangs,
+      };
+    });
+
+    const panelDetail =
+      panel === null
+        ? 'no .app-side-nav element in the document'
+        : `top: ${panel.top.toFixed(1)}, left: ${panel.left.toFixed(1)}, bottom: ${panel.bottom.toFixed(1)}, ` +
+          `gap to content: ${panel.rightGap === null ? 'content region not found' : panel.rightGap.toFixed(1)}`;
+    const insetOk = checkTrue(
+      'sidebar is inset from all four edges',
+      panel !== null &&
+        panel.top > 0 &&
+        panel.left > 0 &&
+        panel.bottom > 0 &&
+        panel.rightGap !== null &&
+        panel.rightGap > 0,
+      panelDetail,
+    );
+    // Equal top/bottom/left gaps are what make it read as a floating panel
+    // rather than a column with a stray margin.
+    const insetEqual = checkTrue(
+      'top, bottom and left insets are equal within 1px',
+      panel !== null &&
+        Math.abs(panel.top - panel.left) <= INSET_TOLERANCE &&
+        Math.abs(panel.top - panel.bottom) <= INSET_TOLERANCE,
+      panelDetail,
+    );
+    // border-radius resolves to a length once computed; the first number is the
+    // one every corner shares on a uniform radius.
+    const radiusPx = panel === null ? NaN : parseFloat(panel.borderRadius);
+    const radiusOk = checkTrue(
+      'sidebar corner radius is at least 12px',
+      Number.isFinite(radiusPx) && radiusPx >= 12,
+      `computed border-radius: ${panel === null ? 'not measured' : panel.borderRadius}`,
+    );
+    const shadowOk = checkTrue(
+      'sidebar casts a shadow',
+      panel !== null && panel.boxShadow !== 'none',
+      `computed box-shadow: ${panel === null ? 'not measured' : panel.boxShadow}`,
+    );
+    checkTrue(
+      'sidebar column has no sideways overflow',
+      panel !== null && panel.overflowing === null,
+      panel === null ? 'not measured' : panel.overflowing ?? 'no scrollable element overflows',
+    );
+    for (const overhang of panel?.clippedOverhangs ?? []) {
+      console.log(`  info  clipped overhang: ${overhang}`);
+    }
+
+    // Photographed only once the pill it illustrates is proven on screen.
+    if (insetOk && insetEqual && radiusOk && shadowOk) await shoot(page, 'sidebar-pill');
+    else console.log('  screenshot skipped: sidebar-pill (panel geometry did not hold)');
+
+    // --- Top-row controls: the toggle lives in the panel, above the brand row.
+    const toggle = page.getByRole('button', { name: 'Toggle sidebar' });
+    const toggleExists = checkTrue(
+      'sidebar has a "Toggle sidebar" control',
+      (await toggle.count()) > 0,
+      `buttons named "Toggle sidebar": ${await toggle.count()}`,
+    );
+    if (toggleExists) {
+      checkTrue(
+        'toggle control is inside the sidebar panel',
+        await toggle.first().evaluate((element) => element.closest('.app-side-nav') !== null),
+        'element.closest(".app-side-nav")',
+      );
+      const toggleBox = await toggle.first().boundingBox();
+      const brandBox = await page.getByText('InvoiceApp', { exact: true }).first().boundingBox();
+      checkTrue(
+        'toggle sits above the InvoiceApp brand row',
+        toggleBox !== null && brandBox !== null && toggleBox.y + toggleBox.height <= brandBox.y,
+        `toggle bottom: ${toggleBox === null ? 'not measured' : (toggleBox.y + toggleBox.height).toFixed(1)}, ` +
+          `brand top: ${brandBox === null ? 'not measured' : brandBox.y.toFixed(1)}`,
+      );
+
+      const navWidth = async () =>
+        page.evaluate(() => document.querySelector('.app-side-nav')?.getBoundingClientRect().width ?? null);
+      const expandedWidth = await navWidth();
+      await toggle.first().click();
+      await page.waitForTimeout(600);
+      const collapsedWidth = await navWidth();
+      const collapsed = checkTrue(
+        'toggle collapses the sidebar',
+        expandedWidth !== null && collapsedWidth !== null && collapsedWidth < expandedWidth,
+        `expanded: ${expandedWidth?.toFixed(1)}, collapsed: ${collapsedWidth?.toFixed(1)}`,
+      );
+      if (collapsed) await shoot(page, 'sidebar-collapsed');
+      else console.log('  screenshot skipped: sidebar-collapsed (sidebar did not collapse)');
+
+      await toggle.first().click();
+      await page.waitForTimeout(600);
+      const restoredWidth = await navWidth();
+      checkTrue(
+        'toggle restores the sidebar width',
+        expandedWidth !== null && restoredWidth !== null && Math.abs(restoredWidth - expandedWidth) <= 1,
+        `expanded: ${expandedWidth?.toFixed(1)}, restored: ${restoredWidth?.toFixed(1)}`,
+      );
+
+      // The panel must still navigate after a collapse round-trip.
+      await page.locator('.app-side-nav').getByRole('link', { name: 'Clients', exact: true }).click();
+      await page.waitForTimeout(900);
+      checkTrue(
+        'nav still navigates after a collapse round-trip',
+        new URL(page.url()).hash.startsWith('#/clients'),
+        `hash: ${new URL(page.url()).hash}`,
+      );
+      await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+      await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+    }
+
+    // --- Backdrop gradient, in both themes. The backdrop is whichever element
+    // behind the panel paints it: the nav's ancestors up to and including the
+    // document root, searched for a computed gradient background-image.
+    const backdropGradient = () =>
+      page.evaluate(() => {
+        let node = document.querySelector('.app-side-nav')?.parentElement ?? document.body;
+        for (; node; node = node.parentElement) {
+          const image = getComputedStyle(node).backgroundImage;
+          if (image.includes('gradient')) {
+            return `<${node.tagName.toLowerCase()} class="${node.getAttribute('class') ?? ''}"> ${image}`;
+          }
+        }
+        return null;
+      });
+    for (const mode of ['Light', 'Dark']) {
+      await page.getByRole('radio', { name: mode }).click();
+      const settled = await waitForTheme(page, mode.toLowerCase());
+      const gradient = await backdropGradient();
+      checkTrue(
+        `backdrop paints a gradient in ${mode.toLowerCase()} mode`,
+        settled && gradient !== null,
+        gradient ?? `no gradient background-image behind the panel (theme settled: ${settled})`,
+      );
+    }
+    // Back to the light baseline the rest of the run expects.
+    await page.getByRole('radio', { name: 'Light' }).click();
+    await waitForTheme(page, 'light');
+  } catch (error) {
+    fail('sidebar pill panel section did not complete', String(error));
+  }
+
   // --- Pagination ----------------------------------------------------------
   console.log('\nPagination');
   await page.getByRole('button', { name: 'Go to next page' }).click();

@@ -71,6 +71,75 @@ body {
 }
 
 /*
+ * Removes the horizontal scrollbar that ran under the sidebar.
+ *
+ * The bar was never the sidebar's: the rules above hide bars on `.app-side-nav`
+ * and its descendants, and SideNav's own scroll region is `overflow-x: hidden`.
+ * It belonged to an *ancestor*. `AppShell` renders the sidebar inside a
+ * `LayoutPanel` with `isScrollable={height === 'fill'}` — we pass
+ * `height="fill"` — so that panel is `overflow: auto`. Measured in Chromium at
+ * a 1280px viewport: the panel's scrollWidth was 275 against a clientWidth of
+ * 272, i.e. 3px of inline overflow.
+ *
+ * The 3px is not the panel's margins — the panel's width already resolves to
+ * the sidebar's full margin box. It is the resize handle's hit area: a 16px
+ * absolutely-positioned box centred on the sidebar's inline-end edge and then
+ * biased back by a third of its own width, so it lands 16/6 = 2.67px past that
+ * edge (measured right: 274.67 against a container edge of 272). Being
+ * absolutely positioned it contributes nothing to the panel's intrinsic width,
+ * but it does contribute to its scrollable overflow — so the panel grew a
+ * scroll range no content ever occupied.
+ *
+ * `overflow-x: clip` on the handle's own wrapper ends the overflow rather than
+ * hiding the bar: clipped content stops propagating to the ancestor's scroll
+ * area entirely. Nothing is lost — the clip removes 2.67px of an invisible,
+ * transparent grab zone, leaving ~13px of it, and the sidebar's own content is
+ * inside `nav`, which is a separate `overflow: hidden` box that this does not
+ * touch. `overflow-y` stays `visible` (only `clip` may pair with `visible`),
+ * and the collapsed rail's flyouts are `usePopover`, which renders into the top
+ * layer and so escapes this and every other clip.
+ *
+ * Selected via `:has()` because the wrapper is a design-system internal with
+ * only hashed StyleX class names — the sidebar it wraps is the stable handle.
+ */
+:has(> .app-side-nav) {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+/*
+ * The resize handle's focus ring, drawn *inside* its own hit area.
+ *
+ * The design system draws it outside: `2px solid` at `--spacing-0-5` (2px) of
+ * offset, so the ring's outer edge lands 4px past the handle's border box.
+ * Measured in Chromium at a 1280px viewport with the sidebar at its default
+ * width: handle border box ends at x=280, ring outer edge at x=284 — and the
+ * ring's inline-end stroke never painted. Both its edges were pinned:
+ *
+ *   - `overflow-x: clip` above ends at x=280. Adding `overflow-clip-margin`
+ *     (tried at 4px and 8px) changed nothing: the ring still stopped at 280,
+ *     because the *ancestor* `astryx-layout-panel` is `overflow-x: auto` with a
+ *     clientWidth of exactly 280 and clips the ink itself.
+ *   - Removing the clip entirely (`overflow-x: visible`) also failed to reveal
+ *     it, for the same reason, and put the panel back to scrollWidth 283 vs
+ *     clientWidth 280 — the horizontal scrollbar the clip exists to remove.
+ *
+ * So the ring cannot be let out; it has to come in. `outline-offset: -2px`
+ * draws it inside the handle's 16px-wide (transparent) hit area, where nothing
+ * clips it: measured dark ring pixels at x 264-265 and 278-279 — a complete
+ * 2px rectangle — with the panel still at scrollWidth == clientWidth == 280.
+ *
+ * `:focus-visible` in the selector is what matches the design system's own
+ * specificity (0,2,0); this file is imported after astryx.css, so it wins on
+ * order. Nothing else about the ring is touched — width and colour stay the
+ * design system's.
+ */
+[data-testid='astryx-sidenav-resize-handle']:focus-visible {
+  /* The same --spacing-0-5 the design system offsets by, inverted. */
+  outline-offset: calc(var(--spacing-0-5) * -1);
+}
+
+/*
  * The floating assistant dock. Two things here have no design-system
  * equivalent, which is the only sanctioned reason for app-level CSS: fixed
  * positioning (no Astryx layout component exposes it) and sizing measured

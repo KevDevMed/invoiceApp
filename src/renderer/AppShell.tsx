@@ -18,13 +18,14 @@
  */
 
 import { useState } from 'react';
-import { Outlet, useLocation } from 'react-router';
+import { Outlet, useLocation, useNavigate } from 'react-router';
 
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
 import { Icon, type IconName, type IconType } from '@astryxdesign/core/Icon';
+import { IconButton } from '@astryxdesign/core/IconButton';
 import { NavIcon } from '@astryxdesign/core/NavIcon';
 import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
-import { StackItem, VStack } from '@astryxdesign/core/Stack';
+import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import {
   SideNav,
   SideNavCollapseButton,
@@ -35,13 +36,14 @@ import {
 
 import type { ThemeMode } from '../shared/types';
 import {
-  collapsedRailWidth,
   isSectionSelected,
   NAV_GROUPS,
   readDesktopInfo,
   SECTION_ROUTES,
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
+  sideNavControlRowHeight,
+  sideNavPanelGeometry,
   titleBarInset,
   wasSideNavCollapsed,
   type NavGroup,
@@ -163,6 +165,22 @@ function AssistantIcon(props: NavIconProps): React.JSX.Element {
   );
 }
 
+/**
+ * Panel toggle: a rounded rectangle with its left column filled — the sidebar
+ * seen from above, not a directional chevron. A chevron says "this moves left";
+ * this glyph says "this pane hides", which is what the button actually does and
+ * why it reads the same whether the rail is open or shut. The filled column
+ * traces the outline's own left edge and radius, so the two never disagree.
+ */
+function PanelToggleIcon(props: NavIconProps): React.JSX.Element {
+  return (
+    <svg {...svgProps} {...props}>
+      <rect x="3" y="4.5" width="18" height="15" rx="3" />
+      <path d="M9.5 4.5H6A3 3 0 0 0 3 7.5v9A3 3 0 0 0 6 19.5h3.5z" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 /** Download-into-tray: the update indicator's glyph on the collapsed rail. */
 function UpdateIcon(props: NavIconProps): React.JSX.Element {
   return (
@@ -253,25 +271,64 @@ function ThemeControl(): React.JSX.Element {
 }
 
 /**
- * The band the OS window controls sit in. Empty by construction and draggable,
- * because `hiddenInset` leaves the window with no title bar to grab. Collapses
- * to zero height off macOS, so the preview and the Windows/Linux builds have no
- * dead space at the top.
+ * The band the OS window controls sit in, and the window's drag surface —
+ * `hiddenInset` leaves no title bar to grab.
+ *
+ * With no children it is empty and `aria-hidden`: pure reserved space, and it
+ * collapses to zero height off macOS so the preview and the Windows/Linux
+ * builds have no dead space at the top. The sidebar's copy passes children —
+ * the traffic lights sit at the start of that row and the controls at its end —
+ * and then it must *not* be `aria-hidden`, or the controls inside it disappear
+ * from the accessibility tree while staying clickable.
+ *
+ * Anything interactive in here has to opt out of the drag region or it stops
+ * receiving clicks entirely; `<button>` is in the `:where(...)` list in
+ * `styles/global.css`, which is what both controls below render as.
  */
-function TitleBarInset({ height }: { height: string }): React.JSX.Element {
+function TitleBarInset({
+  height,
+  children,
+}: {
+  height: string;
+  children?: React.ReactNode;
+}): React.JSX.Element {
+  // size="static" so the band keeps its exact height: it is a flex child of a
+  // full-height column and would otherwise shrink under the content's demands.
   return (
-    // size="static" so the band keeps its exact height: it is a flex child of a
-    // full-height column and would otherwise shrink under the content's demands.
     <StackItem size="static">
-      <VStack className="app-drag-region" height={height} aria-hidden />
+      <HStack
+        className="app-drag-region"
+        height={height}
+        align="center"
+        justify="end"
+        gap={0.5}
+        paddingInline={2}
+        aria-hidden={children === undefined ? true : undefined}
+      >
+        {children}
+      </HStack>
     </StackItem>
   );
 }
 
+/**
+ * Accessible name of the collapse/expand toggle. One string for both states on
+ * purpose: the screenshot harness asserts it, and the glyph does not change
+ * between states either. Not derived from anything — a computed name is a name
+ * that can drift out from under the harness.
+ *
+ * A fixed name would otherwise cost a screen-reader user the state the design
+ * system's own default name carried ("Expand sidebar" / "Collapse sidebar"), so
+ * the state moves to `aria-expanded` instead — see `collapseToggle` below.
+ */
+const SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar';
+
 export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const desktop = readDesktopInfo();
   const inset = titleBarInset(desktop);
+  const controlRowHeight = sideNavControlRowHeight(desktop);
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
   /*
     Collapse is controlled here for one reason: `headerEndContent` is hidden
@@ -290,22 +347,58 @@ export function AppShell(): React.JSX.Element {
   const badge = updateBadge(updateState);
 
   /*
-    The sidebar as an inset, rounded panel rather than a column welded to the
-    window edge. Inline styles, in tokens: SideNav's own width/height come from
-    the design system's StyleX classes, which carry specificity hacks that
-    author CSS cannot outrank, and `minInlineSize` is precisely the property
-    that widens the collapsed rail past the traffic lights (see `./chrome`)
-    without fighting either the collapsed width or the resizable one.
+    The sidebar as a floating panel rather than a column welded to the window
+    edge: inset on all four sides, so there is a gap above, below, outside and
+    between it and the content column. Inline styles, in tokens, because
+    SideNav's own width/height come from the design system's StyleX classes,
+    which carry specificity hacks that author CSS cannot outrank.
+
+    Geometry only. Radius, background, shadow and border live in the theme —
+    an inline style here would beat any rule the theme writes. The numbers
+    themselves (and why `blockSize` must subtract exactly both block insets)
+    are in `./chrome`, where they are unit-tested.
   */
   const sideNavPanel: React.CSSProperties = {
-    minInlineSize: collapsedRailWidth(desktop),
     boxSizing: 'border-box',
-    marginBlock: 'var(--spacing-2)',
-    marginInlineStart: 'var(--spacing-2)',
-    blockSize: 'calc(100% - var(--spacing-4))',
-    borderRadius: 'var(--radius-container)',
-    background: 'var(--color-background-surface)',
+    ...sideNavPanelGeometry(desktop),
   };
+
+  /*
+    The two ghost controls in the sidebar's title band, beside the traffic
+    lights. Rendered only while expanded: collapsed, the rail is 88px wide and
+    the lights already occupy x 13-70 of it, so there is no room beside them —
+    `footerIcons` carries both controls instead, which is also what keeps
+    exactly one toggle on screen at a time.
+  */
+  const updateButton = badge.isVisible ? (
+    <IconButton
+      label={badge.label}
+      tooltip={badge.label}
+      variant="ghost"
+      icon={<Icon icon={UpdateIcon} size="sm" />}
+      // The full update UI already lives on Settings; this is a pointer to it,
+      // not a second copy of it. An IconButton has no href, so this navigates
+      // the same HashRouter the nav items' `#/path` hrefs drive.
+      onClick={() => {
+        void navigate('/settings');
+      }}
+    />
+  ) : null;
+
+  /*
+    `aria-expanded` carries the state the fixed label cannot. SideNavCollapseButton
+    does not set it itself (only SideNavItem does), and it spreads its rest props
+    into Button, which spreads them onto the rendered `<button>` — so this lands
+    on the real element. `label` still wins the accessible name: Button applies
+    its own `aria-label` *after* the spread. State comes from `isCollapsed`, the
+    controlled value SideNav is driven by, so the attribute cannot disagree with
+    what the rail is doing.
+  */
+  const collapseToggle = (
+    <SideNavCollapseButton label={SIDE_NAV_TOGGLE_LABEL} aria-expanded={!isCollapsed}>
+      <Icon icon={PanelToggleIcon} size="sm" />
+    </SideNavCollapseButton>
+  );
 
   return (
     /*
@@ -331,37 +424,43 @@ export function AppShell(): React.JSX.Element {
             style={sideNavPanel}
             header={
               <VStack gap={0}>
-                <TitleBarInset height={inset} />
+                {/* The title band: traffic lights at the start, controls at the
+                    end. `justify="end"` is what leaves the lights their space
+                    without reserving it by hand — there is no element under
+                    them, only the empty start of the row. */}
+                <TitleBarInset height={controlRowHeight}>
+                  {isCollapsed ? null : (
+                    <>
+                      {updateButton}
+                      {collapseToggle}
+                    </>
+                  )}
+                </TitleBarInset>
                 <SideNavHeading
                   icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
                   heading="InvoiceApp"
                   headingHref="#/invoices"
-                  /* A1: the toggle belongs on the identity row, not orphaned
-                     under Settings. Hidden while collapsed — `footerIcons`
-                     below is the way back. */
-                  headerEndContent={<SideNavCollapseButton />}
                 />
               </VStack>
             }
             footer={
               <VStack gap={1}>
-                {badge.isVisible ? (
-                  <SideNavItem
-                    label={badge.label}
-                    icon={UpdateIcon}
-                    selectedIcon={selectedVariant(UpdateIcon)}
-                    // The full update UI already lives on Settings; this is a
-                    // pointer to it, not a second copy of it.
-                    href="#/settings"
-                  />
-                ) : null}
                 {footerItems.map((item) => navItem(item, pathname))}
                 {isCollapsed ? null : <ThemeControl />}
               </VStack>
             }
-            /* Only while collapsed: expanded, the heading row owns the toggle,
-               and two of them would be the orphan chevron all over again. */
-            footerIcons={isCollapsed ? <SideNavCollapseButton /> : undefined}
+            /* Only while collapsed: expanded, the title band owns both, and two
+               toggles would be the orphan chevron all over again. The update
+               button comes along so the collapsed rail does not lose the only
+               pointer to a waiting update. */
+            footerIcons={
+              isCollapsed ? (
+                <>
+                  {updateButton}
+                  {collapseToggle}
+                </>
+              ) : undefined
+            }
             collapsible={{
               isCollapsed,
               onCollapsedChange: setIsCollapsed,
