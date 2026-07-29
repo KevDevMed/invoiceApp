@@ -128,6 +128,78 @@ describe('window/panel separation tokens', () => {
   });
 });
 
+/** WCAG 2.x relative luminance of a `#rrggbb` literal. */
+function relativeLuminance(value: string): number {
+  const hex = /^#([0-9a-f]{6})$/i.exec(value.trim())?.[1];
+  if (hex === undefined) throw new Error(`not a 6-digit hex colour: ${value}`);
+  const channels = [0, 2, 4].map((i) => {
+    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }) as [number, number, number];
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+/** WCAG contrast ratio between two `#rrggbb` literals, 1:1 .. 21:1. */
+function contrastRatio(a: string, b: string): number {
+  const [x, y] = [relativeLuminance(a), relativeLuminance(b)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+
+/*
+  The floor this file exists to hold from now on.
+
+  `layout-content` is transparent, so text no longer has one guaranteed white
+  pane under it: supporting copy lands on `--color-background-body` in the
+  content area and on the panel's foot, which is the same token. Retuning the
+  light body to #E4E9F0 without moving the ink is what put secondary text at
+  3.89:1 — passing on white, failing on the pane. Both surfaces are asserted
+  because only checking the friendlier one is how that shipped.
+*/
+describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
+  const AA_NORMAL = 4.5;
+
+  const surfaces = (index: 0 | 1): Array<[name: string, color: string]> => [
+    ['body/panel foot', splitLightDark(token('--color-background-body'))[index]],
+    ['surface (cards, inputs, rows)', splitLightDark(token('--color-background-surface'))[index]],
+  ];
+
+  for (const [modeName, index] of [
+    ['light', 0],
+    ['dark', 1],
+  ] as const) {
+    for (const inkToken of ['--color-text-secondary', '--color-text-primary']) {
+      for (const [surfaceName, background] of surfaces(index)) {
+        it(`${modeName}: ${inkToken} on ${surfaceName} clears ${AA_NORMAL}:1`, () => {
+          const ink = splitLightDark(token(inkToken))[index];
+          expect(contrastRatio(ink, background)).toBeGreaterThanOrEqual(AA_NORMAL);
+        });
+      }
+    }
+  }
+
+  it('exempts only --color-text-disabled, which WCAG 1.4.3 excludes', () => {
+    // #a3a3a3 measures 2.07:1 on the light pane and 2.52:1 on white — nowhere
+    // near AA, and deliberately so: disabled controls are outside 1.4.3. This
+    // asserts the exemption is narrow, i.e. that this is the *only* ink token
+    // the loop above skips. The theme defines no tertiary/placeholder ink.
+    const inks = Object.keys(tokenMap).filter((name) => /^--color-text-/.test(name));
+    const unchecked = inks.filter(
+      (name) => !['--color-text-secondary', '--color-text-primary'].includes(name),
+    );
+    expect(unchecked).toContain('--color-text-disabled');
+    expect(inks).not.toContain('--color-text-tertiary');
+  });
+
+  it('does not fix light mode by flattening the light gradient', () => {
+    // The other way out of the finding was lifting the body back toward white.
+    // The panel head is `--color-background-surface` and its foot is the body;
+    // they have to stay far enough apart for the wash to read at all.
+    const [surfaceLight] = splitLightDark(token('--color-background-surface'));
+    const [bodyLight] = splitLightDark(token('--color-background-body'));
+    expect(hexSum(surfaceLight) - hexSum(bodyLight)).toBeGreaterThanOrEqual(40);
+  });
+});
+
 const PANEL_GRADIENT =
   'linear-gradient(180deg, ' +
   'var(--color-background-surface) 0%, ' +

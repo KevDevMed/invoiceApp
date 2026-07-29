@@ -483,21 +483,34 @@ async function waitForTheme(page, mode) {
  * it is already the current one, because arriving from Settings is exactly what
  * the callers below need. Returns whatever `waitForTheme` decided, so a caller
  * can still report a FAIL rather than photographing an unsettled page.
+ *
+ * The final `reload()` is what makes the second reading worth taking. Hash
+ * navigation only remounts the route — the document, the React tree and the
+ * theme context all stay alive, so a `settings:set` that never persisted
+ * anything would still have passed. A reload throws the whole renderer away and
+ * the mode has to come back from storage, which is the claim being made.
+ *
+ * `Auto` is rejected rather than handled: `waitForTheme` decides settledness by
+ * measuring painted brightness against an expected appearance, and `Auto` has
+ * no expected appearance of its own — it resolves to whatever the host OS says.
+ * A caller that wants it needs to assert something else.
  */
 async function setAppearance(page, mode, returnTo = '#/invoices') {
-  await page.goto(`${APP_ORIGIN}/${returnTo.startsWith('#') ? '' : '#'}${returnTo}`, {
-    waitUntil: 'networkidle',
-  });
+  const expected = mode.toLowerCase();
+  if (expected !== 'light' && expected !== 'dark') {
+    throw new Error(`setAppearance: expected Light or Dark, got ${mode}`);
+  }
   await page.goto(`${APP_ORIGIN}/#/settings`, { waitUntil: 'networkidle' });
   const radio = page.getByRole('radio', { name: mode, exact: true });
   await radio.first().waitFor({ timeout: 15_000 });
   await radio.first().click();
-  const settled = await waitForTheme(page, mode.toLowerCase());
+  const settled = await waitForTheme(page, expected);
   await page.goto(`${APP_ORIGIN}/${returnTo.startsWith('#') ? '' : '#'}${returnTo}`, {
     waitUntil: 'networkidle',
   });
-  // The route just remounted; the persisted mode has to survive that too.
-  return (await waitForTheme(page, mode.toLowerCase())) && settled;
+  await page.reload({ waitUntil: 'networkidle' });
+  // Fresh document: the mode below was read back from storage, not from memory.
+  return (await waitForTheme(page, expected)) && settled;
 }
 
 /**

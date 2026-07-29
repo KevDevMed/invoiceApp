@@ -7,17 +7,22 @@
  * `ui/themeMode`, which is a leaf module with no DOM and no design-system
  * imports. That is what makes it testable under `environment: 'node'`.
  *
- * `usePrefersDarkScheme` is deliberately not tested here: it is a hook over
- * `matchMedia`, and there is no DOM in this project to mount it in. Its one
- * non-React decision — absent `matchMedia` means "not dark" — is asserted
- * through the pure functions below, which take `prefersDark` as an argument
- * precisely so the hook has nothing left to get wrong.
+ * `usePrefersDarkScheme` is still not mounted here — there is no DOM in this
+ * project to render a hook into. What it delegates to, `watchPrefersDark`, is
+ * plain and takes a callback, so the part with a race in it *is* tested below
+ * against a hand-built `MediaQueryList`.
  */
 
 import { describe, expect, it } from 'vitest';
 
 import type { ThemeMode } from '../../../shared/types';
-import { nextThemeMode, resolveAppearance, themeToggleLabel } from '../themeMode';
+import {
+  PREFERS_DARK_QUERY,
+  nextThemeMode,
+  resolveAppearance,
+  themeToggleLabel,
+  watchPrefersDark,
+} from '../themeMode';
 
 const MODES: readonly ThemeMode[] = ['light', 'dark', 'system'];
 
@@ -79,6 +84,101 @@ describe('nextThemeMode', () => {
         expect(nextThemeMode(once, prefersDark)).toBe(resolveAppearance(mode, prefersDark));
       }
     }
+  });
+});
+
+/**
+ * A `MediaQueryList` with two things the real one does not have: it records the
+ * order of every interaction, and reading `.matches` is observable. That is
+ * what lets the ordering itself be asserted rather than inferred.
+ */
+function fakeMediaQueryList(initial: boolean) {
+  const calls: string[] = [];
+  let listener: ((event: MediaQueryListEvent) => void) | null = null;
+  let matches = initial;
+  return {
+    calls,
+    /** Simulate the OS flipping appearance, as the browser would report it. */
+    emit(next: boolean): void {
+      matches = next;
+      listener?.({ matches: next } as MediaQueryListEvent);
+    },
+    /** Flip without notifying — an OS change that lands with no listener yet. */
+    flipSilently(next: boolean): void {
+      matches = next;
+    },
+    query: {
+      media: PREFERS_DARK_QUERY,
+      get matches(): boolean {
+        calls.push('matches');
+        return matches;
+      },
+      addEventListener(_type: string, fn: (event: MediaQueryListEvent) => void): void {
+        calls.push('addEventListener');
+        listener = fn;
+      },
+      removeEventListener(): void {
+        calls.push('removeEventListener');
+        listener = null;
+      },
+    },
+  };
+}
+
+/** Installs a `window.matchMedia` for the duration of `body`. */
+function withMatchMedia<T>(query: unknown, body: () => T): T {
+  const had = 'window' in globalThis;
+  const previous = (globalThis as { window?: unknown }).window;
+  (globalThis as { window?: unknown }).window = {
+    matchMedia: () => query,
+  };
+  try {
+    return body();
+  } finally {
+    if (had) (globalThis as { window?: unknown }).window = previous;
+    else delete (globalThis as { window?: unknown }).window;
+  }
+}
+
+describe('watchPrefersDark', () => {
+  it('subscribes before it reads, so a change during render is not lost', () => {
+    // The regression this pins: the hook's useState initialiser reads `matches`
+    // during render and the effect subscribes later. Read-then-subscribe drops
+    // anything landing in between *permanently* — no listener fired, and the
+    // value is never looked at again.
+    const fake = fakeMediaQueryList(false);
+    const seen: boolean[] = [];
+    withMatchMedia(fake.query, () => {
+      fake.flipSilently(true); // the OS change that lands in the gap
+      return watchPrefersDark((value) => seen.push(value));
+    });
+    expect(fake.calls.indexOf('addEventListener')).toBeLessThan(fake.calls.indexOf('matches'));
+    expect(seen).toEqual([true]);
+  });
+
+  it('reports later changes through the listener', () => {
+    const fake = fakeMediaQueryList(false);
+    const seen: boolean[] = [];
+    withMatchMedia(fake.query, () => watchPrefersDark((value) => seen.push(value)));
+    fake.emit(true);
+    fake.emit(false);
+    expect(seen).toEqual([false, true, false]);
+  });
+
+  it('unsubscribes, so a change after cleanup reports nothing', () => {
+    const fake = fakeMediaQueryList(false);
+    const seen: boolean[] = [];
+    const stop = withMatchMedia(fake.query, () => watchPrefersDark((value) => seen.push(value)));
+    stop?.();
+    fake.emit(true);
+    expect(seen).toEqual([false]);
+    expect(fake.calls).toContain('removeEventListener');
+  });
+
+  it('is a no-op without matchMedia — vitest runs environment: node', () => {
+    const seen: boolean[] = [];
+    expect(watchPrefersDark((value) => seen.push(value))).toBeUndefined();
+    expect(seen).toEqual([]);
   });
 });
 

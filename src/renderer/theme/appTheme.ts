@@ -118,6 +118,23 @@ export const appTheme = defineTheme({
     */
     '--color-background-body': ['#E4E9F0', '#08080A'],
     '--color-shadow': ['rgba(5, 54, 89, 0.16)', 'rgba(0, 0, 0, 0.55)'],
+    /*
+      Fallout from the body re-tune above, and the reason it is fixed here
+      rather than by lifting the body back up. `layout-content` is transparent
+      now, so supporting copy that used to sit on the white pane sits on
+      #E4E9F0. Neutral's light secondary ink #737373 measures 4.74:1 on white
+      but only 3.89:1 on #E4E9F0 — under the 4.5:1 AA floor for normal text.
+      #656565 clears the floor on both surfaces it can land on (4.78:1 on the
+      body/panel foot, 5.83:1 on `--color-background-surface`), and on every
+      colour between them, since the panel gradient only interpolates the two.
+      Darkening the ink rather than lightening the body keeps the light
+      gradient's full #ffffff -> #E4E9F0 span, which is what makes the panel
+      head read as lighter than the pane.
+
+      Dark is neutral's #a3a3a3 untouched: 7.93:1 on #08080A, 6.00:1 on
+      #262626. Restated as a pair only because `light-dark()` needs both.
+    */
+    '--color-text-secondary': ['#656565', '#a3a3a3'],
   },
   components: {
     /* The window itself: flat, and the deepest thing on screen. The gradient

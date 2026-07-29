@@ -92,19 +92,41 @@ export function themeToggleLabel(next: ResolvedAppearance): string {
 export function usePrefersDarkScheme(): boolean {
   const [prefersDark, setPrefersDark] = useState(() => matchPrefersDark()?.matches ?? false);
 
-  useEffect(() => {
-    const query = matchPrefersDark();
-    if (!query) return undefined;
-    const onChange = (event: MediaQueryListEvent): void => {
-      setPrefersDark(event.matches);
-    };
-    query.addEventListener('change', onChange);
-    return () => {
-      query.removeEventListener('change', onChange);
-    };
-  }, []);
+  useEffect(() => watchPrefersDark(setPrefersDark), []);
 
   return prefersDark;
+}
+
+/**
+ * Subscribes to the OS appearance preference, then reports its current value.
+ *
+ * The ordering is the whole point, and it is why this is a function of its own
+ * rather than three lines inside the effect: the hook's `useState` initialiser
+ * reads `matches` during render, and the effect runs later. An OS appearance
+ * change landing in that gap fires no listener (there is none yet) and is never
+ * re-read — so `system` mode would keep the stale glyph for the lifetime of the
+ * app, and one press of the toggle would "flip" to the appearance already on
+ * screen. Subscribing *before* reading closes the gap from both ends: anything
+ * after the subscribe fires `onChange`, anything before it is caught by the
+ * read. Reporting an unchanged value is a no-op re-render.
+ *
+ * Returns `undefined` when there is no `matchMedia` to subscribe to — a
+ * non-browser host, or vitest's `environment: 'node'` — which is also a valid
+ * `useEffect` cleanup.
+ */
+export function watchPrefersDark(
+  onValue: (prefersDark: boolean) => void,
+): (() => void) | undefined {
+  const query = matchPrefersDark();
+  if (!query) return undefined;
+  const onChange = (event: MediaQueryListEvent): void => {
+    onValue(event.matches);
+  };
+  query.addEventListener('change', onChange);
+  onValue(query.matches);
+  return () => {
+    query.removeEventListener('change', onChange);
+  };
 }
 
 function matchPrefersDark(): MediaQueryList | null {
