@@ -24,7 +24,6 @@ import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
 import { Icon, type IconName, type IconType } from '@astryxdesign/core/Icon';
 import { IconButton } from '@astryxdesign/core/IconButton';
 import { NavIcon } from '@astryxdesign/core/NavIcon';
-import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import {
   SideNav,
@@ -34,7 +33,6 @@ import {
   SideNavSection,
 } from '@astryxdesign/core/SideNav';
 
-import type { ThemeMode } from '../shared/types';
 import {
   isSectionSelected,
   NAV_GROUPS,
@@ -50,7 +48,12 @@ import {
 } from './chrome';
 import { isDockVisible } from './ui/dockVisibility';
 import { updateBadge } from './ui/updateBadge';
-import { useThemeMode } from './ui/themeMode';
+import {
+  nextThemeMode,
+  themeToggleLabel,
+  usePrefersDarkScheme,
+  useThemeMode,
+} from './ui/themeMode';
 import { AssistantDock } from './ui/AssistantDock';
 import { AssistantProvider } from './features/assistant/useAssistant';
 import { useUpdates } from './features/updates/useUpdates';
@@ -181,6 +184,26 @@ function PanelToggleIcon(props: NavIconProps): React.JSX.Element {
   );
 }
 
+/** Appearance toggle, dark destination: a crescent, cut from one disc by another. */
+function MoonIcon(props: NavIconProps): React.JSX.Element {
+  return (
+    <svg {...svgProps} {...props}>
+      <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" />
+    </svg>
+  );
+}
+
+/** Appearance toggle, light destination: disc plus eight rays. */
+function SunIcon(props: NavIconProps): React.JSX.Element {
+  return (
+    <svg {...svgProps} {...props}>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2" />
+      <path d="M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4" />
+    </svg>
+  );
+}
+
 /** Download-into-tray: the update indicator's glyph on the collapsed rail. */
 function UpdateIcon(props: NavIconProps): React.JSX.Element {
   return (
@@ -245,28 +268,32 @@ function navItem(item: NavItem, pathname: string): React.JSX.Element {
 }
 
 /**
- * Compact appearance control, in the sidebar footer beside Settings.
+ * Appearance toggle, in the sidebar footer beside Settings.
  *
- * It stays a SegmentedControl with exactly these three labels: the screenshot
- * harness in `preview/screenshots.mjs` drives appearance through
- * `getByRole('radio', { name: 'Light' | 'Dark' })`, and any other control shape
- * breaks that gate. Writes through useThemeMode().
+ * A glyph, not a three-state control: the full Light/Dark/Auto choice moved to
+ * Settings > Appearance, and what is left here is the one-press flip a user
+ * wants from a sidebar. The cycle (light <-> dark, `system` resolving to its
+ * effective mode first) and the label wording live in `ui/themeMode` so they can
+ * be unit-tested without a DOM — see `nextThemeMode`.
+ *
+ * The glyph shows the *destination*, matching the label: moon while the app is
+ * light and about to go dark, sun while it is dark.
  */
-function ThemeControl(): React.JSX.Element {
+function ThemeToggleButton(): React.JSX.Element {
   const { mode, setMode } = useThemeMode();
+  const prefersDark = usePrefersDarkScheme();
+  const next = nextThemeMode(mode, prefersDark);
+  const label = themeToggleLabel(next);
   return (
-    <SegmentedControl
-      label="Appearance"
-      size="sm"
-      value={mode}
-      onChange={(next) => {
-        setMode(next as ThemeMode);
+    <IconButton
+      label={label}
+      tooltip={label}
+      variant="ghost"
+      icon={<Icon icon={next === 'dark' ? MoonIcon : SunIcon} size="sm" />}
+      onClick={() => {
+        setMode(next);
       }}
-    >
-      <SegmentedControlItem value="light" label="Light" />
-      <SegmentedControlItem value="dark" label="Dark" />
-      <SegmentedControlItem value="system" label="Auto" />
-    </SegmentedControl>
+    />
   );
 }
 
@@ -334,8 +361,9 @@ export function AppShell(): React.JSX.Element {
     Collapse is controlled here for one reason: `headerEndContent` is hidden
     while the rail is collapsed, so the toggle that lives on the heading row
     cannot also be the way back out. Knowing the state lets the collapsed rail
-    render its own expand button in `footerIcons` and lets the theme control —
-    which cannot shrink to an icon — sit out the collapsed state entirely.
+    render its own expand button in `footerIcons`, and lets the appearance
+    toggle move from the Settings row into that same icon bar rather than
+    fighting for width on an 88px rail.
 
     Seeded from the *same* localStorage byte `resizable.autoSaveId` persists
     below, because controlled collapse and the resizable width are two views of
@@ -443,20 +471,43 @@ export function AppShell(): React.JSX.Element {
                 />
               </VStack>
             }
+            /*
+              Settings, with the appearance toggle sitting on its row rather
+              than under it — the reference puts one thing at the foot of the
+              panel, and a stacked control adds a second. `StackItem size="fill"`
+              lets the nav item keep the whole row minus the glyph, so the pill
+              still spans the panel at every resized width.
+
+              Collapsed, the row is gone and the toggle moves to `footerIcons`
+              (below): the 88px rail has no room for a link and a glyph side by
+              side, and hiding the toggle outright would make appearance
+              unreachable without expanding first.
+            */
             footer={
               <VStack gap={1}>
-                {footerItems.map((item) => navItem(item, pathname))}
-                {isCollapsed ? null : <ThemeControl />}
+                {footerItems.map((item) =>
+                  isCollapsed || item.path !== '/settings' ? (
+                    navItem(item, pathname)
+                  ) : (
+                    <HStack key={item.path} gap={1} align="center">
+                      <StackItem size="fill">{navItem(item, pathname)}</StackItem>
+                      <ThemeToggleButton />
+                    </HStack>
+                  ),
+                )}
               </VStack>
             }
-            /* Only while collapsed: expanded, the title band owns both, and two
-               toggles would be the orphan chevron all over again. The update
-               button comes along so the collapsed rail does not lose the only
-               pointer to a waiting update. */
+            /* Only while collapsed: expanded, the title band owns the update and
+               collapse controls and the footer row owns the appearance toggle,
+               and two of any of them would be the orphan chevron all over
+               again. All three come along so the collapsed rail loses neither
+               the pointer to a waiting update nor the way to change
+               appearance. */
             footerIcons={
               isCollapsed ? (
                 <>
                   {updateButton}
+                  <ThemeToggleButton />
                   {collapseToggle}
                 </>
               ) : undefined

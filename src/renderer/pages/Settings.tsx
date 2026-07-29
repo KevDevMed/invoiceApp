@@ -16,15 +16,17 @@ import { Button } from '@astryxdesign/core/Button';
 import { Divider } from '@astryxdesign/core/Divider';
 import { Heading } from '@astryxdesign/core/Heading';
 import { NumberInput } from '@astryxdesign/core/NumberInput';
+import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
 import { Selector } from '@astryxdesign/core/Selector';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 import { TextArea } from '@astryxdesign/core/TextArea';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
-import { SETTINGS_KEYS } from '../../shared/types';
+import { SETTINGS_KEYS, type ThemeMode } from '../../shared/types';
 import { UpdatesSection } from '../features/updates';
 import { Page, PageHeader } from '../ui/Page';
+import { useThemeMode } from '../ui/themeMode';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
 
@@ -267,16 +269,54 @@ export function SettingsPage(): React.JSX.Element {
       </SettingsGroup>
 
       {/*
-        Its own section, and deliberately outside the save flow above: the
-        update controls act the moment they are pressed and have nothing to do
-        with "Save settings".
+        Appearance, and everything below it, is deliberately outside the save
+        flow above: these controls act the moment they are pressed and have
+        nothing to do with "Save settings". The sidebar keeps a one-press
+        light/dark glyph; `Auto` — the preference that defers to the OS — only
+        exists here, because it is a preference rather than a switch.
       */}
+      <SettingsGroup title="Appearance">
+        <SettingsRow label="Theme">
+          <AppearanceControl />
+        </SettingsRow>
+      </SettingsGroup>
+
       <UpdatesSection />
     </Page>
   );
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * The app's appearance preference. Writes straight through `useThemeMode()` —
+ * no local state, no save button.
+ *
+ * The three labels are exactly `Light`, `Dark` and `Auto`: the screenshot
+ * harness in `preview/screenshots.mjs` drives appearance through
+ * `getByRole('radio', { name })` on this page, and any other wording breaks that
+ * gate. The values are the `ThemeMode` union, not the labels.
+ */
+function AppearanceControl(): React.JSX.Element {
+  const { mode, setMode } = useThemeMode();
+  return (
+    <SegmentedControl
+      label="Appearance"
+      // `label` is aria-label only and never rendered, so the row's own "Theme"
+      // text stays the visible label. `fill` spreads the three segments across
+      // the control column every other row's control already occupies.
+      layout="fill"
+      value={mode}
+      onChange={(next) => {
+        setMode(next as ThemeMode);
+      }}
+    >
+      <SegmentedControlItem value="light" label="Light" />
+      <SegmentedControlItem value="dark" label="Dark" />
+      <SegmentedControlItem value="system" label="Auto" />
+    </SegmentedControl>
+  );
+}
 
 /** A muted section label over a hairline-separated stack of setting rows. */
 function SettingsGroup({

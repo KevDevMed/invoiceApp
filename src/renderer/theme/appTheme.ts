@@ -1,6 +1,11 @@
 /**
  * The app's own theme: neutral, plus the handful of surface decisions that make
- * the sidebar read as a floating pill panel on a gradient window.
+ * the sidebar read as a lit, floating pill panel on a flat near-black window.
+ *
+ * The surface contract, in one line: the *panel* carries the gradient and the
+ * *window* is flat. The panel's wash starts at the surface colour and resolves
+ * to exactly the window colour at its foot, so its head lifts and its foot
+ * dissolves. Nothing else in the app paints a gradient.
  *
  * Why a theme and not CSS. The shell owns geometry (insets, widths, drag
  * regions); everything *visual* — radius, border, shadow, surface colour, the
@@ -31,31 +36,63 @@ import { neutralTheme } from '@astryxdesign/theme-neutral/built';
 const PANEL_RADIUS = 'calc(var(--radius-container) * 1.5)';
 
 /**
- * Panel lift. `--shadow-high` alone is tuned for dialogs over a dimmed
- * backdrop; over a near-black window it disappears. The second layer is the one
- * that does the work — a wide, soft pool under the panel, coloured with
- * `--color-shadow` (itself re-tuned below) so it tracks the colour mode instead
- * of hardcoding a black that would grey out the light window.
+ * The panel's own wash — the one gradient in the app.
+ *
+ * Vertical, top to bottom, from `--color-background-surface` to
+ * `--color-background-body`. Both are `light-dark()` pairs, so the direction is
+ * mode-correct by construction rather than by a mix that happens to work: dark
+ * mode runs #262626 -> the near-black body, light mode runs #ffffff -> the grey
+ * body. Either way the head of the panel is the lifted surface and its foot is
+ * *exactly* the window colour, so the bottom edge dissolves into the backdrop
+ * instead of ending in a line.
+ *
+ * The middle stop is not decoration. A two-stop ramp spends most of its length
+ * in the middle greys and the top never reads as a surface; holding a
+ * surface-weighted mix until 55% keeps the lifted half lifted and puts the whole
+ * fade in the bottom half, which is what the reference does.
  */
-const PANEL_SHADOW =
-  'var(--shadow-high), 0 var(--spacing-2) var(--spacing-8) color-mix(in srgb, var(--color-shadow) 60%, transparent)';
+const PANEL_GRADIENT = [
+  'linear-gradient(180deg,',
+  'var(--color-background-surface) 0%,',
+  'color-mix(in srgb, var(--color-background-surface) 55%, var(--color-background-body)) 55%,',
+  'var(--color-background-body) 100%)',
+].join(' ');
 
 /**
- * The window wash behind the panel.
+ * The panel's edge, as a second background layer rather than a border colour.
  *
- * Built entirely from `--color-background-body` so it stays correct in both
- * modes. `--color-on-dark` (white) and `--color-on-light` (near-black) name the
- * ink that sits on a surface, not a colour mode — neither is a `light-dark()`
- * pair — so mixing toward them lightens the top-left and darkens the
- * bottom-right whichever way the app is running. 155deg puts the dark end at
- * bottom-right, as in the reference.
+ * A uniform 1px ring contradicts the gradient: it would redraw the bottom edge
+ * the wash just dissolved. So the border stays 1px of *transparent* and the ink
+ * comes from this gradient, painted into the border box while `PANEL_GRADIENT`
+ * is clipped to the padding box (see `backgroundClip` below). The hairline is
+ * strongest at the top, where the panel is lightest and genuinely stands off the
+ * window, and gone by 80% of the way down.
+ *
+ * `--color-border-emphasized` rather than `--color-border`: in light mode the
+ * latter is #ebebeb, which is lighter than this theme's body colour and so
+ * paints an invisible edge. #d4d4d4 / #525252 reads in both modes.
  */
-const WINDOW_GRADIENT = [
-  'linear-gradient(155deg,',
-  'color-mix(in srgb, var(--color-background-body) 94%, var(--color-on-dark)) 0%,',
-  'var(--color-background-body) 45%,',
-  'color-mix(in srgb, var(--color-background-body) 88%, var(--color-on-light)) 100%)',
+const PANEL_EDGE = [
+  'linear-gradient(180deg,',
+  'var(--color-border-emphasized) 0%,',
+  'color-mix(in srgb, var(--color-border-emphasized) 35%, transparent) 40%,',
+  'transparent 80%)',
 ].join(' ');
+
+/**
+ * Panel lift, now a single inset highlight along the top edge and no drop
+ * shadow at all.
+ *
+ * The old treatment was `--shadow-high` plus a wide pool underneath. Both are
+ * wrong for this panel: every layer of `--shadow-high` is an outer shadow (plus
+ * a full inset ring), and a pool under the panel paints a dark halo exactly
+ * where the gradient's foot is supposed to be the same colour as the window —
+ * it re-draws the bottom edge by hand. Separation now comes from the wash
+ * itself; the only thing left to say is "the top of this is a raised surface",
+ * which is what a 1px inset highlight says.
+ */
+const PANEL_SHADOW =
+  'inset 0 var(--border-width) 0 color-mix(in srgb, var(--color-on-dark) 10%, transparent)';
 
 /**
  * Selected nav pill. A tint of the text colour rather than a background token:
@@ -72,34 +109,77 @@ export const appTheme = defineTheme({
   tokens: {
     /*
       Both re-tuned for the same reason: the panel has to separate from the
-      window. Neutral's body is only 14 units off its dark surface, and its
-      shadow at 0.3 alpha cannot carve a panel out of it. Written as
-      [light, dark] pairs — `defineTheme` folds them into `light-dark()`.
+      window. Neutral's body is only 14 units off its dark surface, so a panel
+      that fades *to* the body would have nowhere to fade from. These values are
+      the two ends of `PANEL_GRADIENT` as much as they are window colours —
+      dark runs #262626 -> #08080A, light runs #ffffff -> #E4E9F0, and both are
+      wide enough for the wash to read. Written as [light, dark] pairs —
+      `defineTheme` folds them into `light-dark()`.
     */
-    '--color-background-body': ['#EEF1F5', '#0D0D0F'],
+    '--color-background-body': ['#E4E9F0', '#08080A'],
     '--color-shadow': ['rgba(5, 54, 89, 0.16)', 'rgba(0, 0, 0, 0.55)'],
   },
   components: {
-    /* The window itself. Painting the gradient as a background *image* leaves
-       the variant's background-color underneath as the fallback, so a browser
-       without color-mix still gets the flat wash. */
+    /* The window itself: flat, and the deepest thing on screen. The gradient
+       used to live here, which inverted the reference — a washed window under a
+       flat panel reads as the panel being a hole rather than a surface. The
+       explicit `none` is load-bearing: it is what a revert would have to delete,
+       and the harness asserts the backdrop paints no gradient. */
     'app-shell': {
-      base: { backgroundImage: WINDOW_GRADIENT },
+      base: {
+        backgroundColor: 'var(--color-background-body)',
+        backgroundImage: 'none',
+      },
     },
-    /* The region the sidebar sits in, not the sidebar. It has to be see-through
-       or the gradient stops at the panel's margin and the panel looks inset
-       into a flat strip rather than floating on the window. */
+    /*
+      The content pane, and the reason the first cut of this design still read as
+      inverted: core paints `astryx-layout-content` with
+      `--color-background-surface` — #262626 in dark mode, the *same* colour as
+      the panel's head. The panel then washed from that colour down to the body,
+      so over most of its height the sidebar was darker than the pane it was
+      supposed to float above.
+
+      Transparent, not `--color-background-body`: the app-shell already paints the
+      body colour and this pane covers all of it, so letting it through keeps one
+      painted surface instead of two that have to agree. Cards, inputs and table
+      rows keep `--color-background-surface` and now read as raised on top of it,
+      which is what the reference does.
+    */
+    'layout-content': {
+      base: { backgroundColor: 'transparent', backgroundImage: 'none' },
+    },
+    /* The region the sidebar sits in, not the sidebar. It stays see-through so
+       the flat window colour runs edge to edge under the panel's margin — a
+       painted strip here would give the panel a second, squarer outline. */
     'app-shell-sidenav': {
       base: { backgroundColor: 'transparent', backgroundImage: 'none' },
     },
-    /* The pill panel. */
+    /*
+      The pill panel, and the only gradient surface in the app.
+
+      Two background layers with two different clips — the standard way to draw
+      a gradient border on a rounded box, and the only one that follows
+      `border-radius`:
+
+        - `PANEL_GRADIENT` is clipped to the padding box, so it stops at the
+          inside of the 1px border.
+        - `PANEL_EDGE` fills the border box, so the ring is all that shows of it.
+        - `border-color: transparent` is what lets the second layer through.
+          `background-color` must be transparent for the same reason: the colour
+          is painted below every layer and clipped to the border box, so any
+          colour here would tint the ring — including at the bottom, where the
+          edge is deliberately absent.
+    */
     'side-nav': {
       base: {
-        backgroundColor: 'var(--color-background-surface)',
+        backgroundColor: 'transparent',
+        backgroundImage: `${PANEL_GRADIENT}, ${PANEL_EDGE}`,
+        backgroundOrigin: 'border-box',
+        backgroundClip: 'padding-box, border-box',
         borderRadius: PANEL_RADIUS,
         borderWidth: 'var(--border-width)',
         borderStyle: 'solid',
-        borderColor: 'var(--color-border)',
+        borderColor: 'transparent',
         boxShadow: PANEL_SHADOW,
       },
     },
