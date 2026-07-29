@@ -115,6 +115,22 @@ export const appTheme = defineTheme({
       and the reference's top-row glyphs are exactly that — no fill at rest,
       secondary ink, a surface that only appears under the pointer.
     */
+    /*
+      `backgroundImage: 'none'` in the interaction states is load-bearing, not
+      tidiness. Core paints Button's overlays as *images*, not colours: ghost
+      carries `x1ilzqfv`/`xq8i9tn`, which are
+
+        .x1ilzqfv:hover  { background-image: linear-gradient(var(--color-overlay-hover),   var(--color-overlay-hover)) }
+        .xq8i9tn:active  { background-image: linear-gradient(var(--color-overlay-pressed), var(--color-overlay-pressed)) }
+
+      (astryx.css:1152 and :1106). A `background-color` set here does not
+      replace that image — it composites *under* it, so restating the same
+      overlay token would paint the tint twice and every ghost control in the
+      app would hover at double strength. Clearing the image leaves exactly one
+      coat, drawn from the colour written below. It wins over core's rule
+      despite core's `:not(#\#)` specificity padding because theme overrides are
+      injected into `@layer astryx-theme`, above `@layer astryx-base`.
+    */
     button: {
       'variant:ghost': {
         backgroundColor: 'transparent',
@@ -122,9 +138,13 @@ export const appTheme = defineTheme({
         color: 'var(--color-icon-secondary)',
         ':hover': {
           backgroundColor: 'var(--color-overlay-hover)',
+          backgroundImage: 'none',
           color: 'var(--color-text-primary)',
         },
-        ':active': { backgroundColor: 'var(--color-overlay-pressed)' },
+        ':active': {
+          backgroundColor: 'var(--color-overlay-pressed)',
+          backgroundImage: 'none',
+        },
       },
     },
   },

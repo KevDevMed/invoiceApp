@@ -14,6 +14,9 @@
  * the exact bug this app ships into (Light/Dark/Auto are all user-selectable).
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import { generateThemeCSS } from '@astryxdesign/core/theme';
@@ -210,9 +213,32 @@ describe('nav items and ghost icon buttons', () => {
     expect(ghost.color).toBe('var(--color-icon-secondary)');
     expect(ghost[':hover']).toEqual({
       backgroundColor: 'var(--color-overlay-hover)',
+      backgroundImage: 'none',
       color: 'var(--color-text-primary)',
     });
-    expect(ghost[':active']).toEqual({ backgroundColor: 'var(--color-overlay-pressed)' });
+    expect(ghost[':active']).toEqual({
+      backgroundColor: 'var(--color-overlay-pressed)',
+      backgroundImage: 'none',
+    });
+  });
+
+  it('clears the inherited overlay image so the hover tint is single-strength', () => {
+    // Core paints ghost's hover/pressed overlay as a background-*image*
+    // (astryx.css:1152, :1106), which composites on top of any
+    // background-color rather than replacing it. Without these two
+    // `backgroundImage: none` declarations the same overlay token is painted
+    // twice and every ghost control in the app hovers at double strength.
+    // Asserted on both the object and the emitted CSS: this is the property
+    // whose deletion is the regression, so deleting it must fail here.
+    const ghost = rule('button', 'variant:ghost');
+    for (const state of [':hover', ':active'] as const) {
+      const styles = ghost[state];
+      if (typeof styles !== 'object') throw new Error(`ghost has no ${state} block`);
+      expect(styles.backgroundImage).toBe('none');
+      // The colour it replaces it with must be a single overlay layer, not a
+      // stack of gradients that would reintroduce the doubling by hand.
+      expect(styles.backgroundColor).not.toContain('gradient');
+    }
   });
 
   it('keeps the ghost radius below the panel radius', () => {
@@ -237,9 +263,40 @@ describe('generated CSS', () => {
       '.astryx-side-nav-item.selected {',
       '.astryx-button.ghost {',
       '.astryx-button.ghost:hover {',
+      '.astryx-button.ghost:active {',
     ]) {
       expect(all).toContain(selector);
     }
+  });
+
+  it('emits background-image: none in both ghost interaction rules', () => {
+    // The composited result cannot be measured in a node environment, so this
+    // asserts the next best thing: the declaration that neutralises core's
+    // overlay image reaches the stylesheet, in the same rule as the colour.
+    for (const selector of ['.astryx-button.ghost:hover', '.astryx-button.ghost:active']) {
+      const body = all.split(`${selector} {`)[1]?.split('}')[0];
+      if (body === undefined) throw new Error(`no emitted rule for ${selector}`);
+      expect(body).toContain('background-image: none;');
+      expect(body).toContain('background-color: var(--color-overlay-');
+    }
+  });
+
+  it('is the theme App.tsx actually hands to <Theme>', () => {
+    /*
+      Everything above tests an object no one is obliged to use. `App.tsx`
+      reverting `theme={appTheme}` to `theme={neutralTheme}` would leave this
+      whole file green while the gradient, the pill, the shadow, the nav tint
+      and the ghost override all vanish from the running app.
+
+      This is a source-text assertion because the root vitest project runs in
+      `environment: 'node'`: there is no DOM, so <App> cannot be mounted and
+      the prop cannot be read off a rendered tree. It is deliberately narrow —
+      the import and the one prop — so ordinary edits to App.tsx do not trip
+      it, and only the two edits that actually unwire the theme do.
+    */
+    const app = readFileSync(fileURLToPath(new URL('../../App.tsx', import.meta.url)), 'utf8');
+    expect(app).toMatch(/import\s*\{\s*appTheme\s*\}\s*from\s*'\.\/theme\/appTheme'/);
+    expect(app).toMatch(/<Theme\b[^>]*\btheme=\{appTheme\}/);
   });
 
   it('scopes the rules to this theme, not to neutral', () => {
