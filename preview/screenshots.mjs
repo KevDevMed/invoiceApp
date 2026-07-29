@@ -617,7 +617,8 @@ async function main() {
      * same discovery rule as contentColumnGutters, so the "gap to the content"
      * is measured against what actually holds the page, not a class name.
      * Also walks `.app-side-nav` and its ancestors up to (not including) body
-     * for sideways overflow, naming the first offender by class.
+     * for sideways overflow that could render a scrollbar, naming the first
+     * offender by class; clipped overhangs are reported informationally.
      */
     const panel = await page.evaluate(() => {
       const nav = document.querySelector('.app-side-nav');
@@ -635,12 +636,22 @@ async function main() {
         node = node.parentElement;
       }
 
+      // Only an `overflow-x: auto|scroll` box is a scroll container, so only
+      // those can paint a horizontal bar; a `clip`/`hidden` box still reports
+      // the clipped content through scrollWidth without ever scrolling. The
+      // first kind is a failure, the second is noted so growth stays visible.
       let overflowing = null;
+      const clippedOverhangs = [];
       for (let element = nav; element && element !== document.body; element = element.parentElement) {
         if (element.scrollWidth > element.clientWidth + 1) {
-          overflowing = `<${element.tagName.toLowerCase()} class="${element.getAttribute('class') ?? ''}"> ` +
+          const description = `<${element.tagName.toLowerCase()} class="${element.getAttribute('class') ?? ''}"> ` +
             `scrollWidth ${element.scrollWidth} > clientWidth ${element.clientWidth} + 1`;
-          break;
+          const overflowX = getComputedStyle(element).overflowX;
+          if (overflowX === 'auto' || overflowX === 'scroll') {
+            if (overflowing === null) overflowing = description;
+          } else {
+            clippedOverhangs.push(`${description} (overflow-x: ${overflowX}, cannot scroll)`);
+          }
         }
       }
 
@@ -653,6 +664,7 @@ async function main() {
         borderRadius: styles.borderRadius,
         boxShadow: styles.boxShadow,
         overflowing,
+        clippedOverhangs,
       };
     });
 
@@ -696,8 +708,11 @@ async function main() {
     checkTrue(
       'sidebar column has no sideways overflow',
       panel !== null && panel.overflowing === null,
-      panel === null ? 'not measured' : panel.overflowing ?? 'no element overflows',
+      panel === null ? 'not measured' : panel.overflowing ?? 'no scrollable element overflows',
     );
+    for (const overhang of panel?.clippedOverhangs ?? []) {
+      console.log(`  info  clipped overhang: ${overhang}`);
+    }
 
     // Photographed only once the pill it illustrates is proven on screen.
     if (insetOk && insetEqual && radiusOk && shadowOk) await shoot(page, 'sidebar-pill');
