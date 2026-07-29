@@ -471,6 +471,114 @@ async function waitForTheme(page, mode) {
   }
 }
 
+/**
+ * Sets the app's appearance and blocks until the repaint has landed.
+ *
+ * Appearance is no longer reachable from the invoices route: the sidebar keeps
+ * only a two-state glyph, and the Light/Dark/Auto radios moved to
+ * Settings > Appearance. So every mode switch is a round trip — go to Settings,
+ * click the radio, wait for the paint, come back to wherever the caller was.
+ *
+ * `returnTo` is a full hash route (e.g. `#/invoices`) and is navigated even when
+ * it is already the current one, because arriving from Settings is exactly what
+ * the callers below need. Returns whatever `waitForTheme` decided, so a caller
+ * can still report a FAIL rather than photographing an unsettled page.
+ *
+ * The final `reload()` is what makes the second reading worth taking. Hash
+ * navigation only remounts the route — the document, the React tree and the
+ * theme context all stay alive, so a `settings:set` that never persisted
+ * anything would still have passed. A reload throws the whole renderer away and
+ * the mode has to come back from storage, which is the claim being made.
+ *
+ * `Auto` is rejected rather than handled: `waitForTheme` decides settledness by
+ * measuring painted brightness against an expected appearance, and `Auto` has
+ * no expected appearance of its own — it resolves to whatever the host OS says.
+ * A caller that wants it needs to assert something else.
+ */
+async function setAppearance(page, mode, returnTo = '#/invoices') {
+  const expected = mode.toLowerCase();
+  if (expected !== 'light' && expected !== 'dark') {
+    throw new Error(`setAppearance: expected Light or Dark, got ${mode}`);
+  }
+  await page.goto(`${APP_ORIGIN}/#/settings`, { waitUntil: 'networkidle' });
+  const radio = page.getByRole('radio', { name: mode, exact: true });
+  await radio.first().waitFor({ timeout: 15_000 });
+  await radio.first().click();
+  const settled = await waitForTheme(page, expected);
+  await page.goto(`${APP_ORIGIN}/${returnTo.startsWith('#') ? '' : '#'}${returnTo}`, {
+    waitUntil: 'networkidle',
+  });
+  await page.reload({ waitUntil: 'networkidle' });
+  // Fresh document: the mode below was read back from storage, not from memory.
+  return (await waitForTheme(page, expected)) && settled;
+}
+
+/**
+ * Where the gradient is painted, as two independent readings.
+ *
+ * The design's whole claim is a *contrast*: the panel carries a vertical wash
+ * and the backdrop behind it is flat. Asserting only "something paints a
+ * gradient" passed against the previous, inverted design too — it is the pair
+ * that pins this one down.
+ */
+async function gradientSurfaces(page) {
+  return page.evaluate(() => {
+    const nav = document.querySelector('.app-side-nav');
+    if (!nav) return null;
+    const panel = getComputedStyle(nav).backgroundImage;
+    let backdrop = null;
+    for (let node = nav.parentElement; node; node = node.parentElement) {
+      const image = getComputedStyle(node).backgroundImage;
+      if (image.includes('gradient')) {
+        backdrop = `<${node.tagName.toLowerCase()} class="${node.getAttribute('class') ?? ''}"> ${image}`;
+        break;
+      }
+    }
+    // The walk ends at <html>, so "no gradient behind the panel" covers the
+    // shell, the layout panels, <body> and the document element alike.
+    return { panel, panelHasGradient: panel.includes('gradient'), backdrop };
+  });
+}
+
+/**
+ * The pane/panel relationship, read from computed styles.
+ *
+ * The design is a contrast between three surfaces: the window, the content pane
+ * painted with it, and the panel's lit head above both. `gradientSurfaces` above
+ * only proves *where* the gradient is; this proves the pane did not quietly keep
+ * core's `--color-background-surface` default, which is the same colour as the
+ * panel's first gradient stop.
+ */
+async function paneVersusPanel(page) {
+  return page.evaluate(() => {
+    const pane = document.querySelector('.astryx-layout-content');
+    if (!pane) return null;
+    const sum = (color) => {
+      const parts = (color.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+      return parts.length === 3 ? parts[0] + parts[1] + parts[2] : NaN;
+    };
+    const paneStyle = getComputedStyle(pane);
+    const body = getComputedStyle(document.body).backgroundColor;
+    // The panel's head is the gradient's first stop, resolved to real numbers by
+    // getComputedStyle — the substring up to the first percentage.
+    const image = getComputedStyle(document.querySelector('.app-side-nav')).backgroundImage;
+    const head = /linear-gradient\((.+?)\s+0%/.exec(image)?.[1] ?? '';
+    return {
+      pane: paneStyle.backgroundColor,
+      paneImage: paneStyle.backgroundImage,
+      body,
+      panelHead: head,
+      // Transparent counts: the app-shell paints the body colour underneath. Read
+      // the alpha rather than the sum, so an opaque black pane is not mistaken
+      // for a see-through one.
+      paneMatchesBody:
+        paneStyle.backgroundColor === body ||
+        (paneStyle.backgroundColor.match(/[\d.]+/g) ?? [])[3] === '0',
+      panelHeadOffPane: sum(head) - sum(body) >= 30 || sum(body) - sum(head) >= 30,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
@@ -775,33 +883,105 @@ async function main() {
       await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
     }
 
-    // --- Backdrop gradient, in both themes. The backdrop is whichever element
-    // behind the panel paints it: the nav's ancestors up to and including the
-    // document root, searched for a computed gradient background-image.
-    const backdropGradient = () =>
-      page.evaluate(() => {
-        let node = document.querySelector('.app-side-nav')?.parentElement ?? document.body;
-        for (; node; node = node.parentElement) {
-          const image = getComputedStyle(node).backgroundImage;
-          if (image.includes('gradient')) {
-            return `<${node.tagName.toLowerCase()} class="${node.getAttribute('class') ?? ''}"> ${image}`;
-          }
-        }
-        return null;
-      });
+    // --- The surface contract, in both themes: the *panel* paints a vertical
+    // gradient and nothing behind it paints one. Both halves are asserted,
+    // because "a gradient exists somewhere" was also true of the previous,
+    // inverted design (washed window, flat panel).
     for (const mode of ['Light', 'Dark']) {
-      await page.getByRole('radio', { name: mode }).click();
-      const settled = await waitForTheme(page, mode.toLowerCase());
-      const gradient = await backdropGradient();
+      const settled = await setAppearance(page, mode);
+      const surfaces = await gradientSurfaces(page);
       checkTrue(
-        `backdrop paints a gradient in ${mode.toLowerCase()} mode`,
-        settled && gradient !== null,
-        gradient ?? `no gradient background-image behind the panel (theme settled: ${settled})`,
+        `sidebar panel paints its own gradient in ${mode.toLowerCase()} mode`,
+        settled && surfaces !== null && surfaces.panelHasGradient,
+        surfaces === null
+          ? 'no .app-side-nav found'
+          : `theme settled: ${settled}, .app-side-nav background-image: ${surfaces.panel}`,
+      );
+      checkTrue(
+        `backdrop behind the panel stays flat in ${mode.toLowerCase()} mode`,
+        surfaces !== null && surfaces.backdrop === null,
+        surfaces?.backdrop ?? 'no gradient on any ancestor of .app-side-nav',
+      );
+      // The other half of the contrast, and the one the first cut got wrong: the
+      // content pane must be the *window* colour, not `--color-background-surface`
+      // (core's default for `astryx-layout-content`, and the same colour as the
+      // panel's head — which made the sidebar the darker of the two).
+      const pane = await paneVersusPanel(page);
+      checkTrue(
+        `content pane is flat window colour in ${mode.toLowerCase()} mode`,
+        pane !== null && pane.paneMatchesBody && pane.paneImage === 'none',
+        pane === null
+          ? 'no .astryx-layout-content found'
+          : `pane: ${pane.pane}, body: ${pane.body}, pane background-image: ${pane.paneImage}`,
+      );
+      checkTrue(
+        `panel head stands off the pane in ${mode.toLowerCase()} mode`,
+        pane !== null && pane.panelHeadOffPane,
+        pane === null ? 'no pane' : `panel head: ${pane.panelHead}, pane: ${pane.pane}`,
+      );
+      // Let the list finish arriving, or the shot photographs the spinner.
+      await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
+      await shoot(page, `sidebar-${mode.toLowerCase()}`);
+    }
+
+    // --- The sidebar's own appearance toggle actually flips the mode.
+    // It is a two-state glyph, so its accessible name states the destination
+    // and changes with every press — which is also how this finds it twice.
+    // The loop above left the app dark, so return to light first: the name to
+    // look for depends on the mode, and a fixed name needs a fixed baseline.
+    await setAppearance(page, 'Light');
+    const darkToggle = page.getByRole('button', { name: 'Switch to dark theme' });
+    const toggleFound = checkTrue(
+      'sidebar footer offers a "Switch to dark theme" control',
+      (await darkToggle.count()) > 0,
+      `buttons named "Switch to dark theme": ${await darkToggle.count()}`,
+    );
+    if (toggleFound) {
+      checkTrue(
+        'appearance toggle is inside the sidebar panel',
+        await darkToggle.first().evaluate((element) => element.closest('.app-side-nav') !== null),
+        'element.closest(".app-side-nav")',
+      );
+      await darkToggle.first().click();
+      const wentDark = await waitForTheme(page, 'dark');
+      const afterColors = await paintedColors(page);
+      checkTrue(
+        'sidebar toggle switches the app to dark',
+        wentDark,
+        `body: ${afterColors.body}, surface: ${afterColors.surface}`,
+      );
+      const lightToggle = page.getByRole('button', { name: 'Switch to light theme' });
+      checkTrue(
+        'the toggle relabels itself to the new destination',
+        (await lightToggle.count()) > 0,
+        `buttons named "Switch to light theme": ${await lightToggle.count()}`,
+      );
+      if ((await lightToggle.count()) > 0) {
+        await lightToggle.first().click();
+        checkTrue(
+          'sidebar toggle switches back to light',
+          await waitForTheme(page, 'light'),
+          `body: ${(await paintedColors(page)).body}`,
+        );
+      }
+    }
+    // --- Where the three-way control lives now. The sidebar glyph cannot
+    // express `Auto`, so Settings has to, and it has to apply immediately —
+    // outside the "Save settings" flow, like the update controls.
+    await page.goto(`${APP_ORIGIN}/#/settings`, { waitUntil: 'networkidle' });
+    await page.getByRole('heading', { name: 'Appearance', exact: true }).first().waitFor({ timeout: 15_000 });
+    for (const name of ['Light', 'Dark', 'Auto']) {
+      checkTrue(
+        `settings appearance offers "${name}"`,
+        (await page.getByRole('radio', { name, exact: true }).count()) > 0,
+        `radios named "${name}": ${await page.getByRole('radio', { name, exact: true }).count()}`,
       );
     }
+    await shoot(page, 'settings-appearance');
+
     // Back to the light baseline the rest of the run expects.
-    await page.getByRole('radio', { name: 'Light' }).click();
-    await waitForTheme(page, 'light');
+    await setAppearance(page, 'Light');
+    await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   } catch (error) {
     fail('sidebar pill panel section did not complete', String(error));
   }
@@ -1099,9 +1279,10 @@ async function main() {
   await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
   await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   // The theme mode is persisted in the database, so a previous run may have
-  // left it dark. Start from a known light baseline.
-  await page.getByRole('radio', { name: 'Light' }).click();
-  const lightSettled = await waitForTheme(page, 'light');
+  // left it dark. Start from a known light baseline. Set from Settings, which
+  // is the only place the three-way control lives now, and land back here.
+  const lightSettled = await setAppearance(page, 'Light');
+  await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   const lightColors = await paintedColors(page);
   checkTrue(
     'light baseline paints body and app surface light',
@@ -1109,8 +1290,8 @@ async function main() {
     `body: ${lightColors.body}, surface: ${lightColors.surface}`,
   );
 
-  await page.getByRole('radio', { name: 'Dark' }).click();
-  const darkSettled = await waitForTheme(page, 'dark');
+  const darkSettled = await setAppearance(page, 'Dark');
+  await page.getByText(expected.numbersInOrder[0], { exact: true }).first().waitFor({ timeout: 15_000 });
   const darkColors = await paintedColors(page);
   const repaintOk = checkTrue(
     'dark mode repaints body and app surface, not just body',
@@ -1141,8 +1322,7 @@ async function main() {
     console.log('  screenshot skipped: reports-dark (page was not dark)');
   }
 
-  await page.getByRole('radio', { name: 'Light' }).click();
-  await waitForTheme(page, 'light');
+  await setAppearance(page, 'Light');
 
   await browser.close();
 

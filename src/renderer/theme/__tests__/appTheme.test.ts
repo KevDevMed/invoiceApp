@@ -104,8 +104,8 @@ describe('appTheme identity', () => {
 describe('window/panel separation tokens', () => {
   it('darkens the window body in both modes so the panel can sit above it', () => {
     const [light, dark] = splitLightDark(token('--color-background-body'));
-    expect(light).toBe('#EEF1F5');
-    expect(dark).toBe('#0D0D0F');
+    expect(light).toBe('#E4E9F0');
+    expect(dark).toBe('#08080A');
     // The point of the override: further from the panel surface than neutral's.
     const [neutralLight, neutralDark] = splitLightDark(
       String((neutralTheme.tokens as Record<string, string | undefined>)['--color-background-body']),
@@ -128,18 +128,104 @@ describe('window/panel separation tokens', () => {
   });
 });
 
+/** WCAG 2.x relative luminance of a `#rrggbb` literal. */
+function relativeLuminance(value: string): number {
+  const hex = /^#([0-9a-f]{6})$/i.exec(value.trim())?.[1];
+  if (hex === undefined) throw new Error(`not a 6-digit hex colour: ${value}`);
+  const channels = [0, 2, 4].map((i) => {
+    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }) as [number, number, number];
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+/** WCAG contrast ratio between two `#rrggbb` literals, 1:1 .. 21:1. */
+function contrastRatio(a: string, b: string): number {
+  const [x, y] = [relativeLuminance(a), relativeLuminance(b)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+
+/*
+  The floor this file exists to hold from now on.
+
+  `layout-content` is transparent, so text no longer has one guaranteed white
+  pane under it: supporting copy lands on `--color-background-body` in the
+  content area and on the panel's foot, which is the same token. Retuning the
+  light body to #E4E9F0 without moving the ink is what put secondary text at
+  3.89:1 — passing on white, failing on the pane. Both surfaces are asserted
+  because only checking the friendlier one is how that shipped.
+*/
+describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
+  const AA_NORMAL = 4.5;
+
+  const surfaces = (index: 0 | 1): Array<[name: string, color: string]> => [
+    ['body/panel foot', splitLightDark(token('--color-background-body'))[index]],
+    ['surface (cards, inputs, rows)', splitLightDark(token('--color-background-surface'))[index]],
+  ];
+
+  for (const [modeName, index] of [
+    ['light', 0],
+    ['dark', 1],
+  ] as const) {
+    for (const inkToken of ['--color-text-secondary', '--color-text-primary']) {
+      for (const [surfaceName, background] of surfaces(index)) {
+        it(`${modeName}: ${inkToken} on ${surfaceName} clears ${AA_NORMAL}:1`, () => {
+          const ink = splitLightDark(token(inkToken))[index];
+          expect(contrastRatio(ink, background)).toBeGreaterThanOrEqual(AA_NORMAL);
+        });
+      }
+    }
+  }
+
+  it('exempts only --color-text-disabled, which WCAG 1.4.3 excludes', () => {
+    // #a3a3a3 measures 2.07:1 on the light pane and 2.52:1 on white — nowhere
+    // near AA, and deliberately so: disabled controls are outside 1.4.3. This
+    // asserts the exemption is narrow, i.e. that this is the *only* ink token
+    // the loop above skips. The theme defines no tertiary/placeholder ink.
+    const inks = Object.keys(tokenMap).filter((name) => /^--color-text-/.test(name));
+    const unchecked = inks.filter(
+      (name) => !['--color-text-secondary', '--color-text-primary'].includes(name),
+    );
+    expect(unchecked).toContain('--color-text-disabled');
+    expect(inks).not.toContain('--color-text-tertiary');
+  });
+
+  it('does not fix light mode by flattening the light gradient', () => {
+    // The other way out of the finding was lifting the body back toward white.
+    // The panel head is `--color-background-surface` and its foot is the body;
+    // they have to stay far enough apart for the wash to read at all.
+    const [surfaceLight] = splitLightDark(token('--color-background-surface'));
+    const [bodyLight] = splitLightDark(token('--color-background-body'));
+    expect(hexSum(surfaceLight) - hexSum(bodyLight)).toBeGreaterThanOrEqual(40);
+  });
+});
+
+const PANEL_GRADIENT =
+  'linear-gradient(180deg, ' +
+  'var(--color-background-surface) 0%, ' +
+  'color-mix(in srgb, var(--color-background-surface) 55%, var(--color-background-body)) 55%, ' +
+  'var(--color-background-body) 100%)';
+
+const PANEL_EDGE =
+  'linear-gradient(180deg, ' +
+  'var(--color-border-emphasized) 0%, ' +
+  'color-mix(in srgb, var(--color-border-emphasized) 35%, transparent) 40%, ' +
+  'transparent 80%)';
+
 describe('side-nav renders as a floating pill panel', () => {
   const base = rule('side-nav', 'base');
 
-  it('carries surface, radius, hairline border and shadow together', () => {
+  it('carries the wash, the fading edge, radius and a top inset highlight', () => {
     expect(base).toEqual({
-      backgroundColor: 'var(--color-background-surface)',
+      backgroundColor: 'transparent',
+      backgroundImage: `${PANEL_GRADIENT}, ${PANEL_EDGE}`,
+      backgroundOrigin: 'border-box',
+      backgroundClip: 'padding-box, border-box',
       borderRadius: 'calc(var(--radius-container) * 1.5)',
       borderWidth: 'var(--border-width)',
       borderStyle: 'solid',
-      borderColor: 'var(--color-border)',
-      boxShadow:
-        'var(--shadow-high), 0 var(--spacing-2) var(--spacing-8) color-mix(in srgb, var(--color-shadow) 60%, transparent)',
+      borderColor: 'transparent',
+      boxShadow: 'inset 0 var(--border-width) 0 color-mix(in srgb, var(--color-on-dark) 10%, transparent)',
     });
   });
 
@@ -152,47 +238,109 @@ describe('side-nav renders as a floating pill panel', () => {
     expect(rem * 16 * 1.5).toBeCloseTo(18, 5);
   });
 
-  it('adds a shadow layer beyond the inherited elevation token', () => {
-    // --shadow-high alone is tuned for dialogs over a scrim; the extra pool is
-    // what lifts the panel off a near-black window.
+  it('lifts the panel with an inset top highlight, not an outer shadow', () => {
+    // The old treatment was --shadow-high plus a pool underneath. Both paint
+    // *below* the panel, which redraws the bottom edge the gradient exists to
+    // dissolve. Nothing here may be an outer shadow.
     const boxShadow = prop('side-nav', 'base', 'boxShadow');
-    expect(boxShadow.startsWith('var(--shadow-high),')).toBe(true);
-    expect(boxShadow).toContain('var(--color-shadow)');
+    expect(boxShadow.startsWith('inset ')).toBe(true);
+    expect(boxShadow).not.toContain('var(--shadow-');
+    // One layer only: the sole commas left are color-mix's own, inside parens,
+    // so strip parenthesised groups until none nest and then look for a comma.
+    let flattened = boxShadow;
+    for (let previous = ''; previous !== flattened; ) {
+      previous = flattened;
+      flattened = flattened.replace(/\([^()]*\)/g, '');
+    }
+    expect(flattened).not.toContain(',');
+    expect(boxShadow).toContain('var(--color-on-dark)');
   });
 });
 
-describe('window background gradient', () => {
-  const gradient = prop('app-shell', 'base', 'backgroundImage');
+describe('the panel carries the gradient and the window does not', () => {
+  const gradient = prop('side-nav', 'base', 'backgroundImage');
 
-  it('is a single diagonal gradient built only from background tokens', () => {
-    expect(gradient).toBe(
-      'linear-gradient(155deg, ' +
-        'color-mix(in srgb, var(--color-background-body) 94%, var(--color-on-dark)) 0%, ' +
-        'var(--color-background-body) 45%, ' +
-        'color-mix(in srgb, var(--color-background-body) 88%, var(--color-on-light)) 100%)',
+  it('washes the panel vertically from the surface colour to the body colour', () => {
+    expect(gradient).toBe(`${PANEL_GRADIENT}, ${PANEL_EDGE}`);
+    // Vertical, top to bottom — the reference's panel is lightest at its head.
+    expect(PANEL_GRADIENT.startsWith('linear-gradient(180deg,')).toBe(true);
+  });
+
+  it('ends the wash on exactly the body colour, so the panel foot dissolves', () => {
+    // The single load-bearing claim of the whole design: the last stop is the
+    // window's own colour, unmixed. Anything else leaves a visible bottom edge.
+    const lastStop = PANEL_GRADIENT.slice(PANEL_GRADIENT.lastIndexOf(',') + 1).trim();
+    expect(lastStop).toBe('var(--color-background-body) 100%)');
+    expect(PANEL_GRADIENT.startsWith('linear-gradient(180deg, var(--color-background-surface) 0%,')).toBe(
+      true,
     );
   });
 
-  it('darkens toward the end stop in both modes', () => {
-    // --color-on-dark is white and --color-on-light is black in *either* mode,
-    // so the light stop leads and the dark stop trails whichever mode is on.
-    // Assert that here, because the whole two-mode claim rests on it.
-    // Mode-independent by construction: both are single values, not pairs...
-    const onDark = token('--color-on-dark');
-    const onLight = token('--color-on-light');
-    expect(onDark).not.toContain('light-dark(');
-    expect(onLight).not.toContain('light-dark(');
-    // ...and on-dark is the lighter of the two, so the first stop lightens and
-    // the last darkens no matter which mode is active.
-    expect(hexSum(onDark)).toBeGreaterThan(hexSum(onLight));
-    expect(gradient.indexOf('--color-on-dark')).toBeLessThan(gradient.indexOf('--color-on-light'));
+  it('is mode-correct by construction, not by a mix that happens to work', () => {
+    // Both ends are light-dark() pairs, so "surface at the top, body at the
+    // bottom" is true in light mode and in dark mode without a second gradient.
+    for (const name of ['--color-background-surface', '--color-background-body']) {
+      const [light, dark] = splitLightDark(token(name));
+      expect(light).not.toBe(dark);
+      expect(hexSum(light)).toBeGreaterThan(hexSum(dark));
+    }
+    // ...and the panel head is lighter than the window in both modes.
+    const [surfaceLight, surfaceDark] = splitLightDark(token('--color-background-surface'));
+    const [bodyLight, bodyDark] = splitLightDark(token('--color-background-body'));
+    expect(hexSum(surfaceLight)).toBeGreaterThan(hexSum(bodyLight));
+    expect(hexSum(surfaceDark)).toBeGreaterThan(hexSum(bodyDark));
   });
 
-  it('leaves the sidebar region see-through so the gradient runs under the panel', () => {
+  it('fades the edge out before the bottom, where panel and window are equal', () => {
+    // A uniform ring would contradict the wash. The last stop must be
+    // transparent, and it must arrive before the gradient's end.
+    expect(PANEL_EDGE).toContain('var(--color-border-emphasized) 0%');
+    expect(PANEL_EDGE.trimEnd().endsWith('transparent 80%)')).toBe(true);
+    // Drawn through the border box while the wash is clipped to the padding
+    // box: delete either clip and the ring becomes a solid 1px outline again.
+    expect(prop('side-nav', 'base', 'backgroundClip')).toBe('padding-box, border-box');
+    expect(prop('side-nav', 'base', 'backgroundOrigin')).toBe('border-box');
+    expect(prop('side-nav', 'base', 'borderColor')).toBe('transparent');
+    // Any painted background-color would tint the ring, including at the foot.
+    expect(prop('side-nav', 'base', 'backgroundColor')).toBe('transparent');
+  });
+
+  it('leaves the window flat — the gradient used to live here and must not return', () => {
+    expect(rule('app-shell', 'base')).toEqual({
+      backgroundColor: 'var(--color-background-body)',
+      backgroundImage: 'none',
+    });
+  });
+
+  it('leaves the sidebar region see-through so the flat window runs under the panel', () => {
     expect(rule('app-shell-sidenav', 'base')).toEqual({
       backgroundColor: 'transparent',
       backgroundImage: 'none',
     });
+  });
+
+  it('strips the content pane back to the window colour', () => {
+    // Core paints `astryx-layout-content` with --color-background-surface, which
+    // is the panel gradient's *first stop*. Left alone, the pane and the panel's
+    // head are the same colour and the panel reads as the darker surface — the
+    // exact inversion this design exists to fix. See-through, so the app-shell's
+    // body colour is the only thing painting the window.
+    expect(rule('layout-content', 'base')).toEqual({
+      backgroundColor: 'transparent',
+      backgroundImage: 'none',
+    });
+  });
+
+  it('paints exactly one gradient across every component override', () => {
+    // The screenshot harness asserts the same thing in a real browser; this is
+    // the source-side half, and it catches a gradient added to any other
+    // component without anyone having to remember to look.
+    const withGradient = Object.entries(componentMap).flatMap(([name, rules]) =>
+      Object.entries(rules ?? {})
+        .filter(([, block]) => JSON.stringify(block ?? {}).includes('gradient'))
+        .map(([key]) => `${name}.${key}`),
+    );
+    expect(withGradient).toEqual(['side-nav.base']);
   });
 });
 
