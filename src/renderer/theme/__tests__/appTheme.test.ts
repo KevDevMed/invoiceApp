@@ -177,6 +177,80 @@ describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
     }
   }
 
+  /*
+    The invoice tab strip, which introduces one new ink pairing: primary text on
+    a 10% tint of itself over the window body. The tint is a `color-mix()` with
+    transparent, so it composites over whatever is behind it — here always the
+    flat window (`layout-content` is transparent and the app-shell paints the
+    body colour), which is what makes the composite computable off two tokens.
+
+    The inactive pill is *not* tinted, and this block is where that decision is
+    held: the same maths run at 3% put secondary ink at 4.52:1 in light mode and
+    at 10% at 3.92:1, i.e. under the floor. Flat inactive pills keep their ink on
+    the surface the loop above already measures.
+  */
+  describe('invoice tab strip', () => {
+    const tabColors = rule('app-shell', 'base');
+
+    /** `color-mix(in srgb, X p%, transparent)` over `background`, as #rrggbb. */
+    function composite(ink: string, background: string, percent: number): string {
+      const channels = (value: string): [number, number, number] => {
+        const hex = /^#([0-9a-f]{6})$/i.exec(value.trim())?.[1];
+        if (hex === undefined) throw new Error(`not a 6-digit hex colour: ${value}`);
+        return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number];
+      };
+      const [front, back] = [channels(ink), channels(background)];
+      const alpha = percent / 100;
+      const mixed = front.map((value, i) => Math.round(value * alpha + back[i]! * (1 - alpha)));
+      return `#${mixed.map((value) => value.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    it('mixes the active fill toward the ink, so it lifts in dark and darkens in light', () => {
+      // A background *token* would not work: --color-background-muted is darker
+      // than the window in dark mode, so the active pill would sink.
+      const fill = String(tabColors['--color-invoice-tab-surface-active']);
+      expect(fill).toMatch(
+        /^color-mix\(in srgb, var\(--color-text-primary\) \d+%, transparent\)$/,
+      );
+      expect(String(tabColors['--color-invoice-tab-ink'])).toBe('var(--color-text-secondary)');
+      expect(String(tabColors['--color-invoice-tab-ink-active'])).toBe('var(--color-text-primary)');
+    });
+
+    const percent = Number(
+      /(\d+)%/.exec(String(tabColors['--color-invoice-tab-surface-active']))?.[1],
+    );
+
+    for (const [modeName, index] of [
+      ['light', 0],
+      ['dark', 1],
+    ] as const) {
+      it(`${modeName}: the active pill's ink clears ${AA_NORMAL}:1 on its own fill`, () => {
+        const ink = splitLightDark(token('--color-text-primary'))[index];
+        const body = splitLightDark(token('--color-background-body'))[index];
+        expect(Number.isNaN(percent)).toBe(false);
+        expect(contrastRatio(ink, composite(ink, body, percent))).toBeGreaterThanOrEqual(
+          AA_NORMAL,
+        );
+      });
+
+      it(`${modeName}: an inactive pill's ink clears ${AA_NORMAL}:1 on the flat window`, () => {
+        const ink = splitLightDark(token('--color-text-secondary'))[index];
+        const body = splitLightDark(token('--color-background-body'))[index];
+        expect(contrastRatio(ink, body)).toBeGreaterThanOrEqual(AA_NORMAL);
+      });
+    }
+
+    it('is why the inactive pill has no fill: light mode has no headroom for one', () => {
+      // The number that decided the design. Filling an inactive pill with the
+      // active tint and keeping secondary ink is below AA in light mode, so
+      // "only the active one is filled" is a contrast rule, not just a look.
+      const ink = splitLightDark(token('--color-text-secondary'))[0];
+      const body = splitLightDark(token('--color-background-body'))[0];
+      const primary = splitLightDark(token('--color-text-primary'))[0];
+      expect(contrastRatio(ink, composite(primary, body, percent))).toBeLessThan(AA_NORMAL);
+    });
+  });
+
   it('exempts only --color-text-disabled, which WCAG 1.4.3 excludes', () => {
     // #a3a3a3 measures 2.07:1 on the light pane and 2.52:1 on white — nowhere
     // near AA, and deliberately so: disabled controls are outside 1.4.3. This
@@ -400,6 +474,12 @@ describe('the panel carries the gradient and the window does not', () => {
       '--color-window-control-minimize': '#FEBC2E',
       '--color-window-control-zoom': '#28C840',
       '--color-icon-update-pending': 'light-dark(#0064E0, #2694FE)',
+      // The invoice tab strip's colours, declared here for the same reason and
+      // asserted in their own block below.
+      '--color-invoice-tab-ink': 'var(--color-text-secondary)',
+      '--color-invoice-tab-ink-active': 'var(--color-text-primary)',
+      '--color-invoice-tab-surface-active':
+        'color-mix(in srgb, var(--color-text-primary) 10%, transparent)',
     });
   });
 

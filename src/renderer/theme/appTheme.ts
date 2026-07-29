@@ -140,6 +140,41 @@ const WINDOW_CONTROL_COLORS = {
   '--color-icon-update-pending': 'light-dark(#0064E0, #2694FE)',
 } as const;
 
+/**
+ * Percentage of the ink colour mixed into the active invoice tab's fill.
+ *
+ * The same family as `NAV_SELECTED_TINT` and for the same reason — a mix toward
+ * the text colour lifts on a dark window and darkens on a light one — but two
+ * points stronger, because a nav pill sits on the panel's lit head while a tab
+ * sits on the flat window and has nothing else separating it.
+ */
+const TAB_ACTIVE_TINT_PERCENT = 10;
+
+/**
+ * The invoice tab strip's four colours.
+ *
+ * Custom properties for the same reason as `WINDOW_CONTROL_COLORS`: `tokens` is
+ * typed to Astryx's closed token set, and `components.token` is the *shared*
+ * Token rule — the invoices list paints its filter chips with the same component
+ * (see `features/invoices/InvoiceList.tsx`), so restyling `token` to make a tab
+ * look like a tab would restyle those too. Declared on the app-shell, they
+ * inherit down to the strip, and `styles/global.css` applies them to the two
+ * app-owned classes. Every literal stays here, in the token pipeline.
+ *
+ * Only the active pill is filled — the reference's inactive tabs are flat — and
+ * that is a legibility decision as much as a visual one. An inactive pill's ink
+ * is `--color-text-secondary`, already measured at 4.78:1 on the light window
+ * body; painting even a 3% tint under it drops that to 4.52:1 and a 10% tint to
+ * 3.92:1, under the AA floor. The filled pill can afford the tint because its ink
+ * is `--color-text-primary` (12.05:1 light, 13.81:1 dark on the composite).
+ * `theme/__tests__/appTheme.test.ts` composites the fill and asserts all four.
+ */
+const INVOICE_TAB_COLORS = {
+  '--color-invoice-tab-ink': 'var(--color-text-secondary)',
+  '--color-invoice-tab-ink-active': 'var(--color-text-primary)',
+  '--color-invoice-tab-surface-active': `color-mix(in srgb, var(--color-text-primary) ${TAB_ACTIVE_TINT_PERCENT}%, transparent)`,
+} as const;
+
 export const appTheme = defineTheme({
   name: 'invoiceapp',
   extends: neutralTheme,
@@ -188,6 +223,9 @@ export const appTheme = defineTheme({
            when one is waiting. Custom properties, so they inherit down to the
            sidebar rather than styling anything here. */
         ...WINDOW_CONTROL_COLORS,
+        /* And the tab strip's, which sits in the content column's band — on the
+           window's own flat colour, not on the panel. */
+        ...INVOICE_TAB_COLORS,
       },
     },
     /*

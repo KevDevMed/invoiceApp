@@ -6,6 +6,8 @@ import {
   COLLAPSED_RAIL_MIN_PX,
   collapsedRailInlineEndPx,
   collapsedRailWidth,
+  CONTENT_TITLE_BAR_MIN_HEIGHT,
+  contentTitleBarHeight,
   DEFAULT_COLLAPSED_RAIL_PX,
   DEFAULT_COLLAPSED_RAIL_WIDTH,
   hasPlaceholderWindowControls,
@@ -439,6 +441,46 @@ describe('sideNavControlRowHeight', () => {
     expect(SIDE_NAV_CONTROL_ROW_MIN_PX).toBeGreaterThanOrEqual(32);
     expect(resolvePx(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT)).toBe(SIDE_NAV_CONTROL_ROW_MIN_PX);
     expect(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT).toMatch(/^var\(--spacing-[\d-]+\)$/);
+  });
+});
+
+describe('contentTitleBarHeight', () => {
+  it('is the reserved light band wherever there is a cluster to clear', () => {
+    for (const info of [DARWIN, WEB_DESKTOP_INFO] as const) {
+      for (const hasContent of [false, true]) {
+        expect(contentTitleBarHeight(info, hasContent)).toBe(titleBarInset(info));
+        expect(resolvePx(contentTitleBarHeight(info, hasContent))).toBe(44);
+      }
+    }
+  });
+
+  it('stays flat zero on win32/linux while the band is empty', () => {
+    // The band with nothing in it is reserved space and nothing else. Giving it
+    // a height where the OS already paints a title bar is dead space at the top
+    // of every page.
+    for (const info of REAL_TITLE_BAR) {
+      expect(contentTitleBarHeight(info, false)).toBe(NO_TITLE_BAR_INSET);
+      expect(contentTitleBarHeight(info, false)).toBe('var(--spacing-0)');
+    }
+  });
+
+  it('grows to a real control height on win32/linux once tabs are open', () => {
+    // The bug this pins: `titleBarInset` is 0 there, so a tab strip rendered
+    // into that band is invisible — zero height, nothing to see or click.
+    for (const info of REAL_TITLE_BAR) {
+      expect(contentTitleBarHeight(info, true)).not.toBe(NO_TITLE_BAR_INSET);
+      expect(resolvePx(contentTitleBarHeight(info, true))).toBeGreaterThanOrEqual(
+        SIDE_NAV_CONTROL_ROW_MIN_PX,
+      );
+    }
+  });
+
+  it('reserves the full 44px the sm Toolbar occupies, not the sidebar’s 36px', () => {
+    // A `size="sm"` Toolbar is a 28px element plus 8px of block padding above
+    // and below it. 36px would clip the pills the band exists to show.
+    expect(resolvePx(CONTENT_TITLE_BAR_MIN_HEIGHT)).toBe(44);
+    expect(resolvePx(CONTENT_TITLE_BAR_MIN_HEIGHT)).toBeGreaterThan(SIDE_NAV_CONTROL_ROW_MIN_PX);
+    expect(CONTENT_TITLE_BAR_MIN_HEIGHT).toBe(OVERLAY_TITLE_BAR_INSET);
   });
 });
 

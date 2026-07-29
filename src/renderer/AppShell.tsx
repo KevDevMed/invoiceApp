@@ -34,6 +34,7 @@ import {
 } from '@astryxdesign/core/SideNav';
 
 import {
+  contentTitleBarHeight,
   hasPlaceholderWindowControls,
   isSectionSelected,
   NAV_GROUPS,
@@ -43,11 +44,11 @@ import {
   SIDE_NAV_WIDTH_STORAGE_ID,
   sideNavControlRowHeight,
   sideNavPanelGeometry,
-  titleBarInset,
   wasSideNavCollapsed,
   type NavGroup,
 } from './chrome';
 import { isDockVisible } from './ui/dockVisibility';
+import { InvoiceTabs, useInvoiceTabs } from './ui/InvoiceTabs';
 import { updateBadge } from './ui/updateBadge';
 import {
   nextThemeMode,
@@ -349,10 +350,14 @@ function WindowControlPlaceholders(): React.JSX.Element {
 function TitleBarInset({
   height,
   isDecorative = false,
+  justify = 'end',
   children,
 }: {
   height: string;
   isDecorative?: boolean;
+  /** Where the band's content sits. The sidebar ends its controls at the row's
+   *  inline end; the content column's tab strip starts at its inline start. */
+  justify?: 'start' | 'end';
   children?: React.ReactNode;
 }): React.JSX.Element {
   // size="static" so the band keeps its exact height: it is a flex child of a
@@ -371,7 +376,7 @@ function TitleBarInset({
         */
         width="100%"
         align="center"
-        justify="end"
+        justify={justify}
         gap={0.5}
         /*
           No inline padding of its own. SideNav's header wrapper already carries
@@ -405,8 +410,16 @@ export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const desktop = readDesktopInfo();
-  const inset = titleBarInset(desktop);
   const controlRowHeight = sideNavControlRowHeight(desktop);
+  /*
+    Open-invoice tabs. The state lives here — the shell is the only thing that
+    outlives a route change — and every decision it makes is in `ui/invoiceTabs`.
+    The band's height depends on whether the strip has anything to draw, because
+    `titleBarInset` is 0 on win32/linux where the OS paints a real title bar; see
+    `contentTitleBarHeight`.
+  */
+  const invoiceTabs = useInvoiceTabs();
+  const contentBandHeight = contentTitleBarHeight(desktop, invoiceTabs.tabs.length > 0);
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
   /*
     Collapse is controlled here for one reason: `headerEndContent` is hidden
@@ -615,11 +628,26 @@ export function AppShell(): React.JSX.Element {
       >
         <VStack gap={0} height="100%">
           {/*
-            Kept even though the bar that used to sit under it is gone: this is
-            the content half of the window's drag surface. Delete it and the
-            top-right of the window cannot be grabbed at all.
+            The content half of the window's drag surface — and now the strip of
+            open invoices, which is what the reserved band was being kept for.
+            Delete it and the top-right of the window cannot be grabbed at all.
+
+            With no tabs open `InvoiceTabs` renders null, so this is the same
+            empty, `aria-hidden`, fully draggable band it has always been: no
+            stray `+` on Settings. With tabs open the band is not decorative and
+            must not be `aria-hidden`, or the strip inside it would be clickable
+            but invisible to a screen reader.
           */}
-          <TitleBarInset height={inset} />
+          <TitleBarInset height={contentBandHeight} justify="start">
+            {invoiceTabs.tabs.length === 0 ? undefined : (
+              /* `size="fill"` so the strip owns the band's width and its own
+                 scroller decides what fits, rather than shrink-wrapping the
+                 pills and letting them push the band wider. */
+              <StackItem size="fill">
+                <InvoiceTabs state={invoiceTabs} />
+              </StackItem>
+            )}
+          </TitleBarInset>
           <StackItem size="fill">
             <Outlet />
           </StackItem>

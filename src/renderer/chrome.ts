@@ -384,3 +384,28 @@ export function sideNavControlRowHeight(info: DesktopInfo): string {
     ? OVERLAY_TITLE_BAR_INSET
     : SIDE_NAV_CONTROL_ROW_MIN_HEIGHT;
 }
+
+/**
+ * Height of the *content* column's band — the one that used to be reserved
+ * space and nothing else, and now holds the open-invoice tab strip.
+ *
+ * Same shape of decision as `sideNavControlRowHeight`, and it exists for the
+ * same reason: `titleBarInset` is 44px where there is a light cluster to clear
+ * and 0px on win32/linux, where the OS paints a real title bar — and a strip
+ * inside a zero-height band is a strip nobody can see or click.
+ *
+ * So the fallback is conditional on the band having something in it. With tabs
+ * open it is a real control height; with none it stays flat 0, which is what
+ * keeps a win32 build free of dead space above the page and keeps the band on
+ * Settings exactly the empty drag surface it is today.
+ *
+ * The fallback is the same 44px, not the sidebar's 36px, because the strip is a
+ * `size="sm"` Toolbar: a 28px element plus the 8px of block padding Toolbar puts
+ * above and below it. A 36px band would clip the pills it exists to show.
+ */
+export const CONTENT_TITLE_BAR_MIN_HEIGHT = OVERLAY_TITLE_BAR_INSET;
+
+export function contentTitleBarHeight(info: DesktopInfo, hasContent: boolean): string {
+  if (reservesTrafficLightBand(info)) return OVERLAY_TITLE_BAR_INSET;
+  return hasContent ? CONTENT_TITLE_BAR_MIN_HEIGHT : NO_TITLE_BAR_INSET;
+}

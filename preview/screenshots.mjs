@@ -695,6 +695,161 @@ async function paneVersusPanel(page) {
 }
 
 // ---------------------------------------------------------------------------
+// The open-invoice tab strip, in the content column's band
+// ---------------------------------------------------------------------------
+
+/** Accessible name of the trailing `+`, and of the draft tab it opens. */
+const NEW_TAB_BUTTON = 'New invoice tab';
+const DRAFT_TAB = 'New invoice';
+
+/** The strip, by role and name — `role="toolbar"`, `aria-label="Open invoices"`. */
+function tabStrip(page) {
+  return page.getByRole('toolbar', { name: 'Open invoices' });
+}
+
+/** Every control in the strip, by accessible name, in DOM order. */
+async function stripControlNames(page) {
+  if ((await tabStrip(page).count()) === 0) return [];
+  return tabStrip(page)
+    .getByRole('button')
+    .evaluateAll((elements) =>
+      elements.map((element) => (element.getAttribute('aria-label') ?? element.textContent ?? '').trim()),
+    );
+}
+
+/** Just the tabs: everything that is not a close control and not the `+`. */
+async function tabNames(page) {
+  const names = await stripControlNames(page);
+  return names.filter((name) => !name.startsWith('Close ') && name !== NEW_TAB_BUTTON);
+}
+
+/** Which tab carries `aria-current="page"`. Exactly one, or none off-feature. */
+async function activeTabName(page) {
+  const current = await tabStrip(page)
+    .getByRole('button')
+    .evaluateAll((elements) =>
+      elements
+        .filter((element) => element.getAttribute('aria-current') === 'page')
+        .map((element) => (element.textContent ?? '').trim()),
+    );
+  return current.length === 1 ? current[0] : (current.length === 0 ? null : current);
+}
+
+/**
+ * The content column's band, measured off the real DOM.
+ *
+ * `.app-drag-region` and the two `.app-invoice-tab*` classes are app-owned (the
+ * shell and `global.css` set them); the strip itself is found by its role. The
+ * drag numbers are the reason this is an `evaluate` rather than locators:
+ * `-webkit-app-region` is a computed style, and the invariant is about the exact
+ * three elements below — the pill, its close control, and the empty part of the
+ * band, which has to stay `drag` or the window loses its top edge.
+ */
+async function contentBand(page) {
+  return page.evaluate(() => {
+    const band = [...document.querySelectorAll('.app-drag-region')].find(
+      (element) => element.closest('.app-side-nav') === null,
+    );
+    if (!band) return null;
+    /*
+      `-webkit-app-region` is not inherited, and its initial value is `none` —
+      which is not a third behaviour but "unspecified": Chromium unions the rects
+      of elements set to `drag` and subtracts the rects set to `no-drag`, so what
+      a given pixel does is decided by the nearest ancestor that specifies a
+      value. Reading the hit element's own computed value would report `none` for
+      every plain wrapper inside the band and prove nothing.
+    */
+    const region = (element) => {
+      for (let node = element; node !== null; node = node.parentElement) {
+        const value = getComputedStyle(node).webkitAppRegion;
+        if (value && value !== 'none') return value;
+      }
+      return element === null ? null : 'none';
+    };
+    const rect = band.getBoundingClientRect();
+    const strip = band.querySelector('[role="toolbar"]');
+    const pill = band.querySelector('.app-invoice-tab');
+    const active = band.querySelector('.app-invoice-tab-active');
+    const inactive = band.querySelector('.app-invoice-tab:not(.app-invoice-tab-active)');
+    // A point in the band past everything interactive: still draggable?
+    const empty = document.elementFromPoint(rect.right - 6, rect.top + rect.height / 2);
+    return {
+      height: rect.height,
+      left: rect.left,
+      right: rect.right,
+      ariaHidden: band.getAttribute('aria-hidden'),
+      hasStrip: strip !== null,
+      stripRight: strip === null ? null : strip.getBoundingClientRect().right,
+      pillLeft: pill === null ? null : pill.getBoundingClientRect().left,
+      pillHeight: pill === null ? null : pill.getBoundingClientRect().height,
+      bandRegion: region(band),
+      emptyRegion: region(empty),
+      pillRegion: region(pill),
+      closeRegion: region(band.querySelector('.app-invoice-tab-close')),
+      activeBackground: active === null ? null : getComputedStyle(active).backgroundColor,
+      activeInk: active === null ? null : getComputedStyle(active).color,
+      inactiveBackground: inactive === null ? null : getComputedStyle(inactive).backgroundColor,
+      inactiveInk: inactive === null ? null : getComputedStyle(inactive).color,
+      pageHeadingLeft: (() => {
+        const heading = document.querySelector('h1');
+        return heading === null ? null : heading.getBoundingClientRect().left;
+      })(),
+    };
+  });
+}
+
+/** Accessible name of whatever currently has focus. */
+async function focusedName(page) {
+  return page.evaluate(() => {
+    const element = document.activeElement;
+    if (!element) return null;
+    return (element.getAttribute('aria-label') ?? element.textContent ?? '').trim();
+  });
+}
+
+/** Presses Tab from the top of the document until focus lands inside the strip. */
+async function tabIntoStrip(page, limit = 30) {
+  await page.evaluate(() => {
+    document.activeElement?.blur();
+  });
+  for (let index = 0; index < limit; index++) {
+    await page.keyboard.press('Tab');
+    const inside = await page.evaluate(
+      () => document.activeElement?.closest('.app-invoice-tabs') != null,
+    );
+    if (inside) return { name: await focusedName(page), presses: index + 1 };
+  }
+  return null;
+}
+
+/** Walks the toolbar's roving tabindex with ArrowRight, collecting names. */
+async function arrowWalk(page, steps) {
+  const names = [await focusedName(page)];
+  for (let index = 0; index < steps; index++) {
+    await page.keyboard.press('ArrowRight');
+    names.push(await focusedName(page));
+  }
+  return names;
+}
+
+/** Opens the nth invoice on the first page of the list. Returns its hash. */
+async function openInvoiceFromList(page, index) {
+  await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+  await page.getByRole('button', { name: 'Open', exact: true }).nth(index).waitFor({ timeout: 15_000 });
+  await page.getByRole('button', { name: 'Open', exact: true }).nth(index).click();
+  await page.waitForTimeout(700);
+  return new URL(page.url()).hash;
+}
+
+/** The shell's own inline overflow: many tabs must not widen the window. */
+async function shellOverflow(page) {
+  return page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -1356,6 +1511,219 @@ async function main() {
     await pendingPage.close();
   } catch (error) {
     fail('sidebar top-row chrome section did not complete', String(error));
+  }
+
+  // --- Invoice tabs --------------------------------------------------------
+  /*
+    The strip in the content column's band: one pill per open invoice, the active
+    one filled, a trailing `+`. Behaviour first, appearance second, and the
+    behaviour is asserted on role/name locators — `role="toolbar"` named
+    "Open invoices", the pills' own accessible names, `aria-current="page"` for
+    the active one — never on the pill class, which is only used for the two
+    things a locator cannot read: computed `-webkit-app-region` and colour.
+
+    Tab state is in memory (see `useInvoiceTabs`), so a `reload()` is the reset.
+  */
+  console.log('\nInvoice tabs');
+  try {
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.goto(`${APP_ORIGIN}/#/settings`, { waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.getByRole('heading', { name: 'Settings', exact: true }).first().waitFor({ timeout: 15_000 });
+
+    const settingsBand = await contentBand(page);
+    checkTrue(
+      'with no tabs open the band is empty reserved space',
+      settingsBand !== null && !settingsBand.hasStrip && settingsBand.ariaHidden === 'true',
+      `strip: ${settingsBand?.hasStrip}, aria-hidden: ${settingsBand?.ariaHidden}, height: ${settingsBand?.height}`,
+    );
+    check('Settings grows no stray +', await page.getByRole('button', { name: NEW_TAB_BUTTON }).count(), 0);
+    checkTrue(
+      'the empty band is still window-drag surface',
+      settingsBand !== null && settingsBand.bandRegion === 'drag' && settingsBand.emptyRegion === 'drag',
+      `band: ${settingsBand?.bandRegion}, empty point: ${settingsBand?.emptyRegion}`,
+    );
+
+    // --- one invoice, one tab ---------------------------------------------
+    const firstNumber = expected.numbersInOrder[0];
+    const firstHash = await openInvoiceFromList(page, 0);
+    check('opening an invoice opens exactly one tab', (await tabNames(page)).join('|'), firstNumber);
+    check('the tab is named after the invoice, not its id', await activeTabName(page), firstNumber);
+
+    // --- the editor is the same document, not a second tab ----------------
+    await page.getByRole('button', { name: 'Edit', exact: true }).first().click();
+    await page.waitForTimeout(900);
+    const editorHash = new URL(page.url()).hash;
+    checkTrue('Edit navigates to the editor route', editorHash.endsWith('/edit'), `hash: ${editorHash}`);
+    check('the editor keeps the invoice on one tab', (await tabNames(page)).join('|'), firstNumber);
+    check('the editor tab is still the active one', await activeTabName(page), firstNumber);
+
+    // --- a second invoice -------------------------------------------------
+    const secondNumber = expected.numbersInOrder[1];
+    const secondHash = await openInvoiceFromList(page, 1);
+    check('a second invoice appends a second tab', (await tabNames(page)).join('|'), `${firstNumber}|${secondNumber}`);
+    check('the newly opened invoice is the active tab', await activeTabName(page), secondNumber);
+
+    // --- clicking a tab moves the route ------------------------------------
+    await tabStrip(page).getByRole('button', { name: firstNumber, exact: true }).first().click();
+    await page.waitForTimeout(800);
+    check('clicking a tab navigates to its invoice', new URL(page.url()).hash, firstHash);
+    check('clicking a tab moves the active state with it', await activeTabName(page), firstNumber);
+
+    // --- closing the active tab hands over to its right neighbour ----------
+    await tabStrip(page).getByRole('button', { name: `Close invoice ${firstNumber}` }).click();
+    await page.waitForTimeout(800);
+    check('closing the active tab navigates to the surviving tab', new URL(page.url()).hash, secondHash);
+    check('the surviving tab is the only one left', (await tabNames(page)).join('|'), secondNumber);
+    check('the surviving tab is active', await activeTabName(page), secondNumber);
+
+    // --- closing the last tab lands on the list ---------------------------
+    await tabStrip(page).getByRole('button', { name: `Close invoice ${secondNumber}` }).click();
+    await page.waitForTimeout(800);
+    check('closing the last tab falls back to the invoices list', new URL(page.url()).hash, '#/invoices');
+    const closedBand = await contentBand(page);
+    checkTrue(
+      'the band is the empty reserved surface again',
+      closedBand !== null && !closedBand.hasStrip && closedBand.ariaHidden === 'true',
+      `strip: ${closedBand?.hasStrip}, aria-hidden: ${closedBand?.ariaHidden}`,
+    );
+
+    // --- the trailing + ---------------------------------------------------
+    // The `+` is part of the strip, so it only exists once a tab does.
+    await openInvoiceFromList(page, 0);
+    await tabStrip(page).getByRole('button', { name: NEW_TAB_BUTTON }).click();
+    await page.waitForTimeout(800);
+    check('+ opens the draft route', new URL(page.url()).hash, '#/invoices/new');
+    check('+ adds a New invoice tab', (await tabNames(page)).join('|'), `${firstNumber}|${DRAFT_TAB}`);
+    check('the draft tab is active', await activeTabName(page), DRAFT_TAB);
+    await tabStrip(page).getByRole('button', { name: NEW_TAB_BUTTON }).click();
+    await page.waitForTimeout(700);
+    check(
+      'pressing + twice activates the one draft rather than adding a second',
+      (await tabNames(page)).filter((name) => name === DRAFT_TAB).length,
+      1,
+    );
+    await tabStrip(page).getByRole('button', { name: 'Close new invoice' }).click();
+    await page.waitForTimeout(700);
+    check('closing the draft leaves the invoice tab', (await tabNames(page)).join('|'), firstNumber);
+
+    // --- appearance: only the active pill is filled ------------------------
+    await openInvoiceFromList(page, 1);
+    const twoTabs = await contentBand(page);
+    // "Flat pills, only the active one filled": the inactive pill's background
+    // must be genuinely unpainted (alpha 0 or the `transparent` keyword), not
+    // merely a different colour from the active one.
+    const unpainted = (color) =>
+      color === 'transparent' || color === 'rgba(0, 0, 0, 0)' || /[\s/]0\)$/.test(color ?? '');
+    checkTrue(
+      'only the active pill is filled — the inactive ones are flat',
+      twoTabs !== null && !unpainted(twoTabs.activeBackground) && unpainted(twoTabs.inactiveBackground),
+      `active: ${twoTabs?.activeBackground}, inactive: ${twoTabs?.inactiveBackground}`,
+    );
+    checkTrue(
+      'the active pill carries brighter ink than the inactive ones',
+      twoTabs !== null && twoTabs.activeInk !== twoTabs.inactiveInk,
+      `active ink: ${twoTabs?.activeInk}, inactive ink: ${twoTabs?.inactiveInk}`,
+    );
+    checkTrue(
+      'the pills are inside the band and start level with the page below',
+      twoTabs !== null &&
+        twoTabs.pillLeft !== null &&
+        twoTabs.pageHeadingLeft !== null &&
+        Math.abs(twoTabs.pillLeft - twoTabs.pageHeadingLeft) <= 2,
+      `pill left: ${twoTabs?.pillLeft}, h1 left: ${twoTabs?.pageHeadingLeft}`,
+    );
+
+    // --- drag region -------------------------------------------------------
+    checkTrue(
+      'the pill and its close control opt out of the drag region',
+      twoTabs !== null && twoTabs.pillRegion === 'no-drag' && twoTabs.closeRegion === 'no-drag',
+      `pill: ${twoTabs?.pillRegion}, close: ${twoTabs?.closeRegion}`,
+    );
+    checkTrue(
+      'the band beyond the strip keeps dragging the window',
+      twoTabs !== null && twoTabs.bandRegion === 'drag' && twoTabs.emptyRegion === 'drag',
+      `band: ${twoTabs?.bandRegion}, empty point: ${twoTabs?.emptyRegion}`,
+    );
+
+    // --- keyboard ----------------------------------------------------------
+    const reached = await tabIntoStrip(page);
+    checkTrue(
+      'Tab reaches the strip',
+      reached !== null,
+      reached === null ? 'never focused anything inside the strip' : `after ${reached.presses} presses: ${reached.name}`,
+    );
+    const walk = await arrowWalk(page, 5);
+    checkTrue(
+      'arrow keys walk the pills and their close controls',
+      walk.some((name) => name?.startsWith('Close ')) && walk.some((name) => name === secondNumber || name === firstNumber),
+      `focus order: ${JSON.stringify(walk)}`,
+    );
+
+    // --- six tabs, two widths, no horizontal scrollbar --------------------
+    for (let index = 2; index < 6; index++) await openInvoiceFromList(page, index);
+    check('six invoices, six tabs', (await tabNames(page)).length, 6);
+    for (const width of [1000, 1600]) {
+      await page.setViewportSize({ width, height: 960 });
+      await page.waitForTimeout(400);
+      const overflow = await shellOverflow(page);
+      const band = await contentBand(page);
+      checkTrue(
+        `six tabs do not widen the shell at ${width}px (light)`,
+        overflow.scrollWidth === overflow.clientWidth,
+        `scrollWidth: ${overflow.scrollWidth}, clientWidth: ${overflow.clientWidth}`,
+      );
+      checkTrue(
+        `the strip stays inside the band at ${width}px`,
+        band !== null && band.stripRight !== null && band.stripRight <= band.right + 1,
+        `strip right: ${band?.stripRight}, band right: ${band?.right}`,
+      );
+    }
+
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.waitForTimeout(400);
+    await shoot(page, 'invoice-tabs-light');
+
+    // The band's left edge is only visible with the sidebar out of the way.
+    await page.getByRole('button', { name: 'Toggle sidebar' }).first().click();
+    await page.waitForTimeout(600);
+    await shoot(page, 'invoice-tabs-collapsed');
+    await page.getByRole('button', { name: 'Toggle sidebar' }).first().click();
+    await page.waitForTimeout(600);
+
+    // --- dark mode ---------------------------------------------------------
+    // setAppearance reloads, which is also the tab state's reset — so the tabs
+    // are reopened after the switch rather than expected to survive it.
+    const darkOk = await setAppearance(page, 'Dark');
+    for (let index = 0; index < 3; index++) await openInvoiceFromList(page, index);
+    check('three tabs open in dark mode', (await tabNames(page)).length, 3);
+    const darkBand = await contentBand(page);
+    checkTrue(
+      'dark mode fills only the active pill, with its own ink',
+      darkOk &&
+        darkBand !== null &&
+        darkBand.activeBackground !== darkBand.inactiveBackground &&
+        darkBand.activeInk !== darkBand.inactiveInk,
+      `active: ${darkBand?.activeBackground} / ${darkBand?.activeInk}, inactive: ${darkBand?.inactiveBackground} / ${darkBand?.inactiveInk}`,
+    );
+    for (const width of [1000, 1600]) {
+      await page.setViewportSize({ width, height: 960 });
+      await page.waitForTimeout(400);
+      const overflow = await shellOverflow(page);
+      checkTrue(
+        `three tabs do not widen the shell at ${width}px (dark)`,
+        overflow.scrollWidth === overflow.clientWidth,
+        `scrollWidth: ${overflow.scrollWidth}, clientWidth: ${overflow.clientWidth}`,
+      );
+    }
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.waitForTimeout(400);
+    if (darkOk) await shoot(page, 'invoice-tabs-dark');
+    else console.log('  screenshot skipped: invoice-tabs-dark (page was not dark)');
+
+    await setAppearance(page, 'Light');
+  } catch (error) {
+    fail('invoice tabs section did not complete', String(error));
   }
 
   // --- Pagination ----------------------------------------------------------
