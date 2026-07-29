@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -367,5 +369,36 @@ describe('SECTION_ROUTES', () => {
     expect(SECTION_ROUTES.filter((route) => route.group === undefined).map((r) => r.label)).toEqual([
       'Settings',
     ]);
+  });
+});
+
+/*
+ * These read AppShell.tsx as *text* rather than rendering it. The root vitest
+ * project is `environment: 'node'` with no DOM harness, so the component cannot
+ * be mounted here — and every test above proves only that the helpers return
+ * the right values, not that the shell still calls them. Drop the geometry
+ * spread, or hand the sidebar's control row `titleBarInset` (0px off macOS,
+ * which hides the only collapse toggle), and everything above stays green.
+ *
+ * Deliberately loose: each assertion pins one *usage*, not a line, a shape or a
+ * formatting choice, so ordinary edits to the file do not fail them.
+ */
+describe('AppShell consumes the chrome helpers', () => {
+  const source = readFileSync(new URL('../AppShell.tsx', import.meta.url), 'utf8');
+
+  it('spreads the panel geometry instead of inlining lengths', () => {
+    expect(source).toMatch(/\.\.\.sideNavPanelGeometry\(/);
+  });
+
+  it('sizes the sidebar control row from its own helper, not the title-bar inset', () => {
+    expect(source).toMatch(/sideNavControlRowHeight\(/);
+    // The bug: `height={inset}` on the sidebar's band. `inset` is the content
+    // column's, and it is `var(--spacing-0)` everywhere but macOS.
+    expect(source).toMatch(/height=\{controlRowHeight\}/);
+  });
+
+  it('keeps the toggle name fixed and moves its state to aria-expanded', () => {
+    expect(source).toMatch(/SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar'/);
+    expect(source).toMatch(/aria-expanded=\{!isCollapsed\}/);
   });
 });

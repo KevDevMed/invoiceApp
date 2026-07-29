@@ -316,6 +316,10 @@ function TitleBarInset({
  * purpose: the screenshot harness asserts it, and the glyph does not change
  * between states either. Not derived from anything — a computed name is a name
  * that can drift out from under the harness.
+ *
+ * A fixed name would otherwise cost a screen-reader user the state the design
+ * system's own default name carried ("Expand sidebar" / "Collapse sidebar"), so
+ * the state moves to `aria-expanded` instead — see `collapseToggle` below.
  */
 const SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar';
 
@@ -381,8 +385,17 @@ export function AppShell(): React.JSX.Element {
     />
   ) : null;
 
+  /*
+    `aria-expanded` carries the state the fixed label cannot. SideNavCollapseButton
+    does not set it itself (only SideNavItem does), and it spreads its rest props
+    into Button, which spreads them onto the rendered `<button>` — so this lands
+    on the real element. `label` still wins the accessible name: Button applies
+    its own `aria-label` *after* the spread. State comes from `isCollapsed`, the
+    controlled value SideNav is driven by, so the attribute cannot disagree with
+    what the rail is doing.
+  */
   const collapseToggle = (
-    <SideNavCollapseButton label={SIDE_NAV_TOGGLE_LABEL}>
+    <SideNavCollapseButton label={SIDE_NAV_TOGGLE_LABEL} aria-expanded={!isCollapsed}>
       <Icon icon={PanelToggleIcon} size="sm" />
     </SideNavCollapseButton>
   );
