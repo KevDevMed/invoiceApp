@@ -203,6 +203,9 @@ export const OVERLAY_COLLAPSED_RAIL_WIDTH = 'calc(var(--spacing-11) * 2)';
 /** No overlay controls, no light zone to clear — the design system's own width. */
 export const DEFAULT_COLLAPSED_RAIL_WIDTH = 'var(--spacing-12)';
 
+/** --spacing-12, in px. Paired with the token above so the two cannot drift. */
+export const DEFAULT_COLLAPSED_RAIL_PX = 48;
+
 /**
  * Minimum width of the collapsed icon rail, as a CSS length.
  *
@@ -214,4 +217,93 @@ export function collapsedRailWidth(info: DesktopInfo): string {
   return info.hasOverlayWindowControls
     ? OVERLAY_COLLAPSED_RAIL_WIDTH
     : DEFAULT_COLLAPSED_RAIL_WIDTH;
+}
+
+/**
+ * The sidebar's inset budget — how far the floating panel sits from each window
+ * edge, and from the content column.
+ *
+ * One value on all four edges, so the panel reads as a pill rather than a column
+ * that happens to have rounded corners. The block-axis total is what the panel's
+ * `blockSize` has to subtract: the panel is a 100%-height flex item, and a
+ * margin on a `border-box` element is *outside* the box, so
+ * `blockSize: 100%` plus `marginBlock` overflows its parent by exactly the two
+ * margins. `PANEL_INSET_TOTAL` is that pair, named once so the margin and the
+ * size calc cannot drift apart — the drift is invisible until it pushes a
+ * scrollbar onto the shell.
+ */
+export const PANEL_INSET = 'var(--spacing-2)';
+
+/** --spacing-2, in px. Paired with the token so the two cannot drift. */
+export const PANEL_INSET_PX = 8;
+
+/** Both block-axis insets, as one token: --spacing-4 is exactly 2 x --spacing-2. */
+export const PANEL_INSET_TOTAL = 'var(--spacing-4)';
+
+/** --spacing-4, in px. Must stay equal to `2 * PANEL_INSET_PX`. */
+export const PANEL_INSET_TOTAL_PX = 16;
+
+/** The floating panel's geometry. Purely size and position — never appearance. */
+export interface SideNavPanelGeometry {
+  readonly marginBlock: string;
+  readonly marginInline: string;
+  readonly blockSize: string;
+  readonly minInlineSize: string;
+}
+
+/**
+ * Geometry for the inset sidebar panel.
+ *
+ * Radius, background, shadow and border are deliberately absent: those are the
+ * theme's, and a value set here would win over the theme by virtue of being an
+ * inline style. `minInlineSize` is the one width property this may set — see
+ * `collapsedRailWidth` for why a floor, rather than a width, is the right lever.
+ */
+export function sideNavPanelGeometry(info: DesktopInfo): SideNavPanelGeometry {
+  return {
+    marginBlock: PANEL_INSET,
+    marginInline: PANEL_INSET,
+    blockSize: `calc(100% - ${PANEL_INSET_TOTAL})`,
+    minInlineSize: collapsedRailWidth(info),
+  };
+}
+
+/**
+ * Inline-end edge of the collapsed rail, in px, measured from the window edge.
+ *
+ * The rail no longer starts at x=0 — it starts at `PANEL_INSET_PX`. That inset
+ * eats into the clearance the rail's width was chosen to provide, so the two
+ * have to be checked together against the traffic lights rather than apart.
+ */
+export function collapsedRailInlineEndPx(info: DesktopInfo): number {
+  const width = info.hasOverlayWindowControls ? COLLAPSED_RAIL_MIN_PX : DEFAULT_COLLAPSED_RAIL_PX;
+  return PANEL_INSET_PX + width;
+}
+
+/**
+ * Rightmost pixel the macOS traffic lights reach under `hiddenInset`. The
+ * cluster spans roughly x 13-70; the collapsed rail has to end past this or the
+ * green light straddles the panel's edge.
+ */
+export const TRAFFIC_LIGHT_ZONE_END_PX = 70;
+
+/**
+ * Height of the sidebar's top control row — the band holding the traffic lights
+ * and the two ghost icon buttons.
+ *
+ * On macOS this is the same 44px band `titleBarInset` reserves, so the buttons
+ * sit beside the lights rather than below them. Everywhere else `titleBarInset`
+ * is zero — there are no lights to clear — but the row still has to be tall
+ * enough to *show the buttons*, so it falls back to a real control height
+ * instead of collapsing to nothing and hiding the only collapse toggle.
+ */
+export const SIDE_NAV_CONTROL_ROW_MIN_HEIGHT = 'var(--spacing-9)';
+
+/** --spacing-9, in px. Comfortably clears a `size="sm"` icon button. */
+export const SIDE_NAV_CONTROL_ROW_MIN_PX = 36;
+
+export function sideNavControlRowHeight(info: DesktopInfo): string {
+  return info.hasOverlayWindowControls
+    ? OVERLAY_TITLE_BAR_INSET
+    : SIDE_NAV_CONTROL_ROW_MIN_HEIGHT;
 }

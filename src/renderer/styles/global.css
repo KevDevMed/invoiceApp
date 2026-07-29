@@ -71,6 +71,43 @@ body {
 }
 
 /*
+ * Removes the horizontal scrollbar that ran under the sidebar.
+ *
+ * The bar was never the sidebar's: the rules above hide bars on `.app-side-nav`
+ * and its descendants, and SideNav's own scroll region is `overflow-x: hidden`.
+ * It belonged to an *ancestor*. `AppShell` renders the sidebar inside a
+ * `LayoutPanel` with `isScrollable={height === 'fill'}` — we pass
+ * `height="fill"` — so that panel is `overflow: auto`. Measured in Chromium at
+ * a 1280px viewport: the panel's scrollWidth was 275 against a clientWidth of
+ * 272, i.e. 3px of inline overflow.
+ *
+ * The 3px is not the panel's margins — the panel's width already resolves to
+ * the sidebar's full margin box. It is the resize handle's hit area: a 16px
+ * absolutely-positioned box centred on the sidebar's inline-end edge and then
+ * biased back by a third of its own width, so it lands 16/6 = 2.67px past that
+ * edge (measured right: 274.67 against a container edge of 272). Being
+ * absolutely positioned it contributes nothing to the panel's intrinsic width,
+ * but it does contribute to its scrollable overflow — so the panel grew a
+ * scroll range no content ever occupied.
+ *
+ * `overflow-x: clip` on the handle's own wrapper ends the overflow rather than
+ * hiding the bar: clipped content stops propagating to the ancestor's scroll
+ * area entirely. Nothing is lost — the clip removes 2.67px of an invisible,
+ * transparent grab zone, leaving ~13px of it, and the sidebar's own content is
+ * inside `nav`, which is a separate `overflow: hidden` box that this does not
+ * touch. `overflow-y` stays `visible` (only `clip` may pair with `visible`),
+ * and the collapsed rail's flyouts are `usePopover`, which renders into the top
+ * layer and so escapes this and every other clip.
+ *
+ * Selected via `:has()` because the wrapper is a design-system internal with
+ * only hashed StyleX class names — the sidebar it wraps is the stable handle.
+ */
+:has(> .app-side-nav) {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+/*
  * The floating assistant dock. Two things here have no design-system
  * equivalent, which is the only sanctioned reason for app-level CSS: fixed
  * positioning (no Astryx layout component exposes it) and sizing measured

@@ -2,22 +2,35 @@ import { describe, expect, it } from 'vitest';
 
 import {
   COLLAPSED_RAIL_MIN_PX,
+  collapsedRailInlineEndPx,
   collapsedRailWidth,
+  DEFAULT_COLLAPSED_RAIL_PX,
   DEFAULT_COLLAPSED_RAIL_WIDTH,
   isSectionSelected,
   NO_TITLE_BAR_INSET,
   OVERLAY_COLLAPSED_RAIL_WIDTH,
   OVERLAY_TITLE_BAR_INSET,
+  PANEL_INSET,
+  PANEL_INSET_PX,
+  PANEL_INSET_TOTAL,
+  PANEL_INSET_TOTAL_PX,
   readDesktopInfo,
   SECTION_ROUTES,
   RESIZABLE_STORAGE_PREFIX,
+  SIDE_NAV_CONTROL_ROW_MIN_HEIGHT,
+  SIDE_NAV_CONTROL_ROW_MIN_PX,
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   SIDE_NAV_WIDTH_STORAGE_KEY,
+  sideNavControlRowHeight,
+  sideNavPanelGeometry,
   titleBarInset,
+  TRAFFIC_LIGHT_ZONE_END_PX,
   wasSideNavCollapsed,
   WEB_DESKTOP_INFO,
 } from '../chrome';
+
+const DARWIN = { platform: 'darwin', hasOverlayWindowControls: true } as const;
 
 // Same reasoning as APPROVED_OVERLAY_INSET below: asserting the fallback
 // against WEB_DESKTOP_INFO only proves readDesktopInfo returns whatever that
@@ -127,6 +140,9 @@ describe('isSectionSelected', () => {
 // only the string 'calc(var(--spacing-11) * 2)' would pass just as happily for
 // --spacing-2 (8px), which is the bug this suite exists to prevent.
 const SPACING_PX: Readonly<Record<string, number>> = {
+  '--spacing-2': 8,
+  '--spacing-4': 16,
+  '--spacing-9': 36,
   '--spacing-11': 44,
   '--spacing-12': 48,
 };
@@ -235,6 +251,103 @@ describe('wasSideNavCollapsed', () => {
   // and under `environment: 'node'` there is no localStorage to fall back on.
   it('defaults to expanded with no arguments', () => {
     expect(wasSideNavCollapsed()).toBe(false);
+  });
+});
+
+// The approved inset, written out rather than imported. Comparing the geometry
+// against PANEL_INSET would only re-assert the module against itself.
+const APPROVED_PANEL_INSET = 'var(--spacing-2)';
+
+describe('sideNavPanelGeometry', () => {
+  it('insets the panel equally on all four edges', () => {
+    const geometry = sideNavPanelGeometry(DARWIN);
+    expect(geometry.marginBlock).toBe(APPROVED_PANEL_INSET);
+    expect(geometry.marginInline).toBe(APPROVED_PANEL_INSET);
+    expect(PANEL_INSET).toBe(APPROVED_PANEL_INSET);
+  });
+
+  // The bug this pins: add a fourth-side inset, forget the block-size calc, and
+  // the panel's margin box runs past its parent — which is a scroll container.
+  it('subtracts exactly both block insets from the panel height', () => {
+    expect(PANEL_INSET_TOTAL_PX).toBe(PANEL_INSET_PX * 2);
+    expect(resolvePx(PANEL_INSET_TOTAL)).toBe(resolvePx(PANEL_INSET) * 2);
+    expect(sideNavPanelGeometry(DARWIN).blockSize).toBe(`calc(100% - ${PANEL_INSET_TOTAL})`);
+  });
+
+  it('keeps the collapsed-rail floor as the only width lever', () => {
+    expect(sideNavPanelGeometry(DARWIN).minInlineSize).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
+    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).minInlineSize).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+  });
+
+  // Radius, background, shadow and border belong to the theme. An inline style
+  // beats a theme rule, so a stray one here silently overrides the theme.
+  it('carries no appearance properties', () => {
+    for (const info of [DARWIN, WEB_DESKTOP_INFO]) {
+      expect(Object.keys(sideNavPanelGeometry(info)).sort()).toEqual([
+        'blockSize',
+        'marginBlock',
+        'marginInline',
+        'minInlineSize',
+      ]);
+    }
+  });
+
+  it('is built from spacing tokens, never raw pixels', () => {
+    const geometry = sideNavPanelGeometry(DARWIN);
+    expect(geometry.marginBlock).toMatch(/^var\(--spacing-[\d-]+\)$/);
+    expect(geometry.marginInline).toMatch(/^var\(--spacing-[\d-]+\)$/);
+    expect(geometry.blockSize).toMatch(/^calc\(100% - var\(--spacing-[\d-]+\)\)$/);
+  });
+});
+
+describe('collapsedRailInlineEndPx', () => {
+  // The inset moved the rail's start edge off x=0, eating into the clearance
+  // the rail width was picked for. Rail and inset must be checked together.
+  it('still clears the traffic lights once the panel is inset', () => {
+    expect(collapsedRailInlineEndPx(DARWIN)).toBeGreaterThan(TRAFFIC_LIGHT_ZONE_END_PX);
+    expect(collapsedRailInlineEndPx(DARWIN)).toBe(PANEL_INSET_PX + COLLAPSED_RAIL_MIN_PX);
+  });
+
+  it('pins the traffic-light zone rather than deriving it', () => {
+    expect(TRAFFIC_LIGHT_ZONE_END_PX).toBe(70);
+  });
+
+  it('uses the design system rail where there are no overlay controls', () => {
+    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBe(
+      PANEL_INSET_PX + DEFAULT_COLLAPSED_RAIL_PX,
+    );
+    expect(resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH)).toBe(DEFAULT_COLLAPSED_RAIL_PX);
+  });
+});
+
+describe('sideNavControlRowHeight', () => {
+  // On macOS the buttons share the band with the lights, so it is the same
+  // 44px `titleBarInset` already reserves.
+  it('matches the reserved title-bar band on macOS', () => {
+    expect(sideNavControlRowHeight(DARWIN)).toBe(titleBarInset(DARWIN));
+    expect(resolvePx(sideNavControlRowHeight(DARWIN))).toBe(44);
+  });
+
+  // The bug this pins: `titleBarInset` is 0 off macOS. Reuse it for the control
+  // row and the row collapses to nothing, hiding the only collapse toggle.
+  it('never collapses to zero where there is no title-bar band', () => {
+    for (const info of [
+      WEB_DESKTOP_INFO,
+      { platform: 'win32', hasOverlayWindowControls: false } as const,
+      { platform: 'linux', hasOverlayWindowControls: false } as const,
+    ]) {
+      expect(titleBarInset(info)).toBe(NO_TITLE_BAR_INSET);
+      expect(sideNavControlRowHeight(info)).not.toBe(NO_TITLE_BAR_INSET);
+      expect(resolvePx(sideNavControlRowHeight(info))).toBeGreaterThanOrEqual(
+        SIDE_NAV_CONTROL_ROW_MIN_PX,
+      );
+    }
+  });
+
+  it('is tall enough for an icon button, from spacing tokens', () => {
+    expect(SIDE_NAV_CONTROL_ROW_MIN_PX).toBeGreaterThanOrEqual(32);
+    expect(resolvePx(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT)).toBe(SIDE_NAV_CONTROL_ROW_MIN_PX);
+    expect(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT).toMatch(/^var\(--spacing-[\d-]+\)$/);
   });
 });
 
