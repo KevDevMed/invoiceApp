@@ -109,9 +109,13 @@ const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
 
 // A line that OPENS a fenced code block: a run of at least three backticks or
 // tildes in one of exactly two shapes, written as an ALTERNATION so the two
-// indent allowances can never combine. Group 1 is everything before the run
-// (its indent, list marker included), group 2 is the run, group 3 is the rest of
-// the line (the info string on an opener).
+// indent allowances can never combine. Because it IS an alternation, the prefix
+// arrives in one of two groups and exactly one of them participates in any given
+// match: group 1 is the with-marker prefix, group 2 the no-marker prefix (read
+// them as `m[1] ?? m[2]`, and with `??` rather than `||` so a legitimately empty
+// no-marker prefix stays `''`). Group 3 is the run, group 4 the rest of the line
+// — the info string on an opener. `FENCE_RE.exec('```')` therefore yields
+// `[undefined, '', '```', '']`, not a prefix in group 1.
 //
 // THE TWO SHAPES, and these are the exact bounds:
 //   - with a LIST MARKER: 0-3 spaces of indent, then one marker (`-`, `*`, `+`,
