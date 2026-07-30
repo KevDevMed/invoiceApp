@@ -423,7 +423,7 @@ export function AppShell(): React.JSX.Element {
   const controlRowHeight = sideNavControlRowHeight(desktop);
   /*
     Open-invoice tabs. The state lives here — the shell is the only thing that
-    outlives a route change — and every decision it makes is in `ui/invoiceTabs`.
+    outlives a route change — and every decision it makes is in `ui/invoiceTabsState`.
     The band's height depends on whether the strip has anything to draw, because
     `titleBarInset` is 0 on win32/linux where the OS paints a real title bar; see
     `contentTitleBarHeight`.

@@ -5,7 +5,7 @@
  * draft — the workflow the user asked for: "when the user opens a new invoice or
  * wants to see an invoice ... they can see these open in tabs".
  *
- * Every *decision* here is imported from `./invoiceTabs`: route -> tab id, the
+ * Every *decision* here is imported from `./invoiceTabsState`: route -> tab id, the
  * open/close/plus transitions, where the route goes after the active tab is
  * closed, and the label strings. This file is the DOM half only, because the
  * root vitest project is `environment: 'node'` and cannot mount it.
@@ -79,7 +79,7 @@ import {
   type CloseFocusTarget,
   type InvoiceTabLabels,
   type LabelRequests,
-} from './invoiceTabs';
+} from './invoiceTabsState';
 
 type GlyphProps = React.SVGProps<SVGSVGElement>;
 
@@ -126,7 +126,7 @@ function PlusIcon(props: GlyphProps): React.JSX.Element {
  * Focus, after the DOM has lost the button that had it.
  *
  * `closeFocusTarget` decides *where*; these three do the DOM half, and they are
- * here rather than in `invoiceTabs.ts` for the reason that file's header gives.
+ * here rather than in `invoiceTabsState.ts` for the reason that file's header gives.
  * Each returns whether focus actually landed, so the caller can retry once — the
  * `page` target can be one frame late when the close also changes route.
  */

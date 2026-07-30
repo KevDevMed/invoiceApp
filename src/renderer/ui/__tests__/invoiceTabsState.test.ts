@@ -3,7 +3,7 @@
  *
  * `InvoiceTabs.tsx` cannot be mounted here (root vitest project is
  * `environment: 'node'`), which is exactly why every rule worth asserting was
- * put in `invoiceTabs.ts` instead: route -> tab, the transitions, the
+ * put in `invoiceTabsState.ts` instead: route -> tab, the transitions, the
  * close-focus rule and the label strings are all pure.
  */
 
@@ -40,7 +40,7 @@ import {
   tabLabel,
   tabRoute,
   unlabelledTabIds,
-} from '../invoiceTabs';
+} from '../invoiceTabsState';
 
 describe('tabIdForPath', () => {
   it('gives the draft route the one draft tab', () => {
