@@ -151,9 +151,14 @@ export function installApi(target: Window = window): void {
 /**
  * Install `window.desktop`. Idempotent, so a hot reload does not throw.
  *
- * Always `'web'`: the preview must never reserve macOS traffic-light space,
- * even when the browser itself runs on a real Mac — which is exactly why the
- * renderer reads this signal instead of sniffing `navigator.userAgent`.
+ * Always `'web'`, even when the browser itself runs on a real Mac — which is
+ * exactly why the renderer reads this signal instead of sniffing
+ * `navigator.userAgent`. `'web'` is also what tells the renderer to *paint
+ * placeholder* traffic lights and reserve the same band macOS reserves (see
+ * `src/renderer/chrome.ts`, `hasPlaceholderWindowControls`): the preview is
+ * where this design is reviewed, so the geometry under review has to be the
+ * geometry that ships. `hasOverlayWindowControls` stays false — no OS is
+ * painting anything here.
  */
 export function installDesktop(target: Window = window): void {
   Object.defineProperty(target, 'desktop', {

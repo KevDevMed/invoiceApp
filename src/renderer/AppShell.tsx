@@ -34,6 +34,8 @@ import {
 } from '@astryxdesign/core/SideNav';
 
 import {
+  contentTitleBarHeight,
+  hasPlaceholderWindowControls,
   isSectionSelected,
   NAV_GROUPS,
   readDesktopInfo,
@@ -42,11 +44,11 @@ import {
   SIDE_NAV_WIDTH_STORAGE_ID,
   sideNavControlRowHeight,
   sideNavPanelGeometry,
-  titleBarInset,
   wasSideNavCollapsed,
   type NavGroup,
 } from './chrome';
 import { isDockVisible } from './ui/dockVisibility';
+import { InvoiceTabs, useInvoiceTabs } from './ui/InvoiceTabs';
 import { updateBadge } from './ui/updateBadge';
 import {
   nextThemeMode,
@@ -268,7 +270,8 @@ function navItem(item: NavItem, pathname: string): React.JSX.Element {
 }
 
 /**
- * Appearance toggle, in the sidebar footer beside Settings.
+ * Appearance toggle, in the sidebar's title band between the update control and
+ * the panel toggle.
  *
  * A glyph, not a three-state control: the full Light/Dark/Auto choice moved to
  * Settings > Appearance, and what is left here is the one-press flip a user
@@ -298,25 +301,73 @@ function ThemeToggleButton(): React.JSX.Element {
 }
 
 /**
- * The band the OS window controls sit in, and the window's drag surface —
+ * The three macOS traffic lights, faked — browser preview only.
+ *
+ * macOS paints nothing into a browser, so the layout the design is reviewed in
+ * would otherwise be a layout that never ships: no cluster in the corner, and
+ * (before `reservesTrafficLightBand`) no band and no 88px rail either. These
+ * are the cluster half of that mirror. See `chrome.ts` for the geometry and
+ * `styles/global.css` for why a disc is a class rather than a component.
+ *
+ * Non-interactive by construction — no button, no href, no tabindex, no title —
+ * so they are not a focus stop and need no drag-region opt-out: they sit inside
+ * `.app-drag-region` precisely so the corner stays draggable. `aria-hidden` on
+ * the cluster because they are decoration standing in for OS chrome; a screen
+ * reader gains nothing from three unnamed dots.
+ */
+function WindowControlPlaceholders(): React.JSX.Element {
+  return (
+    <HStack className="app-window-controls" gap={2} align="center" aria-hidden>
+      <HStack className="app-window-control-dot app-window-control-dot-close" />
+      <HStack className="app-window-control-dot app-window-control-dot-minimize" />
+      <HStack className="app-window-control-dot app-window-control-dot-zoom" />
+    </HStack>
+  );
+}
+
+/**
+ * The band the window controls sit in, and the window's drag surface —
  * `hiddenInset` leaves no title bar to grab.
  *
- * With no children it is empty and `aria-hidden`: pure reserved space, and it
- * collapses to zero height off macOS so the preview and the Windows/Linux
- * builds have no dead space at the top. The sidebar's copy passes children —
- * the traffic lights sit at the start of that row and the controls at its end —
- * and then it must *not* be `aria-hidden`, or the controls inside it disappear
+ * With no children it is empty and `aria-hidden`: pure reserved space, and at
+ * `titleBarInset`'s height it collapses to zero on win32/linux, where the OS draws
+ * a real title bar — so the *content* column has no dead space there.
+ *
+ * The sidebar's copy is not that height: `sideNavControlRowHeight` falls back to a
+ * real 36px control row on win32/linux, because the expanded ghost buttons live in
+ * this band and a zero-height band would hide the only collapse toggle. Collapsed,
+ * those buttons move to their own rows *below* the band, and on win32/linux the
+ * band stays behind empty — a blank 36px row above the toggle. It is knowingly
+ * left: macOS is the shipped target and there the row holds the traffic lights,
+ * and reshaping the rail on the platforms this project does not distribute is a
+ * design decision rather than a fix.
+ *
+ * The sidebar's copy passes children — the traffic lights at the start of the row, the controls at its end
+ * — and then it must *not* be `aria-hidden`, or the controls inside it disappear
  * from the accessibility tree while staying clickable.
+ *
+ * `isDecorative` is the third case, and it exists because of the placeholders:
+ * the collapsed rail's band has children on web (three dots) and none on macOS,
+ * yet neither version holds anything interactive — the collapsed control glyphs
+ * are in their own rows *below* the band. So the caller says so explicitly
+ * rather than this inferring accessibility from `children === undefined`, which
+ * would leave the web band exposed as an empty group for no reason.
  *
  * Anything interactive in here has to opt out of the drag region or it stops
  * receiving clicks entirely; `<button>` is in the `:where(...)` list in
- * `styles/global.css`, which is what both controls below render as.
+ * `styles/global.css`, which is what all three controls below render as.
  */
 function TitleBarInset({
   height,
+  isDecorative = false,
+  justify = 'end',
   children,
 }: {
   height: string;
+  isDecorative?: boolean;
+  /** Where the band's content sits. The sidebar ends its controls at the row's
+   *  inline end; the content column's tab strip starts at its inline start. */
+  justify?: 'start' | 'end';
   children?: React.ReactNode;
 }): React.JSX.Element {
   // size="static" so the band keeps its exact height: it is a flex child of a
@@ -326,11 +377,26 @@ function TitleBarInset({
       <HStack
         className="app-drag-region"
         height={height}
+        /*
+          The band claims the whole column rather than shrink-wrapping its
+          content. SideNav's collapsed header lays its children out centred, so a
+          shrink-wrapped band is as wide as whatever happens to be inside it —
+          which moved the light cluster sideways every time the controls under it
+          changed shape. Full width pins it to the panel's own left edge.
+        */
+        width="100%"
         align="center"
-        justify="end"
+        justify={justify}
         gap={0.5}
-        paddingInline={2}
-        aria-hidden={children === undefined ? true : undefined}
+        /*
+          No inline padding of its own. SideNav's header wrapper already carries
+          8px, which is what puts the light cluster at x=17 — level with the nav
+          pills below and one pixel inside the 70px the real lights end at. Add
+          8px here and the cluster starts at 25 and ends at 77, past the green
+          light and past the collapsed rail's usable width.
+        */
+        paddingInline={0}
+        aria-hidden={children === undefined || isDecorative ? true : undefined}
       >
         {children}
       </HStack>
@@ -354,16 +420,23 @@ export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const desktop = readDesktopInfo();
-  const inset = titleBarInset(desktop);
   const controlRowHeight = sideNavControlRowHeight(desktop);
+  /*
+    Open-invoice tabs. The state lives here — the shell is the only thing that
+    outlives a route change — and every decision it makes is in `ui/invoiceTabs`.
+    The band's height depends on whether the strip has anything to draw, because
+    `titleBarInset` is 0 on win32/linux where the OS paints a real title bar; see
+    `contentTitleBarHeight`.
+  */
+  const invoiceTabs = useInvoiceTabs();
+  const contentBandHeight = contentTitleBarHeight(desktop, invoiceTabs.tabs.length > 0);
   const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
   /*
     Collapse is controlled here for one reason: `headerEndContent` is hidden
     while the rail is collapsed, so the toggle that lives on the heading row
-    cannot also be the way back out. Knowing the state lets the collapsed rail
-    render its own expand button in `footerIcons`, and lets the appearance
-    toggle move from the Settings row into that same icon bar rather than
-    fighting for width on an 88px rail.
+    cannot also be the way back out. Knowing the state is what lets the collapsed
+    rail lay the same three controls out differently — below the reserved light
+    band instead of beside the lights — rather than losing any of them.
 
     Seeded from the *same* localStorage byte `resizable.autoSaveId` persists
     below, because controlled collapse and the resizable width are two views of
@@ -392,17 +465,22 @@ export function AppShell(): React.JSX.Element {
   };
 
   /*
-    The two ghost controls in the sidebar's title band, beside the traffic
-    lights. Rendered only while expanded: collapsed, the rail is 88px wide and
-    the lights already occupy x 13-70 of it, so there is no room beside them —
-    `footerIcons` carries both controls instead, which is also what keeps
-    exactly one toggle on screen at a time.
+    The update control: always on screen, blue only when something is waiting.
+
+    It used to render `null` unless an update was pending, which made the top row
+    change shape under the user. Permanence is the point — this is where you go
+    to ask about updates, so it has to be somewhere you can look. Which phases
+    highlight, and what each phase is called, are `ui/updateBadge`'s decision;
+    the blue itself is `--color-icon-update-pending` (see `theme/appTheme.ts` for
+    why not `color="accent"`), applied through a class because Icon's own
+    `color` prop has no value that resolves to it.
   */
-  const updateButton = badge.isVisible ? (
+  const updateButton = (
     <IconButton
       label={badge.label}
       tooltip={badge.label}
       variant="ghost"
+      className={badge.isHighlighted ? 'app-update-button-pending' : undefined}
       icon={<Icon icon={UpdateIcon} size="sm" />}
       // The full update UI already lives on Settings; this is a pointer to it,
       // not a second copy of it. An IconButton has no href, so this navigates
@@ -411,6 +489,17 @@ export function AppShell(): React.JSX.Element {
         void navigate('/settings');
       }}
     />
+  );
+
+  /*
+    Painted only in the browser preview, and only ever inside the sidebar's own
+    title band: the lights belong to the window's top-left corner, which the
+    panel owns at every width (see `SIDE_NAV_WIDTH.min` and the 88px rail).
+  */
+  const windowControls = hasPlaceholderWindowControls(desktop) ? (
+    <StackItem size="fill">
+      <WindowControlPlaceholders />
+    </StackItem>
   ) : null;
 
   /*
@@ -451,19 +540,60 @@ export function AppShell(): React.JSX.Element {
             className="app-side-nav"
             style={sideNavPanel}
             header={
-              <VStack gap={0}>
-                {/* The title band: traffic lights at the start, controls at the
-                    end. `justify="end"` is what leaves the lights their space
-                    without reserving it by hand — there is no element under
-                    them, only the empty start of the row. */}
-                <TitleBarInset height={controlRowHeight}>
+              /*
+                `width="100%"` because SideNav's collapsed header wrapper centres
+                its children: without it this column is only as wide as its widest
+                child, and the light band — and so the light cluster — slides
+                sideways whenever the controls beneath it change shape.
+              */
+              <VStack gap={0} width="100%">
+                {/*
+                  The title band: window controls at the start, app controls at
+                  the end. `justify="end"` ends the controls; the placeholders
+                  ride a `size="fill"` item, so on macOS — where there is no
+                  element under the lights at all — the row is unchanged.
+
+                  Expanded order, left to right: update, appearance, panel
+                  toggle. The panel toggle is last because it is closest to the
+                  pane it hides, which is what the reference does too.
+                */}
+                <TitleBarInset height={controlRowHeight} isDecorative={isCollapsed}>
+                  {windowControls}
                   {isCollapsed ? null : (
                     <>
                       {updateButton}
+                      <ThemeToggleButton />
                       {collapseToggle}
                     </>
                   )}
                 </TitleBarInset>
+                {/*
+                  Collapsed, the same three controls move *below* the reserved
+                  light band. They cannot sit beside the lights: the rail is 88px
+                  wide and starts at x=8, and the cluster ends at x=70 — and they
+                  cannot all share one row either, since three `md` buttons are
+                  96px against the ~70px of content width an 88px rail leaves.
+
+                  So: two rows. The panel toggle takes the first one alone —
+                  it is the way back out of the collapsed state, so it is the
+                  topmost and first-in-reading-order thing under the lights — and
+                  the two occasional glyphs share the second (2 x 32px = 64px,
+                  inside the 70px of content an 88px rail leaves; measured at
+                  x 20-84 against a content box of 17-87). Two rows rather than
+                  three stacked glyphs so the chrome reads as its own cluster
+                  instead of extending the nav column above the app mark.
+                */}
+                {isCollapsed ? (
+                  /* `paddingBlock` so the first glyph clears the light band
+                     rather than butting straight onto its bottom edge. */
+                  <VStack gap={0} align="center" paddingBlock={0.5}>
+                    {collapseToggle}
+                    <HStack gap={0} justify="center">
+                      {updateButton}
+                      <ThemeToggleButton />
+                    </HStack>
+                  </VStack>
+                ) : null}
                 <SideNavHeading
                   icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
                   heading="InvoiceApp"
@@ -472,46 +602,18 @@ export function AppShell(): React.JSX.Element {
               </VStack>
             }
             /*
-              Settings, with the appearance toggle sitting on its row rather
-              than under it — the reference puts one thing at the foot of the
-              panel, and a stacked control adds a second. `StackItem size="fill"`
-              lets the nav item keep the whole row minus the glyph, so the pill
-              still spans the panel at every resized width.
+              Settings, and nothing else. The appearance toggle used to share
+              this row; it now lives in the title band with the other two
+              glyphs, which is what the reference asks for — one thing at the
+              foot of the panel, all the window chrome at its head. No wrapper
+              either: an HStack around a single child is a row that does nothing.
 
-              Collapsed, the row is gone and the toggle moves to `footerIcons`
-              (below): the 88px rail has no room for a link and a glyph side by
-              side, and hiding the toggle outright would make appearance
-              unreachable without expanding first.
+              `footerIcons` is gone for the same reason. It existed only to hold
+              the three controls the collapsed rail had nowhere else to put, and
+              the collapsed rail now puts them at the top, where the user asked
+              for them.
             */
-            footer={
-              <VStack gap={1}>
-                {footerItems.map((item) =>
-                  isCollapsed || item.path !== '/settings' ? (
-                    navItem(item, pathname)
-                  ) : (
-                    <HStack key={item.path} gap={1} align="center">
-                      <StackItem size="fill">{navItem(item, pathname)}</StackItem>
-                      <ThemeToggleButton />
-                    </HStack>
-                  ),
-                )}
-              </VStack>
-            }
-            /* Only while collapsed: expanded, the title band owns the update and
-               collapse controls and the footer row owns the appearance toggle,
-               and two of any of them would be the orphan chevron all over
-               again. All three come along so the collapsed rail loses neither
-               the pointer to a waiting update nor the way to change
-               appearance. */
-            footerIcons={
-              isCollapsed ? (
-                <>
-                  {updateButton}
-                  <ThemeToggleButton />
-                  {collapseToggle}
-                </>
-              ) : undefined
-            }
+            footer={<VStack gap={1}>{footerItems.map((item) => navItem(item, pathname))}</VStack>}
             collapsible={{
               isCollapsed,
               onCollapsedChange: setIsCollapsed,
@@ -536,11 +638,26 @@ export function AppShell(): React.JSX.Element {
       >
         <VStack gap={0} height="100%">
           {/*
-            Kept even though the bar that used to sit under it is gone: this is
-            the content half of the window's drag surface. Delete it and the
-            top-right of the window cannot be grabbed at all.
+            The content half of the window's drag surface — and now the strip of
+            open invoices, which is what the reserved band was being kept for.
+            Delete it and the top-right of the window cannot be grabbed at all.
+
+            With no tabs open `InvoiceTabs` renders null, so this is the same
+            empty, `aria-hidden`, fully draggable band it has always been: no
+            stray `+` on Settings. With tabs open the band is not decorative and
+            must not be `aria-hidden`, or the strip inside it would be clickable
+            but invisible to a screen reader.
           */}
-          <TitleBarInset height={inset} />
+          <TitleBarInset height={contentBandHeight} justify="start">
+            {invoiceTabs.tabs.length === 0 ? undefined : (
+              /* `size="fill"` so the strip owns the band's width and its own
+                 scroller decides what fits, rather than shrink-wrapping the
+                 pills and letting them push the band wider. */
+              <StackItem size="fill">
+                <InvoiceTabs state={invoiceTabs} />
+              </StackItem>
+            )}
+          </TitleBarInset>
           <StackItem size="fill">
             <Outlet />
           </StackItem>

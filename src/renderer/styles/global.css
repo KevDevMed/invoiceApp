@@ -47,6 +47,208 @@ body {
 }
 
 /*
+ * The open-invoice tab strip, in the content column's reserved band.
+ *
+ * Two things live here and nowhere else.
+ *
+ * 1. The drag opt-out. The strip sits inside `.app-drag-region`, and `Token`'s
+ *    root element is a `<span>` — which is *not* in the `:where(...)` list
+ *    above, so the pill's own padding, its leading glyph and the gaps between
+ *    pills would all still be window-drag surface: press one and you move the
+ *    window instead of switching invoice. Rather than adding `span` to that list
+ *    (which would opt every decorative span in either band out of dragging), the
+ *    pills are an explicit no-drag island.
+ *
+ *    Scoped to the pills, their descendants and the `+` — not to
+ *    `.app-invoice-tabs` and not to the scroller either. Not the strip, because
+ *    Toolbar renders a Section, which is a block and spans the whole band, so
+ *    opting that out made the entire top edge of the window undraggable. Not the
+ *    scroller, because the scroller's box includes the `gap` strips *between*
+ *    pills, which hold nothing clickable: `no-drag` there produced pixels that
+ *    were neither draggable nor clickable. Everything that is not a pill stays
+ *    `drag` — which is the whole reason the band exists.
+ *
+ * 2. Inline scrolling. Many open tabs must not widen the shell (see the
+ *    `:has(> .app-side-nav)` note below for what 3px of inline overflow cost
+ *    last time), and must not clip the `+` either: the pills scroll, the `+`
+ *    stays put.
+ *
+ *    `overflow-x: auto` makes the scroller's own minimum contribution in the
+ *    inline axis zero — but that is not enough on its own, and the bug it hid is
+ *    worth naming. Between the Section and the scroller, Toolbar renders
+ *    `[role="toolbar"]` and a start slot, both flex boxes whose `min-width` is
+ *    `auto`: they refuse to shrink below their content, so with ten tabs open the
+ *    scroller kept its intrinsic 1056px inside a 680px band. Nothing scrolled,
+ *    because there was no overflow *in* the scroller — the band simply clipped,
+ *    and at 1000px the trailing `+` ended up 400px outside the window with no
+ *    scrollbar anywhere able to bring it back. The `min-inline-size: 0` chain
+ *    below is what makes the pressure reach the one box that can absorb it.
+ *
+ * Appearance is all `var()`: the four colours are declared once in
+ * `theme/appTheme.ts` (the token pipeline) and referenced here, exactly like
+ * `--color-window-control-*` above. Only the active pill is filled — the
+ * inactive ones are flat, on purpose, and that is also what keeps their
+ * secondary ink at its measured contrast against the flat window rather than
+ * against a tint of it.
+ */
+.app-invoice-tab,
+.app-invoice-tab *,
+.app-invoice-tabs-new,
+.app-invoice-tabs-new * {
+  -webkit-app-region: no-drag;
+}
+
+.app-invoice-tabs {
+  /* The strip is laid out by Toolbar; this only lets it shrink. */
+  min-inline-size: 0;
+  /*
+    Toolbar pulls its first item back by `--container-padding-inline-start` minus
+    its own block padding (edge compensation, so a ghost button sits flush inside
+    a Card). There is no container padding here — the band is the shell's, not a
+    Card's — so that lands the first pill 8px inside the band and 8px left of the
+    page heading beneath it. Adding it back is what lines the strip up with the
+    content column it belongs to.
+  */
+  padding-inline-start: var(--spacing-2);
+}
+
+/*
+  Toolbar's own two boxes — `[role="toolbar"]` and the start slot it puts the
+  strip in. Both are flex boxes with `min-width: auto`, so without this the
+  shrink stops here and never reaches the scroller. Descendant selectors rather
+  than `>` because how many wrappers Section renders is the design system's
+  business, not ours.
+*/
+.app-invoice-tabs [role='toolbar'],
+.app-invoice-tabs [role='toolbar'] > * {
+  min-inline-size: 0;
+}
+
+.app-invoice-tabs-scroller {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  /* Shrink under pressure, never grow: with two tabs open the `+` sits right
+     after the last pill, not at the far end of the band. */
+  flex: 0 1 auto;
+  min-inline-size: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+/* The `+` is pinned: it is the scroller's sibling, and it never shrinks away. */
+.app-invoice-tabs-new {
+  flex: none;
+}
+
+.app-invoice-tabs-scroller::-webkit-scrollbar {
+  display: none;
+  block-size: 0;
+}
+
+.app-invoice-tab {
+  /*
+    Pills keep their width and the scroller scrolls, rather than ten pills
+    squeezing to 65px each: `flex: none` is what puts the overflow *inside* the
+    scroll container, where a scroll (and `scrollIntoView` on the active pill) can
+    reach it. Shrinking instead would keep every pill on screen and make none of
+    them readable.
+  */
+  flex: none;
+  background-color: transparent;
+  color: var(--color-invoice-tab-ink);
+  /* Long invoice numbers ellipsize inside the pill (Token's own label style)
+     rather than stretching the strip. */
+  max-inline-size: 14rem;
+  block-size: var(--spacing-7);
+  border-radius: var(--radius-element);
+}
+
+.app-invoice-tab-active {
+  background-color: var(--color-invoice-tab-surface-active);
+  color: var(--color-invoice-tab-ink-active);
+}
+
+/*
+ * The close control. A bare `<button>` rather than an IconButton: it lives in
+ * Token's `endContent`, inside a 28px pill, and every IconButton size is taller
+ * than that. `all: unset`-style flattening plus a hit area larger than the glyph
+ * — the same shape as Token's own remove button, which this stands in for (see
+ * `InvoiceTabs.tsx` for why the name could not come from `onRemove`).
+ */
+.app-invoice-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: var(--spacing-4);
+  block-size: var(--spacing-4);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  flex: none;
+}
+
+.app-invoice-tab-close:hover {
+  background-color: var(--color-overlay-hover);
+  color: var(--color-invoice-tab-ink-active);
+}
+
+/*
+ * Traffic-light placeholders — the browser preview only (see
+ * `chrome.ts`, `hasPlaceholderWindowControls`).
+ *
+ * Here rather than in a component because the design system has no primitive
+ * for a fixed-size disc in an arbitrary colour: StatusDot is the closest, and
+ * its colour comes from a five-value semantic variant (success/warning/error/
+ * accent/neutral). Painting the macOS palette through it would either misuse
+ * three status meanings or need a theme override that recolours every StatusDot
+ * in the app. Every value below is a token: --spacing-3 is 12px, and the three
+ * colours are declared once in `theme/appTheme.ts`.
+ *
+ * `flex: none` because the cluster is a flex row: without it the discs would
+ * shrink under the row's own width pressure and stop being circles.
+ */
+.app-window-control-dot {
+  inline-size: var(--spacing-3);
+  block-size: var(--spacing-3);
+  border-radius: var(--radius-full);
+  flex: none;
+}
+
+.app-window-control-dot-close {
+  background-color: var(--color-window-control-close);
+}
+
+.app-window-control-dot-minimize {
+  background-color: var(--color-window-control-minimize);
+}
+
+.app-window-control-dot-zoom {
+  background-color: var(--color-window-control-zoom);
+}
+
+/*
+ * The update control, while an update is actually waiting.
+ *
+ * The theme paints every ghost button `--color-icon-secondary` at rest and
+ * `--color-text-primary` on hover; this has to beat both. It does so by being
+ * *unlayered*: theme overrides are injected into `@layer astryx-theme`, and
+ * unlayered author CSS outranks every layer regardless of specificity. Staying
+ * blue on hover is intended — the highlight is state, not decoration.
+ *
+ * Icon's default `color="inherit"` resolves to currentColor, so colouring the
+ * button is what colours the glyph.
+ */
+.app-update-button-pending {
+  color: var(--color-icon-update-pending);
+}
+
+/*
  * The sidebar's scroll region keeps scrolling; it just stops drawing a bar.
  * `scrollbar-width` and the `::-webkit-scrollbar` pseudo-element are browser
  * chrome with no design-system equivalent — the same reason `-webkit-app-region`

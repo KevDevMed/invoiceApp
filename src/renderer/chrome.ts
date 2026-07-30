@@ -24,6 +24,12 @@ export type { DesktopInfo, DesktopPlatform };
  * with real OS window controls, so no reserved space and no drag surface.
  * `window.desktop` is installed by the Electron preload and by the preview
  * shim; unit tests and any pre-integration build see nothing at all.
+ *
+ * The fallback platform is `'web'`, which now also means "paint traffic-light
+ * placeholders" (see `hasPlaceholderWindowControls`). That is deliberate: the
+ * fallback's whole claim is "this is a plain browser", and a plain browser is
+ * exactly where the placeholders belong. Electron always installs the global,
+ * so nothing that ships in the desktop app can reach this value.
  */
 export const WEB_DESKTOP_INFO: DesktopInfo = {
   platform: 'web',
@@ -54,6 +60,37 @@ export function readDesktopInfo(scope: unknown = globalThis): DesktopInfo {
 }
 
 /**
+ * Does this build draw *fake* macOS traffic lights?
+ *
+ * Only the browser preview does. Gated on the platform being exactly `'web'`
+ * rather than on `!hasOverlayWindowControls`, because win32 and linux also have
+ * no overlay controls — they get a real OS title bar
+ * (`src/main/window.ts`, `titleBarStyle: 'default'`), and three macOS dots
+ * under a Windows title bar would be a lie about the window they sit in.
+ *
+ * The preview exists so the design can be judged in a browser, and the layout
+ * being judged has to be the layout that ships: on macOS the lights are real
+ * and the shell reserves space for them, so on web the same space is reserved
+ * and the same three dots are painted into it.
+ */
+export function hasPlaceholderWindowControls(info: DesktopInfo): boolean {
+  return info.platform === 'web';
+}
+
+/**
+ * Does the top-left corner of this window hold a traffic-light cluster at all —
+ * painted by macOS, or by us?
+ *
+ * The single predicate every piece of geometry keys off, so the preview cannot
+ * drift from darwin: a 12px dot cluster reserved a 36px band on a 48px rail
+ * would make the reference worthless. Everything below that used to read
+ * `hasOverlayWindowControls` directly now reads this instead.
+ */
+export function reservesTrafficLightBand(info: DesktopInfo): boolean {
+  return info.hasOverlayWindowControls || hasPlaceholderWindowControls(info);
+}
+
+/**
  * Vertical band reserved above the shell's top row when the OS paints window
  * controls over the renderer. macOS puts the traffic lights at roughly
  * x 13–70, y 12–32 under `titleBarStyle: 'hiddenInset'`; --spacing-11 (44px)
@@ -76,7 +113,7 @@ export const NO_TITLE_BAR_INSET = 'var(--spacing-0)';
  * breadcrumb can ever sit under a light.
  */
 export function titleBarInset(info: DesktopInfo): string {
-  return info.hasOverlayWindowControls ? OVERLAY_TITLE_BAR_INSET : NO_TITLE_BAR_INSET;
+  return reservesTrafficLightBand(info) ? OVERLAY_TITLE_BAR_INSET : NO_TITLE_BAR_INSET;
 }
 
 /**
@@ -214,7 +251,7 @@ export const DEFAULT_COLLAPSED_RAIL_PX = 48;
  * the rail without fighting either.
  */
 export function collapsedRailWidth(info: DesktopInfo): string {
-  return info.hasOverlayWindowControls
+  return reservesTrafficLightBand(info)
     ? OVERLAY_COLLAPSED_RAIL_WIDTH
     : DEFAULT_COLLAPSED_RAIL_WIDTH;
 }
@@ -276,7 +313,7 @@ export function sideNavPanelGeometry(info: DesktopInfo): SideNavPanelGeometry {
  * have to be checked together against the traffic lights rather than apart.
  */
 export function collapsedRailInlineEndPx(info: DesktopInfo): number {
-  const width = info.hasOverlayWindowControls ? COLLAPSED_RAIL_MIN_PX : DEFAULT_COLLAPSED_RAIL_PX;
+  const width = reservesTrafficLightBand(info) ? COLLAPSED_RAIL_MIN_PX : DEFAULT_COLLAPSED_RAIL_PX;
   return PANEL_INSET_PX + width;
 }
 
@@ -288,14 +325,54 @@ export function collapsedRailInlineEndPx(info: DesktopInfo): number {
 export const TRAFFIC_LIGHT_ZONE_END_PX = 70;
 
 /**
- * Height of the sidebar's top control row — the band holding the traffic lights
- * and the two ghost icon buttons.
+ * The placeholder cluster, in px, measured from the *window* edge.
  *
- * On macOS this is the same 44px band `titleBarInset` reserves, so the buttons
- * sit beside the lights rather than below them. Everywhere else `titleBarInset`
- * is zero — there are no lights to clear — but the row still has to be tall
- * enough to *show the buttons*, so it falls back to a real control height
- * instead of collapsing to nothing and hiding the only collapse toggle.
+ * macOS puts its own cluster at x 13–70. The placeholders cannot be positioned
+ * absolutely — they live inside the sidebar's title band, which is inside the
+ * inset panel — so their left edge is the sum of what is to their left: the
+ * panel's margin, the panel's 1px border, and the padding SideNav's own header
+ * wrapper carries (measured at 8px in Chromium; the band adds none of its own,
+ * which is exactly why it passes `paddingInline={0}`). 8 + 1 + 8 = 17, four
+ * pixels right of the real cluster and level with the nav pills below it, which
+ * is as close as the panel's own geometry allows without hand-positioning them.
+ *
+ * The end is the number that matters: three 12px dots with two 8px gaps put the
+ * cluster's right edge at 69, one pixel inside `TRAFFIC_LIGHT_ZONE_END_PX`, so
+ * the preview's dots occupy no more of the rail than macOS's lights do.
+ */
+export const TRAFFIC_LIGHT_DOT_SIZE_PX = 12;
+export const TRAFFIC_LIGHT_DOT_GAP_PX = 8;
+export const TRAFFIC_LIGHT_DOT_COUNT = 3;
+
+/** --border-width on the panel, in px. Part of the cluster's start offset. */
+export const PANEL_BORDER_PX = 1;
+
+/** SideNav's own header padding, in px. The rest of that offset. */
+export const SIDE_NAV_HEADER_PADDING_INLINE_PX = 8;
+
+export interface TrafficLightClusterPx {
+  readonly startPx: number;
+  readonly endPx: number;
+}
+
+/** Where the placeholder cluster lands, so the reference can be checked in a test. */
+export function placeholderClusterPx(): TrafficLightClusterPx {
+  const startPx = PANEL_INSET_PX + PANEL_BORDER_PX + SIDE_NAV_HEADER_PADDING_INLINE_PX;
+  const dots = TRAFFIC_LIGHT_DOT_COUNT * TRAFFIC_LIGHT_DOT_SIZE_PX;
+  const gaps = (TRAFFIC_LIGHT_DOT_COUNT - 1) * TRAFFIC_LIGHT_DOT_GAP_PX;
+  return { startPx, endPx: startPx + dots + gaps };
+}
+
+/**
+ * Height of the sidebar's title band — the band holding the traffic lights (real
+ * or placeholder) and, while expanded, the three ghost icon buttons.
+ *
+ * Where there is a light cluster this is the same 44px band `titleBarInset`
+ * reserves, so the expanded buttons sit beside the lights rather than below
+ * them. On win32/linux `titleBarInset` is zero — the OS draws its own title bar
+ * and there are no lights to clear — but the row still has to be tall enough to
+ * *show the buttons*, so it falls back to a real control height instead of
+ * collapsing to nothing and hiding the only collapse toggle.
  */
 export const SIDE_NAV_CONTROL_ROW_MIN_HEIGHT = 'var(--spacing-9)';
 
@@ -303,7 +380,32 @@ export const SIDE_NAV_CONTROL_ROW_MIN_HEIGHT = 'var(--spacing-9)';
 export const SIDE_NAV_CONTROL_ROW_MIN_PX = 36;
 
 export function sideNavControlRowHeight(info: DesktopInfo): string {
-  return info.hasOverlayWindowControls
+  return reservesTrafficLightBand(info)
     ? OVERLAY_TITLE_BAR_INSET
     : SIDE_NAV_CONTROL_ROW_MIN_HEIGHT;
+}
+
+/**
+ * Height of the *content* column's band — the one that used to be reserved
+ * space and nothing else, and now holds the open-invoice tab strip.
+ *
+ * Same shape of decision as `sideNavControlRowHeight`, and it exists for the
+ * same reason: `titleBarInset` is 44px where there is a light cluster to clear
+ * and 0px on win32/linux, where the OS paints a real title bar — and a strip
+ * inside a zero-height band is a strip nobody can see or click.
+ *
+ * So the fallback is conditional on the band having something in it. With tabs
+ * open it is a real control height; with none it stays flat 0, which is what
+ * keeps a win32 build free of dead space above the page and keeps the band on
+ * Settings exactly the empty drag surface it is today.
+ *
+ * The fallback is the same 44px, not the sidebar's 36px, because the strip is a
+ * `size="sm"` Toolbar: a 28px element plus the 8px of block padding Toolbar puts
+ * above and below it. A 36px band would clip the pills it exists to show.
+ */
+export const CONTENT_TITLE_BAR_MIN_HEIGHT = OVERLAY_TITLE_BAR_INSET;
+
+export function contentTitleBarHeight(info: DesktopInfo, hasContent: boolean): string {
+  if (reservesTrafficLightBand(info)) return OVERLAY_TITLE_BAR_INSET;
+  return hasContent ? CONTENT_TITLE_BAR_MIN_HEIGHT : NO_TITLE_BAR_INSET;
 }

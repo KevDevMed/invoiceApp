@@ -177,6 +177,80 @@ describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
     }
   }
 
+  /*
+    The invoice tab strip, which introduces one new ink pairing: primary text on
+    a 10% tint of itself over the window body. The tint is a `color-mix()` with
+    transparent, so it composites over whatever is behind it — here always the
+    flat window (`layout-content` is transparent and the app-shell paints the
+    body colour), which is what makes the composite computable off two tokens.
+
+    The inactive pill is *not* tinted, and this block is where that decision is
+    held: the same maths run at 3% put secondary ink at 4.52:1 in light mode and
+    at 10% at 3.92:1, i.e. under the floor. Flat inactive pills keep their ink on
+    the surface the loop above already measures.
+  */
+  describe('invoice tab strip', () => {
+    const tabColors = rule('app-shell', 'base');
+
+    /** `color-mix(in srgb, X p%, transparent)` over `background`, as #rrggbb. */
+    function composite(ink: string, background: string, percent: number): string {
+      const channels = (value: string): [number, number, number] => {
+        const hex = /^#([0-9a-f]{6})$/i.exec(value.trim())?.[1];
+        if (hex === undefined) throw new Error(`not a 6-digit hex colour: ${value}`);
+        return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number];
+      };
+      const [front, back] = [channels(ink), channels(background)];
+      const alpha = percent / 100;
+      const mixed = front.map((value, i) => Math.round(value * alpha + back[i]! * (1 - alpha)));
+      return `#${mixed.map((value) => value.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    it('mixes the active fill toward the ink, so it lifts in dark and darkens in light', () => {
+      // A background *token* would not work: --color-background-muted is darker
+      // than the window in dark mode, so the active pill would sink.
+      const fill = String(tabColors['--color-invoice-tab-surface-active']);
+      expect(fill).toMatch(
+        /^color-mix\(in srgb, var\(--color-text-primary\) \d+%, transparent\)$/,
+      );
+      expect(String(tabColors['--color-invoice-tab-ink'])).toBe('var(--color-text-secondary)');
+      expect(String(tabColors['--color-invoice-tab-ink-active'])).toBe('var(--color-text-primary)');
+    });
+
+    const percent = Number(
+      /(\d+)%/.exec(String(tabColors['--color-invoice-tab-surface-active']))?.[1],
+    );
+
+    for (const [modeName, index] of [
+      ['light', 0],
+      ['dark', 1],
+    ] as const) {
+      it(`${modeName}: the active pill's ink clears ${AA_NORMAL}:1 on its own fill`, () => {
+        const ink = splitLightDark(token('--color-text-primary'))[index];
+        const body = splitLightDark(token('--color-background-body'))[index];
+        expect(Number.isNaN(percent)).toBe(false);
+        expect(contrastRatio(ink, composite(ink, body, percent))).toBeGreaterThanOrEqual(
+          AA_NORMAL,
+        );
+      });
+
+      it(`${modeName}: an inactive pill's ink clears ${AA_NORMAL}:1 on the flat window`, () => {
+        const ink = splitLightDark(token('--color-text-secondary'))[index];
+        const body = splitLightDark(token('--color-background-body'))[index];
+        expect(contrastRatio(ink, body)).toBeGreaterThanOrEqual(AA_NORMAL);
+      });
+    }
+
+    it('is why the inactive pill has no fill: light mode has no headroom for one', () => {
+      // The number that decided the design. Filling an inactive pill with the
+      // active tint and keeping secondary ink is below AA in light mode, so
+      // "only the active one is filled" is a contrast rule, not just a look.
+      const ink = splitLightDark(token('--color-text-secondary'))[0];
+      const body = splitLightDark(token('--color-background-body'))[0];
+      const primary = splitLightDark(token('--color-text-primary'))[0];
+      expect(contrastRatio(ink, composite(primary, body, percent))).toBeLessThan(AA_NORMAL);
+    });
+  });
+
   it('exempts only --color-text-disabled, which WCAG 1.4.3 excludes', () => {
     // #a3a3a3 measures 2.07:1 on the light pane and 2.52:1 on white — nowhere
     // near AA, and deliberately so: disabled controls are outside 1.4.3. This
@@ -197,6 +271,93 @@ describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
     const [surfaceLight] = splitLightDark(token('--color-background-surface'));
     const [bodyLight] = splitLightDark(token('--color-background-body'));
     expect(hexSum(surfaceLight) - hexSum(bodyLight)).toBeGreaterThanOrEqual(40);
+  });
+});
+
+/*
+  The window's own colours, declared as custom properties on the app-shell rather
+  than in `tokens` (defineTheme types that map to Astryx's own closed token set).
+  Asserted here, and asserted *literally*: these are the macOS system colours,
+  and a placeholder cluster in some other palette is a preview of a window that
+  does not exist.
+*/
+describe('window-control and update-pending colours', () => {
+  const windowControls = rule('app-shell', 'base');
+
+  it('paints the three macOS traffic-light colours', () => {
+    expect(windowControls['--color-window-control-close']).toBe('#FF5F57');
+    expect(windowControls['--color-window-control-minimize']).toBe('#FEBC2E');
+    expect(windowControls['--color-window-control-zoom']).toBe('#28C840');
+  });
+
+  it('keeps the light colours mode-independent, because macOS does', () => {
+    // A `light-dark()` pair here would be the mistake: the dots stand in for OS
+    // chrome, which does not follow the app's appearance.
+    for (const name of [
+      '--color-window-control-close',
+      '--color-window-control-minimize',
+      '--color-window-control-zoom',
+    ]) {
+      expect(windowControls[name]).toMatch(/^#[0-9A-F]{6}$/);
+    }
+  });
+
+  it('reaches the stylesheet on the element everything inherits from', () => {
+    // Declared, not merely written: the whole mechanism is inheritance from
+    // `.astryx-app-shell` down to the sidebar's band.
+    const emitted = generateThemeCSS(appTheme).component;
+    const body = emitted.split('.astryx-app-shell {')[1]?.split('}')[0];
+    if (body === undefined) throw new Error('no emitted rule for .astryx-app-shell');
+    for (const name of [
+      '--color-window-control-close',
+      '--color-window-control-minimize',
+      '--color-window-control-zoom',
+      '--color-icon-update-pending',
+    ]) {
+      expect(body).toContain(`${name}:`);
+    }
+  });
+
+  /*
+    The update glyph's blue is non-text ink, so WCAG 1.4.11 applies: 3:1 against
+    the surface behind it. It can land on either end of the panel gradient — the
+    head is `--color-background-surface`, the foot is the window body — so both
+    are measured, in both modes. This is the reason the blue is a light/dark pair
+    rather than one colour: #0064E0 measures 1.94:1 on the dark panel head.
+  */
+  it('keeps the pending blue legible on the panel head and foot, both modes', () => {
+    const AA_NON_TEXT = 3;
+    const [inkLight, inkDark] = splitLightDark(
+      String(windowControls['--color-icon-update-pending']),
+    );
+    const [headLight, headDark] = splitLightDark(token('--color-background-surface'));
+    const [footLight, footDark] = splitLightDark(token('--color-background-body'));
+    for (const [ink, surface] of [
+      [inkLight, headLight],
+      [inkLight, footLight],
+      [inkDark, headDark],
+      [inkDark, footDark],
+    ] as const) {
+      expect(contrastRatio(ink, surface)).toBeGreaterThanOrEqual(AA_NON_TEXT);
+    }
+  });
+
+  it('is a blue, not neutral’s monochrome accent ink', () => {
+    // The trap this pins: `<Icon color="accent">` resolves to
+    // --color-icon-accent, which in this theme is light-dark(#262626, #ebebeb).
+    // A "blue" equal to that token is the bug, not the fix.
+    const [inkLight, inkDark] = splitLightDark(
+      String(windowControls['--color-icon-update-pending']),
+    );
+    for (const ink of [inkLight, inkDark]) {
+      const hex = /^#([0-9a-f]{6})$/i.exec(ink)?.[1] ?? '';
+      const [red, green, blue] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+      expect(blue).toBeGreaterThan((red ?? 0) + 60);
+      expect(blue).toBeGreaterThan((green ?? 0) + 60);
+    }
+    expect(String(windowControls['--color-icon-update-pending'])).not.toBe(
+      token('--color-icon-accent'),
+    );
   });
 });
 
@@ -309,6 +470,16 @@ describe('the panel carries the gradient and the window does not', () => {
     expect(rule('app-shell', 'base')).toEqual({
       backgroundColor: 'var(--color-background-body)',
       backgroundImage: 'none',
+      '--color-window-control-close': '#FF5F57',
+      '--color-window-control-minimize': '#FEBC2E',
+      '--color-window-control-zoom': '#28C840',
+      '--color-icon-update-pending': 'light-dark(#0064E0, #2694FE)',
+      // The invoice tab strip's colours, declared here for the same reason and
+      // asserted in their own block below.
+      '--color-invoice-tab-ink': 'var(--color-text-secondary)',
+      '--color-invoice-tab-ink-active': 'var(--color-text-primary)',
+      '--color-invoice-tab-surface-active':
+        'color-mix(in srgb, var(--color-text-primary) 10%, transparent)',
     });
   });
 
