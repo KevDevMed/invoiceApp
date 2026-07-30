@@ -329,10 +329,20 @@ function WindowControlPlaceholders(): React.JSX.Element {
  * The band the window controls sit in, and the window's drag surface —
  * `hiddenInset` leaves no title bar to grab.
  *
- * With no children it is empty and `aria-hidden`: pure reserved space, and it
- * collapses to zero height on win32/linux, where the OS draws a real title bar,
- * so those builds have no dead space at the top. The sidebar's copy passes
- * children — the traffic lights at the start of the row, the controls at its end
+ * With no children it is empty and `aria-hidden`: pure reserved space, and at
+ * `titleBarInset`'s height it collapses to zero on win32/linux, where the OS draws
+ * a real title bar — so the *content* column has no dead space there.
+ *
+ * The sidebar's copy is not that height: `sideNavControlRowHeight` falls back to a
+ * real 36px control row on win32/linux, because the expanded ghost buttons live in
+ * this band and a zero-height band would hide the only collapse toggle. Collapsed,
+ * those buttons move to their own rows *below* the band, and on win32/linux the
+ * band stays behind empty — a blank 36px row above the toggle. It is knowingly
+ * left: macOS is the shipped target and there the row holds the traffic lights,
+ * and reshaping the rail on the platforms this project does not distribute is a
+ * design decision rather than a fix.
+ *
+ * The sidebar's copy passes children — the traffic lights at the start of the row, the controls at its end
  * — and then it must *not* be `aria-hidden`, or the controls inside it disappear
  * from the accessibility tree while staying clickable.
  *
