@@ -1,7 +1,10 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
-import { parseCommitStream, resolveReleaseBump } from '../resolve-release-bump';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { isValidVersion, parseCommitStream, resolveReleaseBump } from '../resolve-release-bump';
 
 // Fixtures are shaped like this repo's real history rather than minimal
 // one-liners: the subjects are the ones `git log` actually shows (including a
@@ -20,6 +23,20 @@ function runCli(currentVersion: string, messages: string[]): string {
     input: messages.map((m) => `${m}\0`).join(''),
     encoding: 'utf8',
   });
+}
+
+// Same, but never throws: returns the exit code and both streams, so the
+// rejection paths can be asserted rather than just observed as a throw.
+function runCliRaw(argv: string[], input: string | Buffer = ''): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+} {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', CLI, ...argv], {
+    input,
+    encoding: 'utf8',
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 describe('resolveReleaseBump', () => {
@@ -265,6 +282,38 @@ describe('parseCommitStream', () => {
     expect(resolveReleaseBump('0.1.7', parseCommitStream(raw))).toBe('minor');
   });
 
+  // DO NOT DELETE THESE AS "REDUNDANT" NEXT TO THE HAND-JOINED FIXTURES ABOVE.
+  //
+  // Every other test in this file builds its stream as `messages.join('\0')` —
+  // and that fixture is exactly what the shipped bug was blind to. Git does
+  // not emit `<message>\0<message>\0`; `--format=%B%x00` emits
+  // `<message>\0\n<message>\0\n`, an LF AFTER each NUL, because the format's
+  // per-entry newline lands past the NUL. A hand-joined fixture omits that LF,
+  // so every hand-built multi-commit test passed while the real range silently
+  // discarded every commit but the newest. The three outcomes below are the
+  // three the bug broke; they are written with git's real byte framing on
+  // purpose. See also the real-git integration test at the bottom of the file,
+  // which is what proves the framing string above is still what git emits.
+  describe('with git real byte framing (LF after each NUL)', () => {
+    // Newest commit first, exactly like `git log`.
+    const framed = (...messages: string[]): string =>
+      messages.map((message) => `${message}\0\n`).join('');
+
+    it('resolves minor when the newest is docs and an older feat is still in range', () => {
+      expect(resolveReleaseBump('0.1.7', parseCommitStream(framed(DOCS, FEAT)))).toBe('minor');
+    });
+
+    it('resolves minor when the newest is a fix and an older feat is in range', () => {
+      expect(resolveReleaseBump('0.1.7', parseCommitStream(framed(FIX, FEAT)))).toBe('minor');
+    });
+
+    it('resolves none when every commit in range is docs or chore', () => {
+      expect(resolveReleaseBump('0.1.7', parseCommitStream(framed(DOCS, CHORE, DOCS)))).toBe(
+        'none',
+      );
+    });
+  });
+
   it('keeps a multi-line body whole, blank lines and quotes included', () => {
     const message = `feat(cli): accept a "quoted" flag
 
@@ -299,5 +348,159 @@ BREAKING CHANGE: nope, this line is quoted prose only when it is not at
 the start of a line.`;
     expect(runCli('1.0.0', [nasty, DOCS])).toBe('major');
     expect(runCli('0.1.7', [nasty, DOCS])).toBe('minor');
+  });
+
+  describe('version argument validation', () => {
+    it('rejects a version that is not MAJOR.MINOR.PATCH shaped', () => {
+      // The finding: `banana` fell through to major 0, and major 0 downgrades
+      // a breaking change from `major` to `minor`. Answering `minor`
+      // confidently on garbage is one refactor away from shipping the wrong
+      // release, so the CLI refuses instead.
+      const breaking = 'refactor(db): x\n\nBREAKING CHANGE: real';
+      for (const bad of ['banana', 'v1.2.3', '1.2', '1.2.3.4', '', '1.2.x']) {
+        const result = runCliRaw([bad], `${breaking}\0\n`);
+        expect(result.status, `version ${JSON.stringify(bad)}`).toBe(2);
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('not a MAJOR.MINOR.PATCH version');
+      }
+    });
+
+    it('accepts a pre-release version, because the manual path cuts those', () => {
+      const result = runCliRaw(['0.2.0-beta.1'], `${FEAT}\0\n`);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('minor');
+      expect(result.stderr).toBe('');
+      // Build metadata is legal semver too, and a breaking change at a 1.x
+      // pre-release still has to read as major.
+      expect(runCliRaw(['1.0.0-rc.1+build.5'], 'feat(api)!: drop it\0\n').stdout).toBe('major');
+    });
+
+    it('agrees with the exported predicate', () => {
+      expect(isValidVersion('0.1.7')).toBe(true);
+      expect(isValidVersion('0.2.0-beta.1')).toBe(true);
+      expect(isValidVersion('10.20.30')).toBe(true);
+      expect(isValidVersion('banana')).toBe(false);
+      expect(isValidVersion('v0.2.0')).toBe(false);
+      // The pure resolver stays total on purpose — validation is the CLI's
+      // job, not its caller's. Documented at isValidVersion.
+      expect(resolveReleaseBump('banana', [FIX])).toBe('patch');
+    });
+  });
+
+  describe('stdin read failures', () => {
+    it('fails loudly on a closed stdin instead of reporting nothing to release', () => {
+      // `none` + exit 0 on a broken read is the silent-no-release failure mode
+      // this whole feature exists to eliminate: the workflow ends green having
+      // shipped nothing.
+      const result = spawnSync(
+        'bash',
+        ['-c', `exec 0<&-; exec "$0" --import tsx "$1" 0.1.7`, process.execPath, CLI],
+        { encoding: 'utf8' },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('stdin is /dev/null');
+      expect(result.stderr).toContain('NOT "nothing to release"');
+    });
+
+    it('fails the same way on an explicit /dev/null redirect', () => {
+      // Node opens /dev/null over a closed fd 0 before user code runs, so this
+      // and the closed-fd case above are the same process state. Neither is a
+      // commit stream.
+      const result = spawnSync(
+        'bash',
+        ['-c', `exec "$0" --import tsx "$1" 0.1.7 < /dev/null`, process.execPath, CLI],
+        { encoding: 'utf8' },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('stdin is /dev/null');
+    });
+
+    it('still resolves none for genuinely empty stdin', () => {
+      // The other half of the distinction: an empty PIPE is legitimate — the
+      // range really had no commits.
+      const result = runCliRaw(['0.1.7'], '');
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('none');
+      expect(result.stderr).toBe('');
+      // And an empty real file, which is what release.yml actually redirects
+      // in (`< /tmp/release-commits.bin`) when the range is empty.
+      const emptyFile = join(mkdtempSync(join(tmpdir(), 'release-bump-empty-')), 'commits.bin');
+      writeFileSync(emptyFile, '');
+      const fromFile = spawnSync(
+        'bash',
+        ['-c', `exec "$0" --import tsx "$1" 0.1.7 < "$2"`, process.execPath, CLI, emptyFile],
+        { encoding: 'utf8' },
+      );
+      expect(fromFile.status).toBe(0);
+      expect(fromFile.stdout).toBe('none');
+      rmSync(emptyFile, { force: true });
+    });
+
+    // NOT TESTED: EAGAIN. Reproducing it needs stdin to be a pipe left in
+    // non-blocking mode by the parent, which Node's own child_process cannot
+    // set up (it hands children blocking descriptors) and which is racy by
+    // nature — the retry loop exists for a condition that clears on its own,
+    // so a deterministic assertion on it is not available here.
+  });
+});
+
+// The end of the framing chain: everything above trusts a hard-coded `\0\n`,
+// and this is the test that checks git still emits it. If git ever changes the
+// format, this fails and the hand-written fixtures above become wrong together.
+describe('real git integration', () => {
+  let repo: string;
+
+  const git = (...args: string[]): string =>
+    execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+
+  beforeAll(() => {
+    repo = mkdtempSync(join(tmpdir(), 'release-bump-git-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', repo]);
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test');
+    git('config', 'commit.gpgsign', 'false');
+    // Oldest first. The ranges below slice this so each of the three broken
+    // outcomes gets a real commit range.
+    for (const message of ['feat: deep', 'fix: middle', 'docs: newest', CHORE, 'docs: also']) {
+      git('commit', '-q', '--allow-empty', '-m', message);
+    }
+  });
+
+  afterAll(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  function logBytes(...range: string[]): Buffer {
+    return execFileSync('git', ['-C', repo, 'log', '--format=%B%x00', ...range]);
+  }
+
+  it('really does emit an LF after every NUL', () => {
+    const raw = logBytes('HEAD~3');
+    // Two commits in this range, so two records, each `<message>\0\n`.
+    expect(raw.toString('utf8')).toBe('fix: middle\n\0\nfeat: deep\n\0\n');
+    expect(raw.includes(Buffer.from([0x00, 0x0a]))).toBe(true);
+  });
+
+  it('resolves minor when the newest is docs and an older feat is in range', () => {
+    // HEAD~2 == `docs: newest`; the range is docs, fix, feat.
+    const result = runCliRaw(['0.1.7'], logBytes('HEAD~2'));
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('minor');
+  });
+
+  it('resolves minor when the newest is a fix and an older feat is in range', () => {
+    const result = runCliRaw(['0.1.7'], logBytes('HEAD~3'));
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('minor');
+  });
+
+  it('resolves none when every commit in range is docs or chore', () => {
+    const raw = logBytes('HEAD~2..HEAD');
+    expect(raw.toString('utf8')).toBe(`docs: also\n\0\n${CHORE}\n\0\n`);
+    const result = runCliRaw(['0.1.7'], raw);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('none');
   });
 });

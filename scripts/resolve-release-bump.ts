@@ -16,7 +16,7 @@
 //
 // CLI: git log --format=%B%x00 <range> | node --import tsx scripts/resolve-release-bump.ts <currentVersion>
 
-import { readFileSync } from 'node:fs';
+import { fstatSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -190,11 +190,34 @@ function bumpForCommit(message: string, currentMajor: number): ReleaseBump {
   return 'patch';
 }
 
+// A `MAJOR.MINOR.PATCH` version, with an optional pre-release and/or build
+// suffix. The suffix has to be legal because the manual workflow_dispatch path
+// cuts pre-releases (`0.2.0-beta.1`) and those flow straight into this CLI's
+// argument.
+const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+// WHO VALIDATES: the CLI, not the pure function.
+//
+// resolveReleaseBump stays total — every string in, one of four words out —
+// because it is called directly by ~40 tests and by any future caller that has
+// already validated, and because throwing from it would turn a bad version
+// into an unhandled rejection somewhere instead of a diagnosable exit code.
+// Its leniency is documented at the currentMajor line below.
+//
+// The CLI is the trust boundary: it is the thing a workflow hands an
+// unvalidated `package.json` version to, so it rejects a version that does not
+// parse rather than answering confidently about garbage.
+export function isValidVersion(version: string): boolean {
+  return VERSION_RE.test(version);
+}
+
 export function resolveReleaseBump(currentVersion: string, commitMessages: string[]): ReleaseBump {
-  // Only the major matters, and only for the pre-1.0 breaking rule. An
-  // unparseable version is treated as pre-1.0, which is the cautious side:
-  // release.yml's preflight rejects a malformed package.json version anyway,
-  // so this never gets to matter in practice.
+  // Only the major matters, and only for the pre-1.0 breaking rule. A version
+  // this function cannot parse is treated as pre-1.0 — a deliberate, and
+  // deliberately unreachable-from-the-CLI, fallback: see isValidVersion above
+  // for why the rejection lives in main() instead of here. It matters because
+  // pre-1.0 downgrades a breaking change from `major` to `minor`, so a silent
+  // fallback on garbage is a silently wrong release; main() refuses first.
   const currentMajor = Number(/^(\d+)\./.exec(currentVersion)?.[1] ?? 0);
 
   let bump: ReleaseBump = 'none';
@@ -234,23 +257,108 @@ export function parseCommitStream(raw: string): string[] {
   return parts.filter((part) => part.trim().length > 0);
 }
 
+const USAGE =
+  'usage: git log --format=%B%x00 <range> | node --import tsx scripts/resolve-release-bump.ts <currentVersion>';
+
+// How long to keep retrying an EAGAIN before calling it a failure. See
+// readStdin: EAGAIN is the one stdin error that is not a real error.
+const EAGAIN_RETRY_MS = 20;
+const EAGAIN_RETRY_LIMIT = 100; // ~2s total
+
+// Read all of fd 0, or throw.
+//
+// fd 0 read synchronously: the input is a git log, bounded by one release
+// cycle's worth of commits, and sync keeps the exit-code discipline simple.
+//
+// Empty stdin and a broken stdin are DIFFERENT ANSWERS and this is where they
+// get separated. Empty is legitimate — no commits since the tag — and resolves
+// to `none`. A read failure is not: it used to be swallowed into `raw = ''`,
+// which made the CLI print `none` and exit 0, so the workflow ended green
+// having shipped nothing and said nothing. Silent no-release is the exact
+// failure mode this feature exists to eliminate, so a failed read now exits
+// non-zero and the step fails loudly.
+//
+// The two failures worth distinguishing:
+//   - a closed fd (`exec 0<&-`). This never reaches the catch below: node
+//     opens /dev/null over any missing stdio descriptor before user code runs,
+//     so the read succeeds and returns ''. Measured, not assumed — with fd 0
+//     closed, fstat(0) reports the same character device and rdev as
+//     stat('/dev/null'). It is therefore indistinguishable in-process from an
+//     explicit `< /dev/null`, and stdinIsDevNull below rejects both: neither
+//     is ever a legitimate commit stream, and answering `none` to one is the
+//     silent-no-release bug. An empty pipe and an empty real file — the two
+//     shapes a legitimately empty range actually arrives as — are untouched.
+//   - EAGAIN, a pipe left in non-blocking mode by the parent process. Node
+//     surfaces this from a sync read on fd 0 even though the writer is alive
+//     and data is still coming; treating it as terminal would fail runs whose
+//     input was fine. It is the one case that is retried, bounded, and only
+//     escalated if the fd is still not readable after ~2s.
+// Anything else (EIO, EISDIR, ...) is terminal too: it means the input is not
+// something this process can read, which is never "nothing to release".
+// True when fd 0 is /dev/null — either redirected there or, identically, node
+// standing in for a descriptor the caller closed. Any failure to stat is
+// answered `false`: an unknown fd is given the benefit of the doubt rather than
+// failing a release run over a stat.
+function stdinIsDevNull(): boolean {
+  try {
+    const stdin = fstatSync(0);
+    if (!stdin.isCharacterDevice()) return false;
+    return stdin.rdev === statSync('/dev/null').rdev;
+  } catch {
+    return false;
+  }
+}
+
+function readStdin(): string {
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return readFileSync(0, 'utf8');
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EAGAIN' || attempt >= EAGAIN_RETRY_LIMIT) throw error;
+      // Sync sleep: the read itself is sync, so there is no event loop turn to
+      // yield to here.
+      Atomics.wait(sleeper, 0, 0, EAGAIN_RETRY_MS);
+    }
+  }
+}
+
 function main(argv: string[]): void {
   if (argv.length !== 1) {
-    console.error(
-      'usage: git log --format=%B%x00 <range> | node --import tsx scripts/resolve-release-bump.ts <currentVersion>',
-    );
+    console.error(USAGE);
     process.exit(2);
   }
   const [currentVersion] = argv as [string];
-  // fd 0 read synchronously: the input is a git log, bounded by one release
-  // cycle's worth of commits, and sync keeps the exit-code discipline simple.
-  // An empty stdin is legitimate (no commits since the tag) and resolves to
-  // `none`, so a read failure on a closed fd is not an error either.
-  let raw = '';
+  // Same class of error as a missing argument, so the same exit code: the
+  // caller passed something this CLI cannot act on.
+  if (!isValidVersion(currentVersion)) {
+    console.error(
+      `resolve-release-bump: not a MAJOR.MINOR.PATCH version: ${JSON.stringify(currentVersion)}`,
+    );
+    console.error(USAGE);
+    process.exit(2);
+  }
+
+  if (stdinIsDevNull()) {
+    console.error(
+      'resolve-release-bump: stdin is /dev/null (closed or redirected there), not a commit ' +
+        'stream. This is NOT "nothing to release" — refusing to answer.',
+    );
+    process.exit(1);
+  }
+
+  let raw: string;
   try {
-    raw = readFileSync(0, 'utf8');
-  } catch {
-    raw = '';
+    raw = readStdin();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? 'unknown';
+    console.error(
+      `resolve-release-bump: could not read commit messages from stdin (${code}). ` +
+        'This is NOT "nothing to release" — refusing to answer.',
+    );
+    process.exit(1);
+    return;
   }
   // Exactly the word, no trailing newline, so the workflow can use it raw in
   // `echo "bump=$(...)" >> $GITHUB_OUTPUT` without trimming.
