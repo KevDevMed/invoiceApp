@@ -1,10 +1,57 @@
-# Cut a release in one click, from the Actions tab, with no local git.
+# Cut a release — automatically on every merge to main, or in one click from
+# the Actions tab, with no local git.
 #
 # Releasing used to take three manual steps: bump package.json on a branch,
 # PR and merge it, then tag the merge commit. This workflow collapses that to
-# one workflow_dispatch: type the new version (or patch/minor/major), and it
-# bumps, commits to main, tags, and hands off to build-mac.yml — which does
-# all the real work of building, signing, notarising and publishing.
+# one step: it bumps, commits to main, tags, and hands off to build-mac.yml —
+# which does all the real work of building, signing, notarising and publishing.
+#
+# TWO ENTRY POINTS, ONE CODE PATH.
+#   * push to main — the normal case. The bump is DERIVED from the
+#     conventional-commit subjects landed since the last v* tag by
+#     scripts/resolve-release-bump.ts, and the run then continues down exactly
+#     the steps a manual dispatch takes.
+#   * workflow_dispatch — type the version (or patch/minor/major) yourself.
+#     Still the way to cut an explicit version, a pre-release, or 1.0.0.
+# Everything after "Resolve the release intent" is shared: the resolved word
+# lands in the same VERSION_INPUT the preflight has always read, so the
+# automatic path cannot drift from the manual one.
+#
+# WHY THE PUSH TRIGGER EXISTS AT ALL. The app ships an in-app update signal
+# (src/main/updater.ts checks the GitHub Release feed on launch and every 6h),
+# and that signal is only as good as the releases behind it. With releasing
+# gated on a human remembering to click, main sat two feature PRs ahead of
+# v0.1.7 with no release, so every installed app was told it was current when
+# it was not. A merge that changes the app now cuts the release that tells
+# them otherwise.
+#
+# AND WHY IT STILL REFUSES TO RELEASE SOME MERGES. A release run packages,
+# signs and notarises two architectures, and Apple's notary queue has taken
+# 30 to 147+ minutes on identical inputs. A commit whose type is
+# docs/chore/ci/test/style/build contributes nothing to the bump, and so does a
+# commit carrying `[skip release]` in one of exactly two forms: anywhere in its
+# SUBJECT line, or on a BODY line whose entire content is the marker (an
+# optional `-`/`*`/`+` bullet, surrounding whitespace and one trailing `.` `,`
+# `;` `:` or `!` allowed — no other punctuation, so `[skip release]?` does not
+# opt out). Nothing else opts out — the marker mentioned in prose, backticked,
+# or inside a fence (bullet-indented fences included) or a blockquote does not,
+# whatever the line wrapping. If EVERY commit in the range since the last tag
+# contributes nothing, the range resolves to `none` and the run ends green with
+# nothing pushed.
+#
+# PRECEDENCE: breaking beats the non-contributing list. The types above are
+# non-contributing only in the absence of a breaking marker — `chore!: drop
+# node 18` or a `docs:` commit with a real `BREAKING CHANGE:` footer resolves
+# `major` (`minor` while the major is still 0), not `none`. `[skip release]` is
+# the one marker that beats everything, breaking included.
+#
+# Both of those are per-COMMIT, judged by the resolver over the whole range —
+# not per-run, judged on the head commit. That distinction is load-bearing: a
+# `[skip release]` merge landing on top of an already-merged, still-unreleased
+# `feat` must not suppress the feat too. The range resolves `minor` in that
+# case and the release is cut. Read the comments in
+# scripts/resolve-release-bump.ts for the rules; they are unit-tested there,
+# which is the other reason they are not shell in this file.
 #
 # DELIBERATE TRADEOFF — this pushes straight to main, no PR. That is the price
 # of one-click, and it is acceptable here because a version-only bump cannot
@@ -12,7 +59,8 @@
 # typecheck / lint / unit tests in its own `verify` job before packaging
 # anything, so a broken main would still never ship. If main ever becomes
 # branch-protected, this workflow stops working and needs a PAT or a
-# deploy-key bypass — revisit the tradeoff then.
+# deploy-key bypass — revisit the tradeoff then, and read the two paragraphs
+# below first: moving this push off GITHUB_TOKEN breaks more than the push.
 #
 # THE TRIGGER PROBLEM, AND WHY THIS DISPATCHES INSTEAD OF RELYING ON THE TAG.
 # A tag pushed with the workflow's own GITHUB_TOKEN does NOT trigger
@@ -33,6 +81,22 @@
 # itself triggers — was rejected: it adds a long-lived credential to rotate
 # for zero functional gain.
 #
+# IF YOU EVER DO MOVE THIS PUSH TO A PAT OR DEPLOY KEY, TWO THINGS BREAK — the
+# release loop discussed above, and the tag trigger discussed here. Under
+# GITHUB_TOKEN, .github/workflows/build-mac.yml's `on: push: tags: ['v*']` is
+# inert, so the explicit `gh workflow run build-mac.yml` dispatch at the end of
+# this file is the only thing that starts a build. Under a PAT, BOTH fire for
+# the same tag, and build-mac.yml has no `concurrency` block — so two runs
+# would build, sign, notarise and publish that one tag at the same time.
+# Whoever makes that move must therefore ALSO do one of:
+#   * delete the "Start the build (build-mac.yml)" step (and the run-URL step
+#     after it, which looks up an `--event workflow_dispatch` run) from
+#     .github/workflows/release.yml, letting the tag push do the triggering; or
+#   * add a `concurrency` group keyed on the tag to
+#     .github/workflows/build-mac.yml, so the second run queues or is cancelled
+#     instead of racing the first.
+# Neither is optional. Doing the credential swap on its own double-publishes.
+#
 # Preflight is strict and runs before ANY write: malformed version, version
 # not strictly greater than package.json, or an already-existing tag each
 # abort with instructions. The existing-tag case is not hypothetical: v0.1.4
@@ -44,6 +108,11 @@
 name: Cut release
 
 on:
+  # Every merge to main. Direct pushes to main land here too, deliberately:
+  # what earns a release is a change reaching main, not the shape of the PR
+  # that carried it.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -61,7 +130,10 @@ permissions:
   actions: write
 
 # Two concurrent release cuts would race each other's push to main and tag
-# creation. Queue them instead; never cancel a half-done release.
+# creation. Queue them instead; never cancel a half-done release. This matters
+# more now than it did under dispatch-only: two PRs merged a minute apart fire
+# two runs with no human in between, and cancel-in-progress would kill the
+# first one mid-push, between its bump commit and its tag.
 concurrency:
   group: cut-release
   cancel-in-progress: false
@@ -75,23 +147,158 @@ jobs:
       # clicked from — a release is only ever cut from main. persist-credentials
       # (the default) keeps GITHUB_TOKEN wired into the remote so the pushes
       # below authenticate.
+      #
+      # fetch-depth: 0 (the default is a single commit) because the push path
+      # walks history: it needs every v* tag to find the last release, and every
+      # commit after it to read the subjects. A depth-1 clone has neither, so
+      # `git describe` finds no tag and the range falls back to `HEAD` — which
+      # in that clone is exactly ONE commit. Measured on a depth-1 replay: the
+      # resolver sees the head commit only, so every earlier unreleased commit
+      # in the cycle is invisible and the bump is decided by whatever landed
+      # last (a `docs` head hides an unreleased `feat` behind it: `none`).
       - uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
 
-      # Everything that can refuse, refuses here — before any write anywhere.
-      - name: Preflight — resolve and validate the new version
-        id: preflight
+      # Only the push path needs node_modules, for tsx and the resolver, so the
+      # dispatch path is left paying nothing for it — its timing and behaviour
+      # stay exactly what they were. --ignore-scripts for the same reason
+      # build-mac.yml's publish job uses it: the postinstall rebuilds
+      # better-sqlite3 and fetches llama.cpp backends, minutes of work that
+      # resolving one word does not need.
+      - name: Install dependencies (scripts only)
+        if: github.event_name == 'push'
+        run: npm ci --ignore-scripts
+
+      # The one step that differs between the two entry points. It produces
+      # `version` — the word the preflight below has always read — and
+      # `release`, which is 'false' for the two cases that must end green
+      # without releasing anything: a head commit that is this workflow's own
+      # bump, and a range that resolves to `none`.
+      - name: Resolve the release intent
+        id: intent
         env:
           VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
+          if [ "$GITHUB_EVENT_NAME" != 'push' ]; then
+            # Dispatch: the human's word, verbatim. Whitespace is stripped
+            # before it reaches $GITHUB_OUTPUT — the preflight strips it too,
+            # so this changes nothing about how the value is judged, but it
+            # keeps a newline in a free-text input from writing a second
+            # key=value line of its own choosing.
+            echo "version=$(printf '%s' "$VERSION_INPUT" | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+            echo 'release=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          skip() {
+            echo 'release=false' >> "$GITHUB_OUTPUT"
+            echo "No release: $1"
+            echo "**No release cut.** $1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          HEAD_SUBJECT=$(git log -1 --format=%s HEAD)
+
+          # Belt and braces, and the ONLY head-commit-scoped rule in this file
+          # — everything else about what earns a release is decided per commit
+          # across the whole range, by the resolver.
+          #
+          # GitHub does not run workflows for events caused by GITHUB_TOKEN (see
+          # the header), so the bump commit this workflow pushes should never
+          # retrigger it in the first place. This guard is here so that stays
+          # true if the push ever moves to a PAT or a deploy key — with a PAT,
+          # without this, every release would immediately cut another one,
+          # forever.
+          #
+          # WHAT IT DOES NOT DO. It is a head-SUBJECT check, so it cannot tell
+          # this workflow's own bump commit from any other commit with that
+          # subject, and it does not verify that a release actually completed.
+          # In the normal case the range behind such a head is empty and
+          # resolves to `none` anyway, so the guard suppresses nothing that has
+          # not shipped. Two cases break that: a run whose bump commit pushed
+          # but whose tag push then FAILED, and a hand-written `chore(release):`
+          # commit. In both, this guard ends the run green while unreleased work
+          # sits in the range. Neither self-heals — the next push to main has a
+          # different head and releases normally, but the half-released state
+          # itself (version bumped, no tag) is recovered by hand: tag the bump
+          # commit, or run the manual workflow_dispatch path.
+          case "$HEAD_SUBJECT" in
+            'chore(release):'*)
+              skip "the head commit is this workflow's own bump commit (\`$HEAD_SUBJECT\`)."
+              ;;
+          esac
+
           CURRENT=$(node -p "require('./package.json').version")
+
+          # The last release tag reachable from HEAD, not the newest tag in the
+          # repo: a tag on an unmerged branch must not shorten the range. With
+          # no v* tag at all (--abbrev=0 exits non-zero), the range is the whole
+          # history, which is the correct reading of "nothing has been released
+          # yet".
+          LAST_TAG=$(git describe --tags --abbrev=0 --match 'v*' HEAD 2> /dev/null || true)
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="$LAST_TAG..HEAD"
+          else
+            RANGE='HEAD'
+          fi
+
+          # Commit messages go to the resolver as a NUL-delimited stream on a
+          # file, never through argv or a variable: bodies in this repo contain
+          # quotes, backticks, blank lines and `$(...)`, and NUL is the one byte
+          # git guarantees a commit message cannot contain. See the comment on
+          # parseCommitStream in the script.
+          git log --format=%B%x00 "$RANGE" > /tmp/release-commits.bin
+          BUMP=$(node --import tsx scripts/resolve-release-bump.ts "$CURRENT" < /tmp/release-commits.bin)
+
+          SUBJECTS=$(git log --format='%s' "$RANGE")
+          echo "Range $RANGE resolved to: $BUMP"
+          echo "$SUBJECTS"
+
+          if [ "$BUMP" = 'none' ]; then
+            skip "nothing releasable landed since ${LAST_TAG:-the start of history} — every commit in the range is docs/chore/ci/test/style/build, or opted out with \`[skip release]\`. A signed, notarised two-arch build is not worth spending on a change users cannot see."
+          fi
+
+          echo "version=$BUMP" >> "$GITHUB_OUTPUT"
+          echo 'release=true' >> "$GITHUB_OUTPUT"
+
+          # Why version X is about to happen, readable from the Actions tab
+          # without opening a log.
+          {
+            echo "## Auto-release: $BUMP bump"
+            echo ""
+            echo "Derived from the commits since \`${LAST_TAG:-the start of history}\` (current version $CURRENT):"
+            echo ""
+            printf '%s\n' "$SUBJECTS" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Everything that can refuse, refuses here — before any write anywhere.
+      - name: Preflight — resolve and validate the new version
+        id: preflight
+        if: steps.intent.outputs.release == 'true'
+        env:
+          VERSION_INPUT: ${{ steps.intent.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(node -p "require('./package.json').version")
+          # Pre-dates the automatic path and is deliberately left as it was: it
+          # is the grammar build-mac.yml's tag stamping enforces, so the two
+          # must keep agreeing. It has NO `+` branch, so build metadata
+          # (1.0.0-rc.1+build.5) is rejected here — the manual path cannot cut
+          # one. It is also looser than scripts/resolve-release-bump.ts's CLI on
+          # illegal suffixes (`01.2.3`, `1.2.3-alpha..1`, `1.2.3-01`, `1.2.3-.`
+          # pass here and exit 2 there). That disagreement is pre-existing;
+          # tightening it changes what the manual path accepts, which is a
+          # separate call from validating what the automatic path reads.
           SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
           if [[ ! "$CURRENT" =~ $SEMVER_RE ]]; then
             echo "::error::package.json's current version '$CURRENT' is not a valid semver — fix package.json on main before cutting a release."
@@ -184,7 +391,13 @@ jobs:
       # version fields in package-lock.json, without needing node_modules.
       # The read-back is not paranoia for its own sake: a lockfile the bump
       # missed would ship a release whose lockfile disagrees with its manifest.
+      # Every step from here on carries the same guard rather than the job
+      # carrying it, because a skipped release must report SUCCESS: the
+      # resolver deciding "nothing to ship" is the workflow working, not
+      # failing, and a red X on half the merges to main trains everyone to
+      # ignore the ones that matter.
       - name: Bump package.json and package-lock.json
+        if: steps.intent.outputs.release == 'true'
         env:
           NEW: ${{ steps.preflight.outputs.version }}
         run: |
@@ -207,6 +420,7 @@ jobs:
       # commit differs from what was built.
       - name: Commit, push to main, and tag
         id: push
+        if: steps.intent.outputs.release == 'true'
         env:
           NEW: ${{ steps.preflight.outputs.version }}
           TAG: ${{ steps.preflight.outputs.tag }}
@@ -238,6 +452,7 @@ jobs:
       # so build-mac.yml's validate job finds tag and build commit identical
       # and publishes exactly as it would for a human-pushed tag.
       - name: Start the build (build-mac.yml)
+        if: steps.intent.outputs.release == 'true'
         env:
           TAG: ${{ steps.preflight.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
@@ -250,6 +465,7 @@ jobs:
       # silently-no-build failure mode this workflow exists to prevent — fail
       # loudly rather than end green with nothing building.
       - name: Print the build run URL
+        if: steps.intent.outputs.release == 'true'
         env:
           TAG: ${{ steps.preflight.outputs.tag }}
           COMMIT: ${{ steps.push.outputs.commit }}
