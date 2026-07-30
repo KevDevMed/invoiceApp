@@ -189,6 +189,102 @@ BREAKING CHANGE: databases written by 0.1.x must be re-migrated.`;
       // And the plain body-then-footer shape keeps working.
       expect(resolveReleaseBump('1.2.3', [FOOTER])).toBe('major');
     });
+
+    it('does not close a four-backtick fence on a three-backtick line inside it', () => {
+      // H3. Round 2 matched `(```|~~~)` — the first three marker characters
+      // only — so the inner ``` ended the fence and the BREAKING line, still
+      // inside the OUTER fence, counted. CommonMark: a closing fence must be
+      // the same character and at least as long.
+      const nested = `fix(api): document the fence rules
+
+\`\`\`\`markdown
+\`\`\`
+BREAKING CHANGE: example only, still inside the outer fence
+\`\`\`
+\`\`\`\``;
+      expect(resolveReleaseBump('1.2.3', [nested])).toBe('patch');
+      expect(resolveReleaseBump('0.1.7', [nested])).toBe('patch');
+    });
+
+    it('does not read a long inline code span as a fence', () => {
+      // The other half of H3, and the worse direction: round 2 opened a fence
+      // on the five-backtick span and never closed it, swallowing the genuine
+      // footer — a breaking change silently under-released. CommonMark: a
+      // backtick opener's info string may not contain a backtick, so this line
+      // is a paragraph.
+      const span = `refactor(api): rename the field
+
+The old call was \`\`\`\`\`invoice.total\`\`\`\`\` and is gone.
+
+BREAKING CHANGE: invoice.total is now invoice.amountTotal.`;
+      expect(resolveReleaseBump('1.2.3', [span])).toBe('major');
+      expect(resolveReleaseBump('0.1.7', [span])).toBe('minor');
+    });
+
+    it('does not let stripping the last paragraph promote the one above it', () => {
+      // M1. The footer paragraph is chosen from the ORIGINAL paragraph
+      // structure; stripping happens inside it. Round 2 stripped first, so the
+      // trailing blockquote/fence vanished and the prose above became "last".
+      const quotedLast = `fix(api): keep the legacy field
+
+BREAKING CHANGE: is what the reporter thought this was.
+
+> It is not: the old field still resolves. Quoting their words, not ours.`;
+      const fencedLast = `fix(api): keep the legacy field
+
+BREAKING CHANGE: is what a lazier version of this commit would have said.
+
+\`\`\`text
+still not breaking
+\`\`\``;
+      expect(resolveReleaseBump('1.2.3', [quotedLast])).toBe('patch');
+      expect(resolveReleaseBump('1.2.3', [fencedLast])).toBe('patch');
+      expect(resolveReleaseBump('0.1.7', [quotedLast])).toBe('patch');
+    });
+
+    it('keeps an unterminated fence swallowing everything after it', () => {
+      const unterminated = `fix(api): document parser
+
+\`\`\`text
+BREAKING CHANGE: example only, fence never closed`;
+      expect(resolveReleaseBump('1.2.3', [unterminated])).toBe('patch');
+    });
+  });
+
+  describe('CRLF line endings', () => {
+    // H2. One root cause, several symptoms: every line rule in the resolver is
+    // written against \n, so before normalization a `\r` rode along at the end
+    // of each line and none of them matched. The first case below is the sharp
+    // one — a Windows author's opt-out ignored and a signed, notarised,
+    // two-architecture build cut anyway.
+    it('honours [skip release] written with CRLF', () => {
+      expect(resolveReleaseBump('0.1.7', ['feat: windows optout\r\n\r\n[skip release]\r\n'])).toBe(
+        'none',
+      );
+      expect(resolveReleaseBump('0.1.7', ['fix: internal\r\n\r\n[skip release]\r\n'])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', ['\r\n[skip release]\r\n'])).toBe('none');
+    });
+
+    it('does not read mid-body CRLF prose as a breaking footer', () => {
+      const crlf = 'fix: windows\r\n\r\nBREAKING CHANGE: discussed only\r\n\r\nLater paragraph.\r\n';
+      expect(resolveReleaseBump('1.2.3', [crlf])).toBe('patch');
+    });
+
+    it('still honours a genuine CRLF footer, fence and blockquote', () => {
+      expect(
+        resolveReleaseBump('1.2.3', ['refactor: x\r\n\r\nBREAKING CHANGE: really.\r\n']),
+      ).toBe('major');
+      expect(
+        resolveReleaseBump('1.2.3', ['fix: x\r\n\r\n```text\r\nBREAKING CHANGE: quoted\r\n```\r\n']),
+      ).toBe('patch');
+      expect(resolveReleaseBump('1.2.3', ['fix: x\r\n\r\n> BREAKING CHANGE: theirs\r\n'])).toBe(
+        'patch',
+      );
+    });
+
+    it('normalizes a lone CR too', () => {
+      expect(resolveReleaseBump('0.1.7', ['feat: mac classic\r\r[skip release]\r'])).toBe('none');
+    });
   });
 
   describe('[skip release]', () => {
@@ -223,6 +319,48 @@ nothing, so a marker in prose like this one must not fire.`;
       expect(resolveReleaseBump('0.1.7', [discusses])).toBe('minor');
     });
 
+    it('fires on the shapes people actually write the marker in', () => {
+      // M2. Round 2 accepted the bare line only, so every one of these was
+      // ignored and the commit released.
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n- [skip release]`])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n* [skip release]`])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n+ [skip release]`])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n  [skip release].`])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\nPlease [skip release] for this commit.`])).toBe(
+        'none',
+      );
+      // A bare marker line still counts even inside a longer paragraph: shape
+      // A does not care how many lines the paragraph has.
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\nNo need to ship this one.\n[skip release]`])).toBe(
+        'none',
+      );
+    });
+
+    it('does not fire on a marker discussed inside a multi-line prose paragraph', () => {
+      // The far edge of M2, and the reason the widening stopped where it did.
+      // Both shapes below are copied from 529b279's real body: backticked on
+      // its line 51, and bare inside a wrapped paragraph on its line 70. Widen
+      // past either and the commit that introduced this feature opts itself
+      // out of its own release.
+      const backticked = `${FEAT}
+
+Three conditions end the run green with nothing pushed: a resolved bump of
+\`none\`, a head commit that is already \`chore(release):\`, or \`[skip release]\`
+in the head message.`;
+      const bareInProse = `${FEAT}
+
+The resolve step's shell was exercised locally through all four outcomes
+(minor, chore(release) skip, [skip release] skip, docs-only none) and the
+YAML parsed with js-yaml.`;
+      expect(resolveReleaseBump('0.1.7', [backticked])).toBe('minor');
+      expect(resolveReleaseBump('0.1.7', [bareInProse])).toBe('minor');
+      // Backticked even as a one-line paragraph: the code span is blanked out
+      // before either shape is tried.
+      expect(resolveReleaseBump('0.1.7', [`${FEAT}\n\nThe marker is \`[skip release]\`.`])).toBe(
+        'minor',
+      );
+    });
+
     it('does not fire on a marker inside a fence or a blockquote', () => {
       const fenced = `${FIX}
 
@@ -248,10 +386,12 @@ nothing, so a marker in prose like this one must not fire.`;
       expect(resolveReleaseBump('0.1.7', [''])).toBe('none');
       expect(resolveReleaseBump('0.1.7', ['\n \n'])).toBe('none');
       expect(parseCommitStream('\n \n\0')).toEqual([]);
-      // ...but a segment with content IS a commit and survives the parse. Its
-      // leading newline is git's entry separator, not part of the message.
+      // ...but a segment with content IS a commit and survives the parse.
+      // Nothing is stripped from the FIRST segment: there is no delimiter in
+      // front of it, so its leading newline is the message's own (see the
+      // --cleanup=verbatim test below).
       expect(parseCommitStream('\nbody describes shipped fix\0')).toEqual([
-        'body describes shipped fix',
+        '\nbody describes shipped fix',
       ]);
     });
 
@@ -357,7 +497,26 @@ the start of a line.`;
       // confidently on garbage is one refactor away from shipping the wrong
       // release, so the CLI refuses instead.
       const breaking = 'refactor(db): x\n\nBREAKING CHANGE: real';
-      for (const bad of ['banana', 'v1.2.3', '1.2', '1.2.3.4', '', '1.2.x']) {
+      for (const bad of [
+        'banana',
+        'v1.2.3',
+        '1.2',
+        '1.2.3.4',
+        '',
+        '1.2.x',
+        // L1: shapes the loose regex waved through. Leading zeros in a core
+        // number and empty or zero-led dot-separated identifiers are not
+        // SemVer, and the CLI answered `minor` on every one of them.
+        '01.2.3',
+        '1.02.3',
+        '1.2.03',
+        '1.2.3-alpha..1',
+        '1.2.3+build..5',
+        '1.2.3-01',
+        '1.2.3-.',
+        '1.2.3+',
+        '1.2.3-',
+      ]) {
         const result = runCliRaw([bad], `${breaking}\0\n`);
         expect(result.status, `version ${JSON.stringify(bad)}`).toBe(2);
         expect(result.stdout).toBe('');
@@ -381,6 +540,17 @@ the start of a line.`;
       expect(isValidVersion('10.20.30')).toBe(true);
       expect(isValidVersion('banana')).toBe(false);
       expect(isValidVersion('v0.2.0')).toBe(false);
+      // The suffixes the manual path cuts stay legal...
+      expect(isValidVersion('1.0.0-rc.1+build.5')).toBe(true);
+      expect(isValidVersion('1.0.0-0.3.7')).toBe(true);
+      expect(isValidVersion('1.0.0-alpha-1')).toBe(true);
+      expect(isValidVersion('1.0.0+21AF26D3--117B344092BD')).toBe(true);
+      // ...and the malformed ones do not.
+      expect(isValidVersion('01.2.3')).toBe(false);
+      expect(isValidVersion('1.2.3-alpha..1')).toBe(false);
+      expect(isValidVersion('1.2.3+build..5')).toBe(false);
+      expect(isValidVersion('1.2.3-01')).toBe(false);
+      expect(isValidVersion('1.2.3-.')).toBe(false);
       // The pure resolver stays total on purpose — validation is the CLI's
       // job, not its caller's. Documented at isValidVersion.
       expect(resolveReleaseBump('banana', [FIX])).toBe('patch');
@@ -494,6 +664,37 @@ describe('real git integration', () => {
     const result = runCliRaw(['0.1.7'], logBytes('HEAD~3'));
     expect(result.status).toBe(0);
     expect(result.stdout).toBe('minor');
+  });
+
+  it('keeps a genuine leading blank line in the newest message', () => {
+    // H1. `git commit --cleanup=verbatim` preserves a leading blank line and
+    // `%B` hands it back byte for byte, so the "git strips those" claim round 2
+    // relied on is false. Stripping `^\n+` promoted the body's first line to
+    // the subject: the `docs:` line below became the subject and the commit
+    // resolved `none` — a shipped change reported as nothing to release. The
+    // documented answer for an empty subject WITH content is `patch`.
+    const messageFile = join(repo, 'verbatim-message.txt');
+    writeFileSync(messageFile, '\ndocs: body content is real\n');
+    git(
+      'commit',
+      '-q',
+      '--allow-empty',
+      '--allow-empty-message',
+      '--cleanup=verbatim',
+      '-F',
+      messageFile,
+    );
+    rmSync(messageFile, { force: true });
+    try {
+      const raw = logBytes('-1', 'HEAD');
+      expect(raw.toString('utf8')).toBe('\ndocs: body content is real\n\0\n');
+      expect(parseCommitStream(raw.toString('utf8'))).toEqual(['\ndocs: body content is real\n']);
+      const result = runCliRaw(['0.1.7'], raw);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('patch');
+    } finally {
+      git('reset', '-q', '--soft', 'HEAD~1');
+    }
   });
 
   it('resolves none when every commit in range is docs or chore', () => {

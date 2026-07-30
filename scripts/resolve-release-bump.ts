@@ -52,30 +52,62 @@ const RELEASE_COMMIT_RE = /^chore\(release\):/i;
 // some unrelated later push happened along. Scoped to the commit, the marker
 // can only ever suppress its own commit.
 //
-// WHERE IT COUNTS: in the subject, or on a line of its own in the body. NOT
-// anywhere in the message, for the same reason `BREAKING CHANGE:` is not
-// matched anywhere (see footerBlock): this repo's bodies are long enough to
-// DISCUSS the marker in prose. Commit 529b279's body does exactly that, and an
-// anywhere-match read that feat as opted out — verified against real history,
-// not hypothesised. Fenced and quoted lines are stripped before the
-// line-of-its-own check, so a marker inside an example cannot fire either.
+// WHERE THE LINE IS DRAWN, and why it has two edges rather than one.
+//
+// It counts in the subject anywhere. In the body it counts in exactly two
+// shapes, both checked on lines that survived fence and blockquote stripping
+// and after inline `code spans` are blanked out (see isSkipped):
+//
+//   A. a line whose only content is the marker, allowing a leading list
+//      bullet (`-`, `*`, `+`), surrounding whitespace and trailing
+//      punctuation — `[skip release]`, `- [skip release]`, `[skip release].`;
+//   B. a single-line paragraph that mentions the marker — `Please
+//      [skip release] for this commit.` People write the opt-out as a short
+//      standalone instruction at least as often as they write it bare, and
+//      round 2 ignored every one of those.
+//
+// THE FAR EDGE: a marker inside a MULTI-LINE prose paragraph, or inside
+// backticks, never fires. That is not fastidiousness — an anywhere-match was
+// tried and it misfired on this repo's own history. Commit 529b279's body
+// both writes `` `[skip release]` `` in backticks (line 51) and writes it
+// bare inside a wrapped prose paragraph (line 70, "…[skip release] skip,
+// docs-only none)"), so BOTH exclusions are load-bearing: drop either one and
+// the commit that introduced this feature reads as opted out of its own
+// release. Verified against real history, not hypothesised.
 const SKIP_RELEASE_ANYWHERE_RE = /\[skip release\]/i;
-const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*\[skip release\][ \t]*$/i;
+const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[skip release\][ \t]*[.,;:!]*[ \t]*$/i;
+
+// An inline code span: a run of backticks, its content, and a closing run.
+// Blanked out before the marker checks so a backticked mention cannot fire.
+const CODE_SPAN_RE = /`+[^`]*`+/g;
 
 // A `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer. Both spellings are
 // spec-legal aliases. Anchoring to a line start is necessary but nowhere near
 // sufficient — see footerBlock for the two things that have to happen first.
 const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
 
-// Lines that open or close a fenced code block: ``` or ~~~, indented up to
-// three spaces (CommonMark's limit).
-const FENCE_RE = /^ {0,3}(```|~~~)/;
+// A line that opens or closes a fenced code block: a run of at least three
+// backticks or tildes, indented up to three spaces (CommonMark's limit).
+// Group 1 is the run; group 2 is the rest of the line (the info string on an
+// opener). The run LENGTH is captured, not just its first three characters:
+// round 2 looked at `(```|~~~)` only, so it could not tell a four-backtick
+// fence from a three-backtick one and it read a long inline code span as a
+// fence. CommonMark's rule is the simplest correct one and it is what this
+// implements — see scanBody.
+const FENCE_RE = /^ {0,3}((?:`{3,})|(?:~{3,}))(.*)$/;
 
 // A blockquote line: `>` after at most three spaces of indent.
 const BLOCKQUOTE_RE = /^ {0,3}>/;
 
-// The body's lines with fenced code blocks and blockquotes removed, so no rule
-// below can be fired by a line that is quoting something rather than saying it.
+type ScannedLine = {
+  text: string;
+  // True for the fence delimiters themselves and everything between them.
+  fenced: boolean;
+  quoted: boolean;
+};
+
+// Classify every body line as fenced / quoted / plain, so no rule below can be
+// fired by a line that is quoting something rather than saying it.
 //
 // A line start inside a ``` fence is still a line start, so an anchored regex
 // alone matches a commit that merely DOCUMENTS the string:
@@ -90,44 +122,96 @@ const BLOCKQUOTE_RE = /^ {0,3}>/;
 // repo are long enough to quote things, so this is a real shape, not a
 // theoretical one. An unterminated fence swallows the rest of the message,
 // which is the cautious direction: nothing after it can force a release.
-function bodyLines(message: string): string[] {
+//
+// THE TWO COMMONMARK RULES THAT MATTER HERE, both found by review as real
+// misreads:
+//   - a closing fence must use the SAME character and be AT LEAST AS LONG as
+//     the opener. A three-backtick line inside a four-backtick fence is
+//     content, not a close; treating it as a close ended the fence early and
+//     let a `BREAKING CHANGE:` line that is still inside the outer fence bump
+//     to major.
+//   - a backtick opener's info string may not contain a backtick. That single
+//     clause is what separates a fence from an inline code span: `````code`````
+//     on one line has backticks after the run, so it is a paragraph, not an
+//     opener. Round 2 opened a fence on it and swallowed the genuine breaking
+//     footer that followed — the worse failure of the two, because post-1.0 it
+//     silently under-releases a breaking change.
+function scanBody(message: string): ScannedLine[] {
   const [subject = ''] = message.split('\n');
   const lines = message.slice(subject.length).split('\n');
 
-  const kept: string[] = [];
-  let fence: string | null = null;
+  const scanned: ScannedLine[] = [];
+  let open: { char: string; length: number } | null = null;
   for (const line of lines) {
-    const fenceMatch = FENCE_RE.exec(line);
-    if (fence !== null) {
-      // Inside a fence: only a fence of the same kind closes it.
-      if (fenceMatch?.[1] === fence) fence = null;
+    const match = FENCE_RE.exec(line);
+    const run = match?.[1];
+    const rest = match?.[2] ?? '';
+    if (open !== null) {
+      // Inside a fence: same character, at least as long, nothing but
+      // whitespace after it.
+      const closes =
+        run !== undefined &&
+        run[0] === open.char &&
+        run.length >= open.length &&
+        rest.trim() === '';
+      if (closes) open = null;
+      scanned.push({ text: line, fenced: true, quoted: false });
       continue;
     }
-    if (fenceMatch?.[1] !== undefined) {
-      fence = fenceMatch[1];
+    if (run !== undefined && !(run[0] === '`' && rest.includes('`'))) {
+      open = { char: run[0] as string, length: run.length };
+      scanned.push({ text: line, fenced: true, quoted: false });
       continue;
     }
-    if (BLOCKQUOTE_RE.test(line)) continue;
-    kept.push(line);
+    scanned.push({ text: line, fenced: false, quoted: BLOCKQUOTE_RE.test(line) });
   }
-  return kept;
+  return scanned;
 }
 
-// The message's footer block — the last blank-line-separated paragraph of the
-// stripped body. Both this and the stripping above are needed for breaking
-// detection and neither is redundant: stripping fences alone still lets a
-// mid-body `BREAKING CHANGE:` line in a prose paragraph count, and the
-// last-paragraph rule alone does not help when the fence IS the last
-// paragraph, which is exactly the shape the review found.
+// The body's plain lines: fenced and quoted ones dropped.
+function strippedBodyLines(message: string): string[] {
+  return scanBody(message)
+    .filter((line) => !line.fenced && !line.quoted)
+    .map((line) => line.text);
+}
+
+// The body's paragraphs, in the ORIGINAL blank-line structure. A blank line
+// inside a fence does not split — the fence is one opaque block — and blocks
+// are kept even when every line in them is fenced or quoted, because WHICH
+// paragraph is last must be decided before anything is stripped. Round 2 split
+// the already-stripped body, so a message whose genuinely-last paragraph was
+// entirely a fence or a blockquote lost that paragraph and promoted the one
+// before it to "footer" — turning hypothetical breaking text one paragraph up
+// into a real major bump.
+function bodyParagraphs(message: string): ScannedLine[][] {
+  const paragraphs: ScannedLine[][] = [];
+  let current: ScannedLine[] = [];
+  for (const line of scanBody(message)) {
+    if (!line.fenced && line.text.trim().length === 0) {
+      if (current.length > 0) paragraphs.push(current);
+      current = [];
+      continue;
+    }
+    current.push(line);
+  }
+  if (current.length > 0) paragraphs.push(current);
+  return paragraphs;
+}
+
+// The message's footer block — the last paragraph of the body, with its fenced
+// and quoted lines then removed. Both halves are needed for breaking detection
+// and neither is redundant: stripping alone still lets a mid-body
+// `BREAKING CHANGE:` line in a prose paragraph count, and the last-paragraph
+// rule alone does not help when the fence IS the last paragraph. Stripping
+// happens strictly INSIDE the chosen paragraph, never before the choice.
 function footerBlock(message: string): string {
-  // Blank lines left behind by a stripped fence must not become the "last
-  // paragraph", so empty paragraphs are discarded and the last surviving one
-  // wins.
-  const paragraphs = bodyLines(message)
-    .join('\n')
-    .split(/\n[ \t]*\n/)
-    .filter((paragraph) => paragraph.trim().length > 0);
-  return paragraphs[paragraphs.length - 1] ?? '';
+  const paragraphs = bodyParagraphs(message);
+  const last = paragraphs[paragraphs.length - 1];
+  if (last === undefined) return '';
+  return last
+    .filter((line) => !line.fenced && !line.quoted)
+    .map((line) => line.text)
+    .join('\n');
 }
 
 function isBreaking(message: string): boolean {
@@ -143,10 +227,43 @@ function isBreaking(message: string): boolean {
 function isSkipped(message: string): boolean {
   const [subject = ''] = message.split('\n');
   if (SKIP_RELEASE_ANYWHERE_RE.test(subject)) return true;
-  return bodyLines(message).some((line) => SKIP_RELEASE_OWN_LINE_RE.test(line));
+
+  // Paragraph structure matters here, so the plain lines are regrouped rather
+  // than flattened: shape B (see the marker comment above) only fires on a
+  // paragraph that is a single line.
+  for (const paragraph of strippedBodyLines(message)
+    .join('\n')
+    .split(/\n[ \t]*\n/)) {
+    const lines = paragraph.split('\n').filter((line) => line.trim().length > 0);
+    for (const line of lines) {
+      const bare = line.replace(CODE_SPAN_RE, ' ');
+      if (SKIP_RELEASE_OWN_LINE_RE.test(bare)) return true;
+      if (lines.length === 1 && SKIP_RELEASE_ANYWHERE_RE.test(bare)) return true;
+    }
+  }
+  return false;
 }
 
-function bumpForCommit(message: string, currentMajor: number): ReleaseBump {
+// Every line-oriented rule below — the subject split, the paragraph split, the
+// footer match, the marker match, the fence tracker — is written against `\n`.
+// A commit authored on Windows arrives with `\r\n` and, before this, every one
+// of them silently failed: a `\r` rode along at the end of each line, so
+// `[skip release]\r` was not a line of its own (a Windows author's opt-out was
+// ignored and a signed, notarised, two-architecture build was cut anyway) and
+// a `BREAKING CHANGE:\r` paragraph in mid-body prose became the footer.
+//
+// Normalizing ONCE, here, is deliberate. Sprinkling `\r?` through the
+// individual regexes fixes whichever ones you remember and leaves the rest —
+// and completeness is not checkable by reading them. After this line the rest
+// of the module can assume LF, and that assumption is provable rather than
+// hoped for. Lone `\r` (classic Mac line endings, and what a stray carriage
+// return in a pasted body looks like) is normalized too.
+function normalizeEol(message: string): string {
+  return message.replace(/\r\n?/g, '\n');
+}
+
+function bumpForCommit(raw: string, currentMajor: number): ReleaseBump {
+  const message = normalizeEol(raw);
   const [rawSubject = ''] = message.split('\n');
   const subject = rawSubject.trim();
   // An opted-out commit is treated exactly like a `docs:` one: it contributes
@@ -190,11 +307,22 @@ function bumpForCommit(message: string, currentMajor: number): ReleaseBump {
   return 'patch';
 }
 
-// A `MAJOR.MINOR.PATCH` version, with an optional pre-release and/or build
-// suffix. The suffix has to be legal because the manual workflow_dispatch path
-// cuts pre-releases (`0.2.0-beta.1`) and those flow straight into this CLI's
-// argument.
-const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+// SemVer 2.0.0, the published grammar (semver.org's own recommended regex,
+// minus its named capture groups). Not a loose approximation: the previous
+// `\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?...` accepted `01.2.3`, `1.2.3-alpha..1`,
+// `1.2.3+build..5`, `1.2.3-01` and `1.2.3-.`, none of which are versions, while
+// the comment claimed the suffix was "legal". The CLI is the trust boundary for
+// a `package.json` version nobody validated, so it enforces the real grammar
+// rather than a shape that merely looks like one:
+//   - core numbers are `0` or a non-zero-leading run of digits;
+//   - a pre-release is dot-separated identifiers, each non-empty, and a numeric
+//     one may not have a leading zero;
+//   - build metadata is dot-separated non-empty alphanumeric-or-hyphen runs.
+// `0.2.0-beta.1` and `1.0.0-rc.1+build.5` — what the manual workflow_dispatch
+// path actually cuts — stay accepted; they are the reason a suffix is allowed
+// at all.
+const VERSION_RE =
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
 // WHO VALIDATES: the CLI, not the pure function.
 //
@@ -241,18 +369,30 @@ export function resolveReleaseBump(currentVersion: string, commitMessages: strin
 //     `git log --format=%B%x00` emits exactly this framing.
 // Two artifacts of that framing are removed and nothing else is:
 //   - the trailing empty segment after the final NUL;
-//   - a leading newline on every segment but the first. `git log` separates
-//     entries with a newline of its own, so the byte stream is really
-//     `<message>\0\n<message>\0\n`, and the split leaves that separator at the
-//     head of the next segment. Left in, it makes every commit except the
-//     newest look like it has an empty subject line — which silently reduced
-//     an entire range to "whatever the newest commit was" (found by driving
-//     the workflow's extracted shell against a real two-commit range: a
-//     `feat` behind a `chore` resolved to the chore's answer, not `minor`).
-//     Git itself strips leading blank lines from a commit message, so no real
-//     message can begin with one and nothing legitimate is lost here.
+//   - EXACTLY ONE leading newline on every segment but the first. `git log`
+//     separates entries with a newline of its own, so the byte stream is
+//     really `<message>\0\n<message>\0\n`, and the split leaves that separator
+//     at the head of the next segment. Left in, it makes every commit except
+//     the newest look like it has an empty subject line — which silently
+//     reduced an entire range to "whatever the newest commit was" (found by
+//     driving the workflow's extracted shell against a real two-commit range:
+//     a `feat` behind a `chore` resolved to the chore's answer, not `minor`).
+//
+//     BOTH halves of that sentence are load-bearing and round 2 got both
+//     wrong. It stripped `^\n+` from EVERY segment, first included, and a
+//     commit message CAN begin with a blank line: `git commit
+//     --cleanup=verbatim` keeps one, and `%B` hands it back byte for byte
+//     (reproduced with a real repo, not assumed). Stripping greedily promoted
+//     that message's first body line to its subject, so a commit whose body
+//     read `docs: ...` under an empty subject resolved `none` instead of the
+//     documented `patch` — a shipped change reported as nothing to release.
+//     One newline belongs to the delimiter; every newline after it belongs to
+//     the message.
 export function parseCommitStream(raw: string): string[] {
-  const parts = raw.split('\0').map((part) => part.replace(/^\n+/, ''));
+  const parts = raw
+    .split('\0')
+    // Index 0 has no delimiter in front of it, so it is never touched.
+    .map((part, index) => (index === 0 ? part : part.replace(/^\n/, '')));
   if (parts[parts.length - 1]?.trim() === '') parts.pop();
   return parts.filter((part) => part.trim().length > 0);
 }

@@ -34,6 +34,12 @@
 # nothing, the range resolves to `none` and the run ends green with nothing
 # pushed.
 #
+# PRECEDENCE: breaking beats the non-contributing list. The types above are
+# non-contributing only in the absence of a breaking marker — `chore!: drop
+# node 18` or a `docs:` commit with a real `BREAKING CHANGE:` footer resolves
+# `major` (`minor` while the major is still 0), not `none`. `[skip release]` is
+# the one marker that beats everything, breaking included.
+#
 # Both of those are per-COMMIT, judged by the resolver over the whole range —
 # not per-run, judged on the head commit. That distinction is load-bearing: a
 # `[skip release]` merge landing on top of an already-merged, still-unreleased
@@ -203,10 +209,20 @@ jobs:
           # retrigger it in the first place. This guard is here so that stays
           # true if the push ever moves to a PAT or a deploy key — with a PAT,
           # without this, every release would immediately cut another one,
-          # forever. It is safe as a head-only check, unlike the per-commit
-          # rules: a run whose head is `chore(release):` has just released, so
-          # the range behind it is empty and resolves to `none` anyway. It
-          # cannot suppress anything that has not already shipped.
+          # forever.
+          #
+          # WHAT IT DOES NOT DO. It is a head-SUBJECT check, so it cannot tell
+          # this workflow's own bump commit from any other commit with that
+          # subject, and it does not verify that a release actually completed.
+          # In the normal case the range behind such a head is empty and
+          # resolves to `none` anyway, so the guard suppresses nothing that has
+          # not shipped. Two cases break that: a run whose bump commit pushed
+          # but whose tag push then FAILED, and a hand-written `chore(release):`
+          # commit. In both, this guard ends the run green while unreleased work
+          # sits in the range. Neither self-heals — the next push to main has a
+          # different head and releases normally, but the half-released state
+          # itself (version bumped, no tag) is recovered by hand: tag the bump
+          # commit, or run the manual workflow_dispatch path.
           case "$HEAD_SUBJECT" in
             'chore(release):'*)
               skip "the head commit is this workflow's own bump commit (\`$HEAD_SUBJECT\`)."
