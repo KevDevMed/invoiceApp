@@ -107,15 +107,37 @@ const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[skip release\][ \t]*[
 // sufficient — see footerBlock for the two things that have to happen first.
 const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
 
-// A line that opens or closes a fenced code block: a run of at least three
-// backticks or tildes, optionally preceded by a LIST-ITEM MARKER and by up to
-// three spaces of indent on either side of it. Group 1 is everything before the
-// run (its indent, list marker included), group 2 is the run, group 3 is the
-// rest of the line (the info string on an opener). The run LENGTH is captured,
-// not just its first three characters: round 2 looked at `(```|~~~)` only, so it
-// could not tell a four-backtick fence from a three-backtick one and it read a
-// long inline code span as a fence. CommonMark's rule is the simplest correct
-// one and it is what this implements — see scanBody.
+// A line that OPENS a fenced code block: a run of at least three backticks or
+// tildes in one of exactly two shapes, written as an ALTERNATION so the two
+// indent allowances can never combine. Group 1 is everything before the run
+// (its indent, list marker included), group 2 is the run, group 3 is the rest of
+// the line (the info string on an opener).
+//
+// THE TWO SHAPES, and these are the exact bounds:
+//   - with a LIST MARKER: 0-3 spaces of indent, then one marker (`-`, `*`, `+`,
+//     or an ordered `1.` / `1)`), then EXACTLY 1-4 spaces before the run. Five
+//     or more spaces after the marker is not a supported opener — the line is
+//     ordinary body content.
+//   - with NO marker: EXACTLY 0-3 spaces of indent before the run. Four or more
+//     is an indented code block per CommonMark, not a fence opener, and it must
+//     stay ordinary content.
+//
+// WHY THE ALTERNATION (round 6). Round 5 wrote one branch,
+// `( {0,3}(?:MARKER {1,4})? {0,3})`, and the two ` {0,3}` groups were ADJACENT
+// and BOTH OPTIONAL, so with the marker absent they silently composed into
+// ` {0,6}` — a 4-, 5- or 6-space-indented line became a false opener that
+// swallowed the genuine `BREAKING CHANGE:` footer below it (measured: `patch`
+// where `major` was correct), and on the marker branch the trailing group
+// widened the declared 1-4 spaces to 1-7, so `1.` + five spaces + ``` opened a
+// fence and hid a real `[skip release]` line (measured: `patch` where `none` was
+// correct). Do not merge the branches back together: two adjacent optional
+// indent groups are the trap.
+//
+// The run LENGTH is captured, not just its first three characters: round 2
+// looked at `(```|~~~)` only, so it could not tell a four-backtick fence from a
+// three-backtick one and it read a long inline code span as a fence.
+// CommonMark's rule is the simplest correct one and it is what this implements —
+// see scanBody.
 //
 // WHY THE LIST MARKER IS HERE (round 5). Without it, `- ```text` was not an
 // opener at all, and both directions of that were wrong: a `[skip release]`
@@ -124,12 +146,23 @@ const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
 // closing ``` was then read as a NEW opener, so a genuine `BREAKING CHANGE:`
 // footer after the bullet was swallowed as fenced content and the wrong version
 // was cut (measured: `patch` where `minor`/`major` was correct).
-const FENCE_RE = /^( {0,3}(?:(?:[-*+]|\d{1,9}[.)]) {1,4})? {0,3})((?:`{3,})|(?:~{3,}))(.*)$/;
+export const FENCE_RE =
+  /^(?:( {0,3}(?:[-*+]|\d{1,9}[.)]) {1,4})|( {0,3}))((?:`{3,})|(?:~{3,}))(.*)$/;
 
-// What a CLOSING fence's prefix may be: indent only. A closer carries no list
+// A line that may CLOSE an open fence. Indent only: a closer carries no list
 // marker of its own — inside a list item it sits on the bullet's continuation
 // indent — so `- ``` ` can open a fence but never close one.
-const CLOSER_PREFIX_RE = /^ *$/;
+//
+// The indent here is an UNBOUNDED run of spaces on purpose. An opener's recorded
+// indent can legitimately exceed six (`123456789. ```text` indents its content
+// eleven columns), and a closer aligned to that content must still close. The
+// real bound is the CommonMark one — no more than three columns past the
+// opener's indent — and it is enforced by comparing against `open.indent` in
+// scanBody, NOT by this pattern. Round 5 reused the opener regex for closers, so
+// the closer's allowance was capped at whatever the opener pattern happened to
+// permit and an aligned closer for a long marker could never close the fence at
+// all (measured: `patch` where `major` was correct).
+const CLOSER_RE = /^( *)((?:`{3,})|(?:~{3,}))(.*)$/;
 
 // A blockquote line: `>` after at most three spaces of indent.
 const BLOCKQUOTE_RE = /^ {0,3}>/;
@@ -179,13 +212,24 @@ type ScannedLine = {
 //     closer that follows carries the bullet's continuation indent rather than
 //     starting at column 0. Indent is therefore tracked on the opener and the
 //     closer is judged RELATIVE to it (CommonMark allows a closer up to three
-//     spaces further in).
+//     spaces further in). The closer's own pattern (CLOSER_RE) therefore leaves
+//     its indent unbounded and the `prefix.length <= open.indent + 3` comparison
+//     below is what bounds it — an opener's indent can exceed anything the
+//     opener pattern itself allows once a long marker is in front of the run.
+//   - four spaces of indent is an INDENTED CODE BLOCK, not a fence opener
+//     (round 6). A `    ```text` line is ordinary content, so a genuine
+//     `BREAKING CHANGE:` footer below it stays visible.
 //
 // WHERE THE LIST SUPPORT STOPS, deliberately. This is NOT a CommonMark list
-// parser and must not grow into one. What is handled: at most one list marker
-// (`-`, `*`, `+`, or an ordered `1.` / `1)`) plus its whitespace directly before
-// an opening fence, and a closer indented anywhere from column 0 to the
-// opener's own indent + 3. What is NOT handled: nested/multi-level list markers
+// parser and must not grow into one. What is handled, in exact bounds:
+//   - an opener with NO marker: 0-3 spaces of indent, 4+ is not an opener;
+//   - an opener WITH at most one list marker (`-`, `*`, `+`, or an ordered `1.` /
+//     `1)`): 0-3 spaces, the marker, then 1-4 spaces directly before the run —
+//     5+ spaces after the marker is not an opener;
+//   - a closer: indent only, any width, accepted when its indent is no more than
+//     the OPENER's recorded indent + 3 (so column 0 through open.indent + 3),
+//     which for a `123456789. ```text` opener means up to column 14.
+// What is NOT handled: nested/multi-level list markers
 // (`- - ```), a fence separated from its bullet by intervening lines, tab-based
 // indentation measured as tab stops (a tab counts as one column here), and
 // lazy-continuation subtleties — including the strict-CommonMark reading in
@@ -201,25 +245,30 @@ function scanBody(message: string): ScannedLine[] {
   const scanned: ScannedLine[] = [];
   let open: { char: string; length: number; indent: number } | null = null;
   for (const line of lines) {
-    const match = FENCE_RE.exec(line);
-    const prefix = match?.[1] ?? '';
-    const run = match?.[2];
-    const rest = match?.[3] ?? '';
     if (open !== null) {
       // Inside a fence: same character, at least as long, no list marker of its
-      // own, indented no more than three columns past the opener, nothing but
-      // whitespace after the run.
+      // own (CLOSER_RE allows indent and nothing else), indented no more than
+      // three columns past the opener, nothing but whitespace after the run.
+      const closer = CLOSER_RE.exec(line);
+      const prefix = closer?.[1] ?? '';
+      const run = closer?.[2];
+      const rest = closer?.[3] ?? '';
       const closes =
         run !== undefined &&
         run[0] === open.char &&
         run.length >= open.length &&
-        CLOSER_PREFIX_RE.test(prefix) &&
         prefix.length <= open.indent + 3 &&
         rest.trim() === '';
       if (closes) open = null;
       scanned.push({ text: line, fenced: true, opensFence: false, quoted: false });
       continue;
     }
+    const match = FENCE_RE.exec(line);
+    // Exactly one of the two prefix branches participates in any match; the
+    // other is undefined.
+    const prefix = match?.[1] ?? match?.[2] ?? '';
+    const run = match?.[3];
+    const rest = match?.[4] ?? '';
     if (run !== undefined && !(run[0] === '`' && rest.includes('`'))) {
       open = { char: run[0] as string, length: run.length, indent: prefix.length };
       scanned.push({ text: line, fenced: true, opensFence: true, quoted: false });

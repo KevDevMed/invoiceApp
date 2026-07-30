@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { isValidVersion, parseCommitStream, resolveReleaseBump } from '../resolve-release-bump';
+import {
+  FENCE_RE,
+  isValidVersion,
+  parseCommitStream,
+  resolveReleaseBump,
+} from '../resolve-release-bump';
 
 // Fixtures are shaped like this repo's real history rather than minimal
 // one-liners: the subjects are the ones `git log` actually shows (including a
@@ -308,6 +313,94 @@ BREAKING CHANGE: oldCall was removed.`;
   BREAKING CHANGE: example only
   \`\`\``;
       expect(resolveReleaseBump('1.2.3', [onlyFenced])).toBe('patch');
+    });
+
+    it('does not open a fence on four or more spaces of indent', () => {
+      // ROUND 6, the regression. Round 5's opener had two ADJACENT OPTIONAL
+      // ` {0,3}` groups around the list marker, so with no marker present they
+      // composed into ` {0,6}` and a 4-, 5- or 6-space-indented ``` became a
+      // false opener. Per CommonMark four spaces is an indented code block, not
+      // a fence, and people do indent code in commit bodies.
+      const table = Object.fromEntries(
+        Array.from({ length: 8 }, (_, n) => [n, FENCE_RE.test(`${' '.repeat(n)}\`\`\`text`)]),
+      );
+      expect(table).toEqual({
+        0: true,
+        1: true,
+        2: true,
+        3: true,
+        4: false,
+        5: false,
+        6: false,
+        7: false,
+      });
+      // The decision that indent drives: the four-space line is content, so the
+      // genuine footer below it is still the footer (measured `patch` before).
+      const indented = `fix: API
+
+    \`\`\`text
+BREAKING CHANGE: removed`;
+      expect(resolveReleaseBump('1.2.3', [indented])).toBe('major');
+    });
+
+    it('accepts exactly one to four spaces between a list marker and the run', () => {
+      // Same composition bug, marker branch: the trailing ` {0,3}` widened the
+      // declared 1-4 to 1-7, so `1.` + five spaces + ``` opened a fence and hid
+      // a real `[skip release]` line below it (measured `patch`, want `none`).
+      for (const marker of ['-', '*', '+', '1.', '1)']) {
+        const spacings = Object.fromEntries(
+          Array.from({ length: 9 }, (_, n) => [n, FENCE_RE.test(`${marker}${' '.repeat(n)}\`\`\`text`)]),
+        );
+        expect(spacings).toEqual({
+          0: false,
+          1: true,
+          2: true,
+          3: true,
+          4: true,
+          5: false,
+          6: false,
+          7: false,
+          8: false,
+        });
+      }
+      // Five spaces: not an opener, so the marker line below is a real body line
+      // and must opt the commit out.
+      const overWide = `fix: parser
+
+1.     \`\`\`text
+[skip release]`;
+      expect(resolveReleaseBump('1.2.3', [overWide])).toBe('none');
+      // One through four spaces still open, so a marker inside the fence stays
+      // fenced content and cannot opt out.
+      for (const spaces of [1, 2, 3, 4]) {
+        const inside = `fix: parser
+
+1.${' '.repeat(spaces)}\`\`\`text
+[skip release]
+   \`\`\``;
+        expect(resolveReleaseBump('1.2.3', [inside])).toBe('patch');
+      }
+    });
+
+    it('closes a fence whose opener indent exceeds what an opener prefix can be', () => {
+      // A closer carries no marker of its own, so reusing the opener regex for
+      // it capped its indent at what the opener pattern allowed — and a long
+      // ordered marker pushes the opener's indent past that, so the aligned
+      // closer never closed and the footer was swallowed (measured `patch`).
+      const longMarker = `fix: API
+
+123456789. \`\`\`text
+           example
+           \`\`\`
+
+BREAKING CHANGE: removed`;
+      expect(resolveReleaseBump('1.2.3', [longMarker])).toBe('major');
+      // The bound is still open.indent + 3 — three columns past the opener's
+      // eleven closes, fifteen does not, so the fence swallows the footer.
+      const withinBound = longMarker.replace('           ```', '              ```');
+      expect(resolveReleaseBump('1.2.3', [withinBound])).toBe('major');
+      const pastBound = longMarker.replace('           ```', '               ```');
+      expect(resolveReleaseBump('1.2.3', [pastBound])).toBe('patch');
     });
 
     it('keeps an unterminated fence swallowing everything after it', () => {
