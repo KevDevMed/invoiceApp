@@ -17,11 +17,11 @@ import type { BeamPreset } from './beam/presets';
  * The one route the dock stays off.
  *
  * Settings is where the user goes to change how the app behaves, including —
- * eventually — the assistant itself. A floating chat button hovering over its
- * own configuration is both visually noisy and circular, so the dock yields the
- * corner there. Everything else in the app gets it, including `/assistant`: the
- * page and the dock share one provider, so the launcher on that route is a
- * harmless no-op rather than a second, disagreeing chat.
+ * eventually — the assistant itself. A shortcut into the assistant sitting
+ * above its own configuration is circular, so the dock yields its slot in the
+ * breadcrumb band there. Everything else in the app gets it, including
+ * `/assistant`: the page and the dock share one provider, so the launcher on
+ * that route is a harmless no-op rather than a second, disagreeing chat.
  */
 const HIDDEN_SECTION = '/settings';
 

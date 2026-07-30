@@ -1,24 +1,43 @@
 /**
- * Invoice list: inline filter tokens over a dense, paginated table.
+ * Invoices, as a triage cockpit.
  *
- * The filter bar is a `PowerSearch`; everything it produces is interpreted by
- * the pure helpers in ./filters — the part the backend understands goes into
- * the `invoices:list` request, the rest is applied over the fetched set here.
- * That fetched set is the *whole* matching set: `load` pages `invoices:list`
- * until it holds `total` rows, so the client-side filters and the footer count
- * both speak for every invoice, not for the first window of them.
- * Paging is client-side over that filtered set via the shared helpers.
+ * Chasing is the job, so the list never leaves the screen: a grouped list on
+ * the left, the selected invoice rendered in full on the right, and the chase
+ * actions pinned to the bottom of that pane. Select a row, read the invoice,
+ * act, press `J` for the next one — no navigation, no losing your place.
+ *
+ * What changed from the table this replaced, and why:
+ *   - Rows are two lines and say *when* (`INV-0051 · 34 days late`), because a
+ *     status pill never did. Grouping, ordering and every one of those phrases
+ *     is decided in ./listGrouping, which the node-only vitest project covers.
+ *   - The row is the link; there is no `Open` button, and selection is a rail
+ *     in the foreground colour rather than a colour-coded highlight.
+ *   - Selection is *state*, not navigation. `/invoices/:id` appends a tab
+ *     (ui/invoiceTabsState.ts `syncTabs`), so routing on every `J` would open
+ *     sixty pills in a minute. The pane's overflow menu opens the route
+ *     deliberately when a tab is what you want.
+ *
+ * The visible filter chrome is a compact search box and a segmented control.
+ * The `PowerSearch` filter vocabulary is not deleted: it still owns what a
+ * filter *is* (./filters), still builds the `invoices:list` request, and is one
+ * click away behind the Filters toggle — the segments and the search box are
+ * the two filters that earn permanent chrome, not a replacement for the rest.
+ *
+ * `load` still pages `invoices:list` until it holds the whole matching set:
+ * group sums and the segment counts speak for every matching invoice, not for
+ * the first window of them.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 
-import { Avatar } from '@astryxdesign/core/Avatar';
-import { Badge } from '@astryxdesign/core/Badge';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
+import { Heading } from '@astryxdesign/core/Heading';
 import { Icon } from '@astryxdesign/core/Icon';
+import { Item } from '@astryxdesign/core/Item';
+import { Kbd } from '@astryxdesign/core/Kbd';
 import { PowerSearch } from '@astryxdesign/core/PowerSearch';
 import type {
   PowerSearchComponents,
@@ -26,45 +45,57 @@ import type {
   PowerSearchFilter,
   PowerSearchTokenProps,
 } from '@astryxdesign/core/PowerSearch';
-import { Token } from '@astryxdesign/core/Token';
-import { Selector } from '@astryxdesign/core/Selector';
+import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
-import { Table, pixel, proportional, useTableSelection, useTableSelectionState } from '@astryxdesign/core/Table';
-import type { TableColumn } from '@astryxdesign/core/Table';
+import { StatusDot } from '@astryxdesign/core/StatusDot';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
+import { Token } from '@astryxdesign/core/Token';
 
-import type { Client, Invoice } from '../../../shared/types';
-import { ListFooter } from '../../ui/ListFooter';
-import { Page, PageHeader, PageToolbar } from '../../ui/Page';
-import { pageSlice } from '../../ui/pagination';
-import { isEffectivelyOverdue, money } from './format';
+import { SHELL_GUTTER_STEP } from '../../chrome';
+import type { Client, Invoice, InvoiceWithItems } from '../../../shared/types';
+import { todayIso } from './format';
 import {
-  DEFAULT_SORT,
   FIELD_AMOUNT,
   FIELD_CLIENT,
   FIELD_ISSUED,
   FIELD_NUMBER,
   FIELD_STATUS,
-  SORT_OPTIONS,
+  OPERATOR_IS,
   applyClientFilters,
   buildInvoiceSearchConfig,
-  sortInvoices,
   toListRequest,
 } from './filters';
-import type { InvoiceSortKey } from './filters';
+import { fetchClientInvoices } from './listData';
+import {
+  LIST_SEGMENTS,
+  adjacentRowId,
+  buildInvoiceGroups,
+  countSegments,
+  extraCurrencyLabel,
+  flattenGroups,
+  groupHeaderParts,
+  listColumnWidthCss,
+  outstandingTotals,
+  overdueTotals,
+  rowPosition,
+  summariseTotals,
+} from './listGrouping';
+import type { ListRow, ListSegment, RowState } from './listGrouping';
+import { InvoicePane, toneColours } from './listPaneView';
 
 /**
  * Rows per `invoices:list` request. The contract caps `limit` at 500
  * (src/shared/ipc-contract.ts, `Pagination`), so this is one round trip per 500
  * matching invoices — the whole matching set is pulled, never a prefix of it.
  * The database is local SQLite on the user's own machine, so this is cheap, and
- * it is the only way the footer count and the renderer-side filters can be
- * true: a filter that only sees the first page silently loses every match past
- * it, while the footer still prints an exact "of N".
+ * it is the only way the group sums and the segment counts can be true.
  */
 const PAGE_LIMIT = 500;
+
+/** Width of the selection rail down the left edge of a row. */
+const RAIL_WIDTH = 'var(--spacing-0-5)';
 
 // The semantic icon set ships no person / money / hash glyph, and the Icon docs
 // sanction passing an SVG component directly. These follow the same conventions
@@ -107,14 +138,11 @@ const FIELD_ICONS: Record<string, React.JSX.Element> = {
 /**
  * Token pill for our filters: `[field icon] Field · operator · value · ×`.
  *
- * PowerSearch's own token (node_modules/@astryxdesign/core/src/PowerSearch/
- * PowerSearch.tsx:798-844) renders one flat `Field: operator` string and only
- * ever passes an `icon` for single-entity filters — a configured `field.icon`
- * reaches the typeahead list (PowerSearch.tsx:869-885) and nothing else. The
- * sanctioned way past that is the per-type `components.Token` override
- * (PowerSearch.tsx:778-796; PowerSearchToken.tsx:30-33 documents it), which is
- * what this is: the shipped `Token` with the icon slot filled and the three
- * parts kept as separate runs of text.
+ * PowerSearch's own token renders one flat `Field: operator` string and only
+ * ever passes an `icon` for single-entity filters. The sanctioned way past that
+ * is the per-type `components.Token` override, which is what this is: the
+ * shipped `Token` with the icon slot filled and the three parts kept as
+ * separate runs of text.
  *
  * `label` stays the `Field: operator` string the default builds, so the remove
  * button keeps its "Remove Status: is" accessible name; it is hidden visually
@@ -204,31 +232,41 @@ const SEARCH_COMPONENTS: PowerSearchComponents = {
   date_range: { Token: InvoiceFilterToken },
 };
 
-/** Only errors and overdue invoices earn a loud badge; the rest stay quiet. */
-function statusBadge(invoice: Invoice): React.JSX.Element {
-  if (isEffectivelyOverdue(invoice)) return <Badge variant="red" label="overdue" />;
-  switch (invoice.status) {
-    case 'paid':
-      return <Badge variant="green" label="paid" />;
-    case 'sent':
-      return <Badge variant="blue" label="sent" />;
-    case 'overdue':
-      return <Badge variant="red" label="overdue" />;
-    case 'void':
-      return <Badge variant="orange" label="void" />;
-    default:
-      return <Badge variant="neutral" label="draft" />;
+/**
+ * The state dot. Four of the six states map onto a semantic `StatusDot`; a
+ * draft is the exception — it is the *absence* of a state, and the design says
+ * so with a hollow ring, which the five semantic variants cannot express.
+ */
+function StateDot({ state }: { readonly state: RowState }): React.JSX.Element {
+  if (state === 'draft') {
+    return (
+      <HStack
+        width="var(--spacing-1-5)"
+        height="var(--spacing-1-5)"
+        aria-label="Draft"
+        role="img"
+        style={{
+          flex: 'none',
+          borderRadius: 'var(--radius-full)',
+          border: '1px solid var(--color-border-emphasized)',
+        }}
+      >
+        {null}
+      </HStack>
+    );
   }
-}
-
-interface InvoiceRow extends Record<string, unknown> {
-  id: string;
-  number: string;
-  clientName: string;
-  issueDate: string;
-  dueDate: string;
-  total: string;
-  invoice: Invoice;
+  switch (state) {
+    case 'overdue':
+      return <StatusDot variant="error" label="Overdue" />;
+    case 'due-soon':
+      return <StatusDot variant="warning" label="Due this week" />;
+    case 'paid':
+      return <StatusDot variant="success" label="Paid" />;
+    case 'void':
+      return <StatusDot variant="neutral" label="Void" />;
+    case 'later':
+      return <StatusDot variant="accent" label="Open" />;
+  }
 }
 
 export function InvoiceList(): React.JSX.Element {
@@ -236,19 +274,29 @@ export function InvoiceList(): React.JSX.Element {
 
   const [search, setSearch] = useState('');
   const [filters, setFilters] = useState<readonly PowerSearchFilter[]>([]);
-  const [sort, setSort] = useState<InvoiceSortKey>(DEFAULT_SORT);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
-  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [segment, setSegment] = useState<ListSegment>('all');
+  const [isFilterBarOpen, setIsFilterBarOpen] = useState(false);
+  const [isBreakdownOpen, setIsBreakdownOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const [invoices, setInvoices] = useState<Invoice[] | null>(null);
   const [clients, setClients] = useState<Client[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  const [pane, setPane] = useState<InvoiceWithItems | null>(null);
+  const [paneClientInvoices, setPaneClientInvoices] = useState<readonly Invoice[] | null>(null);
+  const [paneError, setPaneError] = useState<string | null>(null);
+
+  const searchRef = useRef<HTMLInputElement>(null);
+  const rowRefs = useRef(new Map<string, HTMLElement>());
+
   // Every load takes a ticket; only the newest one is allowed to write state.
   // Paging is several awaits long, so a load started by an earlier search term
   // can finish after a later one and would otherwise overwrite it.
   const loadTicket = useRef(0);
+  const paneTicket = useRef(0);
+
+  const today = todayIso();
 
   const load = useCallback(async (term: string, active: readonly PowerSearchFilter[]) => {
     const ticket = ++loadTicket.current;
@@ -267,7 +315,7 @@ export function InvoiceList(): React.JSX.Element {
 
       // `total` is the size of the set the backend filter matched. Keep asking
       // for the next window until we hold all of it; an empty page ends the
-      // loop too, so a shrinking table cannot spin here.
+      // loop too, so a shrinking list cannot spin here.
       const collected = [...firstPage.items];
       while (collected.length < firstPage.total) {
         const next = await window.api.invoke('invoices:list', request(collected.length));
@@ -292,31 +340,6 @@ export function InvoiceList(): React.JSX.Element {
     return () => window.clearTimeout(handle);
   }, [search, filters, load]);
 
-  // Any change to what is being looked at sends the reader back to page one.
-  // It also drops the row selection: filters, search and sort all change which
-  // rows exist, so a selection made against the old set would survive unseen
-  // and reappear later. Paging only moves a window over the same set, so it
-  // keeps the selection.
-  const changeSearch = useCallback((term: string) => {
-    setSearch(term);
-    setPage(1);
-    setSelectedKeys(new Set());
-  }, []);
-  const changeFilters = useCallback((next: readonly PowerSearchFilter[]) => {
-    setFilters([...next]);
-    setPage(1);
-    setSelectedKeys(new Set());
-  }, []);
-  const changeSort = useCallback((next: InvoiceSortKey) => {
-    setSort(next);
-    setPage(1);
-    setSelectedKeys(new Set());
-  }, []);
-  const changePageSize = useCallback((next: number) => {
-    setPageSize(next);
-    setPage(1);
-  }, []);
-
   const clientNames = useMemo(
     () => new Map(clients.map((client) => [client.id, client.name])),
     [clients],
@@ -330,85 +353,215 @@ export function InvoiceList(): React.JSX.Element {
     };
   }, [clients]);
 
-  const visible = useMemo(
-    () => sortInvoices(applyClientFilters(invoices ?? [], filters), sort),
-    [invoices, filters, sort],
+  /** The whole matching set, before the segment narrows it. */
+  const matching = useMemo(
+    () => applyClientFilters(invoices ?? [], filters),
+    [invoices, filters],
   );
 
-  const rows: InvoiceRow[] = useMemo(
-    () =>
-      pageSlice(visible, page, pageSize).map((invoice) => ({
-        id: invoice.id,
-        number: invoice.number,
-        clientName: clientNames.get(invoice.clientId) ?? invoice.clientId,
-        issueDate: invoice.issueDate,
-        dueDate: invoice.dueDate,
-        total: money(invoice.totalCents, invoice.currency),
-        invoice,
-      })),
-    [visible, page, pageSize, clientNames],
+  const counts = useMemo(() => countSegments(matching, today), [matching, today]);
+
+  const groups = useMemo(
+    () => buildInvoiceGroups({ invoices: matching, clientNames, today, segment }),
+    [matching, clientNames, today, segment],
   );
 
-  const { selectionConfig } = useTableSelectionState<InvoiceRow>({
-    data: rows,
-    idKey: 'id',
-    selectedKeys,
-    setSelectedKeys,
-  });
-  const selectionPlugin = useTableSelection<InvoiceRow>(selectionConfig);
+  const rows = useMemo(() => flattenGroups(groups), [groups]);
 
-  const columns: TableColumn<InvoiceRow>[] = useMemo(
-    () => [
-      {
-        key: 'clientName',
-        header: 'Client',
-        width: proportional(2),
-        renderCell: (row: InvoiceRow) => (
-          <HStack gap={2} align="center">
-            <Avatar size="sm" name={row.clientName} />
-            <Text>{row.clientName}</Text>
-          </HStack>
-        ),
-      },
-      { key: 'number', header: 'Invoice #', width: pixel(140) },
-      { key: 'issueDate', header: 'Issued', width: pixel(120) },
-      { key: 'dueDate', header: 'Due', width: pixel(120) },
-      {
-        key: 'status',
-        header: 'Status',
-        width: pixel(120),
-        renderCell: (row: InvoiceRow) => statusBadge(row.invoice),
-      },
-      { key: 'total', header: 'Total', width: pixel(140), align: 'end' },
-      {
-        key: 'actions',
-        header: '',
-        width: pixel(90),
-        align: 'end',
-        renderCell: (row: InvoiceRow) => (
-          <Button
-            label="Open"
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              void navigate(row.id);
-            }}
-          />
-        ),
-      },
-    ],
-    [navigate],
+  /**
+   * The row actually on screen. A selection made against an older set — before
+   * a search term, a segment or a status change moved the rows — would
+   * otherwise survive unseen and reappear later, so it is *derived* rather than
+   * corrected after the fact: keep the chosen row while it is still in the
+   * list, fall to the top of the list when it is not.
+   */
+  const selected = useMemo(() => {
+    if (selectedId !== null && rows.some((row) => row.id === selectedId)) return selectedId;
+    return rows[0]?.id ?? null;
+  }, [rows, selectedId]);
+
+  // The pane needs the line items and the client, which the list response does
+  // not carry, plus the client's other invoices for the balance fact. Debounced
+  // because holding `J` would otherwise fire one round trip per keystroke, and
+  // ticketed because those round trips can land out of order.
+  useEffect(() => {
+    const ticket = ++paneTicket.current;
+    const isStale = (): boolean => ticket !== paneTicket.current;
+    const handle = window.setTimeout(() => {
+      if (selected === null) {
+        setPane(null);
+        setPaneClientInvoices(null);
+        setPaneError(null);
+        return;
+      }
+      void (async () => {
+        setPaneError(null);
+        try {
+          const full = await window.api.invoke('invoices:get', { id: selected });
+          if (isStale()) return;
+          if (full === null) {
+            setPane(null);
+            setPaneClientInvoices(null);
+            setPaneError('This invoice no longer exists.');
+            return;
+          }
+          setPane(full);
+          setPaneClientInvoices(null);
+          const siblings = await fetchClientInvoices(full.clientId);
+          if (isStale()) return;
+          setPaneClientInvoices(siblings);
+        } catch (cause) {
+          if (isStale()) return;
+          setPaneError(cause instanceof Error ? cause.message : String(cause));
+        }
+      })();
+    }, 120);
+    return () => {
+      window.clearTimeout(handle);
+    };
+  }, [selected]);
+
+  const move = useCallback(
+    (delta: number) => {
+      const next = adjacentRowId(rows, selected, delta);
+      if (next === null) return;
+      setSelectedId(next);
+      rowRefs.current.get(next)?.scrollIntoView({ block: 'nearest' });
+    },
+    [rows, selected],
   );
 
-  const hasActiveFilters = filters.length > 0 || search.trim() !== '';
-  const selectedCount = rows.filter((row) => selectedKeys.has(row.id)).length;
+  // `J`/`K` move the selection, `/` focuses the search. Scoped to this page
+  // because the listener lives and dies with it, and inert whenever a text
+  // field or a modifier has the keystroke.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target;
+      if (target instanceof HTMLElement) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
+          return;
+        }
+      }
+      if (event.key === 'j' || event.key === 'J') {
+        event.preventDefault();
+        move(1);
+      } else if (event.key === 'k' || event.key === 'K') {
+        event.preventDefault();
+        move(-1);
+      } else if (event.key === '/') {
+        event.preventDefault();
+        searchRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [move]);
+
+  // Any change to what is being looked at sends the reader to the top of the
+  // new list; the selection effect above does that as soon as `rows` changes.
+  const changeSearch = useCallback((term: string) => {
+    setSearch(term);
+  }, []);
+  const changeFilters = useCallback((next: readonly PowerSearchFilter[]) => {
+    setFilters([...next]);
+  }, []);
+
+  const showClientInvoices = useCallback((clientId: string) => {
+    setFilters((current) => [
+      ...current.filter((filter) => filter.field !== FIELD_CLIENT),
+      { field: FIELD_CLIENT, operator: OPERATOR_IS, value: { type: 'enum', value: clientId } },
+    ]);
+    setSegment('all');
+    setIsFilterBarOpen(true);
+  }, []);
+
+  /** A status change in the pane has to land in the list's own copy of the row. */
+  const applyInvoiceChange = useCallback((updated: Invoice) => {
+    setInvoices((current) =>
+      current === null
+        ? current
+        : current.map((invoice) => (invoice.id === updated.id ? { ...invoice, ...updated } : invoice)),
+    );
+    setPane((current) => (current === null || current.id !== updated.id ? current : { ...current, ...updated }));
+  }, []);
+
+  const outstanding = useMemo(() => summariseTotals(outstandingTotals(matching, today)), [matching, today]);
+  // Led by whatever currency the outstanding line led with: the two figures sit
+  // in one sentence and the second is a slice of the first, so they have to be
+  // the same money to be read against each other at all.
+  const overdue = useMemo(
+    () => summariseTotals(overdueTotals(matching, today), outstanding.leadCurrency),
+    [matching, today, outstanding.leadCurrency],
+  );
+  /**
+   * How many currencies the two headline figures are standing in front of.
+   * Per-currency is the right answer — there is no exchange rate in this app
+   * and never was — but printing all of them inline made the one line that
+   * exists to answer "what do I owe attention to" unreadable. The dominant
+   * currency leads; the rest are one click away.
+   */
+  const extraCurrencies = Math.max(outstanding.extraCurrencies, overdue.extraCurrencies);
+  const breakdownLabel = extraCurrencyLabel(extraCurrencies);
+  const position = rowPosition(rows, selected);
+  const hasActiveFilters = filters.length > 0 || search.trim() !== '' || segment !== 'all';
 
   return (
-    <Page>
-      <PageHeader
-        title="Invoices"
-        description="Every invoice in this workspace, filtered inline."
-        actions={
+    <VStack height="100%" gap={0}>
+      <VStack
+        gap={3}
+        paddingInline={SHELL_GUTTER_STEP}
+        paddingBlock={4}
+        style={{ borderBlockEnd: '1px solid var(--color-border)' }}
+      >
+        <HStack justify="between" align="center" gap={4} wrap="wrap">
+          <HStack gap={3} align="center" wrap="wrap">
+            <Heading level={1}>Invoices</Heading>
+            {invoices === null ? null : (
+              <VStack gap={1}>
+                <HStack gap={1} align="center" wrap="wrap">
+                  <Text type="supporting" hasTabularNumbers>
+                    {outstanding.lead === ''
+                      ? 'Nothing outstanding'
+                      : `${outstanding.lead} outstanding`}
+                  </Text>
+                  {overdue.lead === '' ? null : (
+                    <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
+                      {`· ${overdue.lead} overdue`}
+                    </Text>
+                  )}
+                  {breakdownLabel === null ? null : (
+                    <Button
+                      label={isBreakdownOpen ? 'Hide currencies' : breakdownLabel}
+                      variant="ghost"
+                      size="sm"
+                      aria-expanded={isBreakdownOpen}
+                      onClick={() => {
+                        setIsBreakdownOpen((open) => !open);
+                      }}
+                    />
+                  )}
+                </HStack>
+                {isBreakdownOpen ? (
+                  <VStack gap={0.5}>
+                    {outstanding.full === '' ? null : (
+                      <Text type="supporting" hasTabularNumbers>
+                        {`Outstanding ${outstanding.full}`}
+                      </Text>
+                    )}
+                    {overdue.full === '' ? null : (
+                      <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
+                        {`Overdue ${overdue.full}`}
+                      </Text>
+                    )}
+                  </VStack>
+                ) : null}
+              </VStack>
+            )}
+          </HStack>
           <Button
             label="New invoice"
             variant="primary"
@@ -416,121 +569,311 @@ export function InvoiceList(): React.JSX.Element {
               void navigate('new');
             }}
           />
-        }
-      />
+        </HStack>
 
-      <PageToolbar
-        end={
-          <>
-            <TextInput
-              label="Search invoices"
-              isLabelHidden
-              placeholder="Search"
-              startIcon="search"
-              hasClear
-              value={search}
-              onChange={changeSearch}
-            />
-            <Selector
-              label="Sort order"
-              isLabelHidden
-              value={sort}
-              options={SORT_OPTIONS.map((option) => ({ ...option }))}
-              onChange={(value) => {
-                changeSort(value as InvoiceSortKey);
-              }}
-            />
-          </>
-        }
-      >
-        {/* PowerSearch sizes to its tokens; as a bare flex item the tokens run
-            into its own result count, so it gets a filling item to live in. */}
-        <StackItem size="fill">
-          <PowerSearch
-            label="Filter invoices"
-            config={config}
-            components={SEARCH_COMPONENTS}
-            filters={filters}
-            onChange={changeFilters}
-            placeholder="Add filter"
-            // The built-in clear-all reports itself as a single token removal
-            // (Tokenizer hands PowerSearch an empty array, PowerSearch throws it
-            // away and recomputes filters minus one index), so one click only
-            // ever drops one token. Own control, one click, every token.
-            hasClear={false}
-            endContent={
-              filters.length > 0 ? (
+        {/* PowerSearch keeps the filter vocabulary — status, client, issued
+            range, amount, invoice number — and still builds the backend
+            request. It is one click away rather than always on screen, because
+            the two filters used every day earned the permanent chrome. */}
+        {isFilterBarOpen || filters.length > 0 ? (
+          <HStack gap={2} align="start">
+            <StackItem size="fill">
+              <PowerSearch
+                label="Filter invoices"
+                config={config}
+                components={SEARCH_COMPONENTS}
+                filters={filters}
+                onChange={changeFilters}
+                placeholder="Add filter"
+                // The built-in clear-all reports itself as a single token
+                // removal, so one click only ever drops one token. Own control,
+                // one click, every token.
+                hasClear={false}
+                endContent={
+                  filters.length > 0 ? (
+                    <Button
+                      label="Clear all"
+                      variant="ghost"
+                      size="sm"
+                      onClick={(event) => {
+                        // The tokenizer wrapper refocuses its input on any
+                        // click inside it; keep the click to this button.
+                        event.stopPropagation();
+                        changeFilters([]);
+                      }}
+                    />
+                  ) : undefined
+                }
+                resultCount={invoices === null ? undefined : matching.length}
+              />
+            </StackItem>
+          </HStack>
+        ) : null}
+      </VStack>
+
+      {error === null ? null : <Banner status="error" title={error} isDismissable />}
+
+      <StackItem size="fill">
+        <HStack gap={0} height="100%" align="stretch">
+          {/* The list column is ideal-width, not fixed-width. `window.ts` sets a
+              960px minimum window and the side nav takes 224-240 of it, so two
+              rigid columns would give the content region a horizontal
+              scrollbar between 960 and ~1120 and hang the pane's K/J controls
+              off the right edge. The pane is served first down to its own
+              floor and the list gives up the difference —
+              `listColumnWidthAt` in ./listGrouping is the same rule as a
+              number, with the tests. */}
+          <VStack
+            gap={0}
+            style={{
+              flex: 'none',
+              inlineSize: listColumnWidthCss(),
+              borderInlineEnd: '1px solid var(--color-border)',
+            }}
+          >
+            <VStack
+              gap={2}
+              paddingInline={3}
+              paddingBlock={2}
+              style={{ borderBlockEnd: '1px solid var(--color-border)' }}
+            >
+              <HStack gap={2} align="center">
+                <StackItem size="fill">
+                  <TextInput
+                    ref={searchRef}
+                    label="Search invoices"
+                    isLabelHidden
+                    size="sm"
+                    placeholder="Client, number, amount"
+                    startIcon="search"
+                    hasClear
+                    value={search}
+                    onChange={changeSearch}
+                  />
+                </StackItem>
+                <Kbd keys="/" />
                 <Button
-                  label="Clear all"
+                  label={filters.length > 0 ? `Filters ${String(filters.length)}` : 'Filters'}
                   variant="ghost"
                   size="sm"
-                  onClick={(event) => {
-                    // The tokenizer wrapper refocuses its input on any click
-                    // inside it; keep the click to this button.
-                    event.stopPropagation();
-                    changeFilters([]);
+                  onClick={() => {
+                    setIsFilterBarOpen((open) => !open);
                   }}
                 />
-              ) : undefined
-            }
-            resultCount={invoices === null ? undefined : visible.length}
-          />
-        </StackItem>
-      </PageToolbar>
-
-      {error ? <Banner status="error" title={error} isDismissable /> : null}
-
-      {invoices === null ? (
-        <VStack gap={2} align="center" padding={6}>
-          <Spinner size="lg" label="Loading invoices" />
-        </VStack>
-      ) : visible.length === 0 ? (
-        <EmptyState
-          title={hasActiveFilters ? 'No invoices match these filters' : 'No invoices yet'}
-          description={
-            hasActiveFilters
-              ? 'Clear a filter token or the search term to widen the results.'
-              : 'Create your first invoice to get started.'
-          }
-          headingLevel={2}
-          actions={
-            hasActiveFilters ? null : (
-              <Button
-                label="New invoice"
-                variant="primary"
-                onClick={() => {
-                  void navigate('new');
+              </HStack>
+              <SegmentedControl
+                label="Invoice state"
+                size="sm"
+                layout="fill"
+                value={segment}
+                onChange={(value) => {
+                  setSegment(value as ListSegment);
                 }}
+              >
+                {LIST_SEGMENTS.map((item) => (
+                  <SegmentedControlItem
+                    key={item.key}
+                    value={item.key}
+                    label={`${item.label} ${String(counts[item.key])}`}
+                  />
+                ))}
+              </SegmentedControl>
+            </VStack>
+
+            <StackItem size="fill" isScrollable>
+              {invoices === null ? (
+                <VStack gap={2} align="center" padding={6}>
+                  <Spinner size="lg" label="Loading invoices" />
+                </VStack>
+              ) : rows.length === 0 ? (
+                <VStack padding={4}>
+                  <EmptyState
+                    title={hasActiveFilters ? 'Nothing here' : 'No invoices yet'}
+                    description={
+                      hasActiveFilters
+                        ? 'Widen the search, the segment, or the filter tokens.'
+                        : 'Create your first invoice to get started.'
+                    }
+                    headingLevel={2}
+                  />
+                </VStack>
+              ) : (
+                <VStack gap={0}>
+                  {groups.map((group) => {
+                    const header = groupHeaderParts(group);
+                    const isOverdueGroup = group.key === 'overdue';
+                    return (
+                    <VStack key={group.key} gap={0}>
+                      <HStack
+                        gap={1}
+                        align="center"
+                        paddingInline={3}
+                        paddingBlock={1}
+                        style={{
+                          position: 'sticky',
+                          insetBlockStart: 0,
+                          zIndex: 1,
+                          // Opaque in both cases — a sticky header the rows read
+                          // through is unreadable. The overdue one is the same
+                          // barely-warm mix the pane's banner uses, not the
+                          // theme's 20%-alpha red wash, which over a white
+                          // surface composites into a flat pink slab.
+                          background: isOverdueGroup
+                            ? toneColours('error').wash
+                            : 'var(--color-background-surface)',
+                          borderBlockEnd: '1px solid var(--color-border)',
+                        }}
+                      >
+                        <Text
+                          type="supporting"
+                          weight="semibold"
+                          maxLines={1}
+                          hasTabularNumbers
+                          style={{
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.06em',
+                            color: isOverdueGroup
+                              ? 'var(--color-text-red)'
+                              : 'var(--color-text-secondary)',
+                          }}
+                        >
+                          {header.label}
+                        </Text>
+                        {header.more === null ? null : (
+                          <Text
+                            type="supporting"
+                            maxLines={1}
+                            color="secondary"
+                            style={{ textTransform: 'uppercase', letterSpacing: '0.06em' }}
+                          >
+                            {header.more}
+                          </Text>
+                        )}
+                      </HStack>
+                      {group.rows.map((row) => (
+                        <InvoiceListRow
+                          key={row.id}
+                          row={row}
+                          isSelected={row.id === selected}
+                          onSelect={setSelectedId}
+                          registerRef={(id, element) => {
+                            if (element === null) rowRefs.current.delete(id);
+                            else rowRefs.current.set(id, element);
+                          }}
+                        />
+                      ))}
+                    </VStack>
+                    );
+                  })}
+                </VStack>
+              )}
+            </StackItem>
+          </VStack>
+
+          {/* `min-inline-size: 0` is what lets the pane actually shrink: a flex
+              item defaults to `auto`, so the line-item table's fixed columns
+              were setting a floor the whole content region had to obey. */}
+          <StackItem size="fill" style={{ minInlineSize: 0 }}>
+            {paneError !== null ? (
+              <VStack padding={5}>
+                <Banner status="error" title={paneError} />
+              </VStack>
+            ) : pane === null ? (
+              <VStack gap={2} align="center" justify="center" height="100%" padding={6}>
+                {rows.length === 0 ? (
+                  <Text type="supporting">Select an invoice to see it here.</Text>
+                ) : (
+                  <Spinner size="lg" label="Loading invoice" />
+                )}
+              </VStack>
+            ) : (
+              <InvoicePane
+                invoice={pane}
+                clientInvoices={paneClientInvoices}
+                today={today}
+                headingLevel={2}
+                position={position === null ? null : { index: position, total: rows.length }}
+                onPrevious={() => {
+                  move(-1);
+                }}
+                onNext={() => {
+                  move(1);
+                }}
+                onShowClientInvoices={() => {
+                  showClientInvoices(pane.clientId);
+                }}
+                onOpenInTab={() => {
+                  void navigate(pane.id);
+                }}
+                onInvoiceChanged={applyInvoiceChange}
               />
-            )
-          }
-        />
-      ) : (
-        <VStack gap={3}>
-          {selectedCount > 0 ? (
-            <Text type="supporting">
-              {selectedCount} selected on this page
-            </Text>
-          ) : null}
-          <Table<InvoiceRow>
-            data={rows}
-            columns={columns}
-            idKey="id"
-            density="spacious"
-            dividers="rows"
-            hasHover
-            textOverflow="truncate"
-            plugins={{ selection: selectionPlugin }}
-          />
-          <ListFooter
-            total={visible.length}
-            page={page}
-            pageSize={pageSize}
-            onPageChange={setPage}
-            onPageSizeChange={changePageSize}
-          />
-        </VStack>
-      )}
-    </Page>
+            )}
+          </StackItem>
+        </HStack>
+      </StackItem>
+    </VStack>
+  );
+}
+
+/**
+ * Two lines and an amount. The row *is* the link — there is no `Open` button —
+ * and selection is a rail in the foreground colour plus a wash, so it reads as
+ * "you are here" rather than as another status colour.
+ */
+function InvoiceListRow({
+  row,
+  isSelected,
+  onSelect,
+  registerRef,
+}: {
+  readonly row: ListRow;
+  readonly isSelected: boolean;
+  readonly onSelect: (id: string) => void;
+  readonly registerRef: (id: string, element: HTMLElement | null) => void;
+}): React.JSX.Element {
+  return (
+    <Item
+      ref={(element) => {
+        registerRef(row.id, element);
+      }}
+      density="compact"
+      align="center"
+      isSelected={isSelected}
+      aria-current={isSelected ? 'true' : undefined}
+      onClick={() => {
+        onSelect(row.id);
+      }}
+      style={{
+        borderInlineStart: `${RAIL_WIDTH} solid ${
+          isSelected ? 'var(--color-text-primary)' : 'transparent'
+        }`,
+        borderBlockEnd: '1px solid var(--color-border)',
+        background: isSelected ? 'var(--color-overlay-pressed)' : undefined,
+      }}
+      startContent={<StateDot state={row.state} />}
+      label={
+        <Text maxLines={1} color={row.isMuted ? 'secondary' : 'primary'}>
+          {row.clientName}
+        </Text>
+      }
+      description={
+        <Text
+          type="supporting"
+          maxLines={1}
+          style={row.state === 'overdue' ? { color: 'var(--color-error)' } : undefined}
+        >
+          {row.secondary}
+        </Text>
+      }
+      endContent={
+        <Text
+          hasTabularNumbers
+          weight={row.isMuted ? 'normal' : 'semibold'}
+          color={row.isMuted ? 'secondary' : 'primary'}
+        >
+          {row.amount}
+        </Text>
+      }
+    />
   );
 }

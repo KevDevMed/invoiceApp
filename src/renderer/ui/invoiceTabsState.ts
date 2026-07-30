@@ -2,9 +2,11 @@
  * Open-invoice tabs, as pure functions.
  *
  * The band at the top of the content column used to be reserved space and
- * nothing else (see `AppShell.tsx`'s header: there is no breadcrumb any more).
- * It now holds a strip of the invoices the user has open — one pill per open
- * document, the active one filled, a trailing `+` for a new draft.
+ * nothing else. It now holds a strip of the invoices the user has open — one
+ * pill per open document, the active one filled and outlined, a trailing `+`
+ * for a new draft. The band under it is the breadcrumb bar (`./breadcrumbTrail`),
+ * which exists *because* of this strip: a row of sibling documents above the
+ * page heading is exactly the thing that makes the trail worth stating.
  *
  * Everything the strip *decides* lives here, free of React and of the DOM, for
  * the same reason `chrome.ts` exists: the root vitest project is

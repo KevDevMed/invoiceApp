@@ -1,6 +1,18 @@
 /**
- * The floating assistant dock: a launcher pinned bottom-right on every route
+ * The assistant dock: a launcher in the shell's breadcrumb band on every route
  * except `/settings`, and the compact chat panel it opens.
+ *
+ * It was a bubble pinned to the bottom-right of the viewport until that corner
+ * turned out not to be free. The invoice pane anchors its action bar there and
+ * the launcher clipped `Export PDF` to `Export P…`; Reports runs a table under
+ * the same spot. That is not one page's bug — a bottom-right primary action is
+ * a pattern — and the shell cannot fix it by reserving a safe area either,
+ * because the reservation would be a dead band across the foot of every page,
+ * including a full-bleed cockpit that has no business ending short of the
+ * window. So the launcher moved into the one strip of the window that belongs
+ * to the shell and can never hold page content: the breadcrumb band, at its
+ * inline end, past the status line. AppShell passes it in as that bar's
+ * `action`; no page knows the dock exists, and none can collide with it.
  *
  * This is an *additional* surface, not a replacement for `/assistant`. Both
  * read the same `useAssistantContext()`, mounted once by `AppShell`, so the
@@ -257,11 +269,12 @@ export function AssistantDock(): React.JSX.Element {
 
   return (
     /*
-      The fixed positioning lives on this Stack rather than on the AppBeam.
-      `border-beam` injects `[data-beam="…"] { position: relative }` in a
-      <style> tag mounted with the component, i.e. after global.css in document
-      order and at the same specificity as a class — it would win, and the
-      launcher would sit in the flow. A separate positioned parent is immune.
+      A wrapper Stack rather than beaming the Button directly: `border-beam`
+      injects `[data-beam="…"] { position: relative }` in a <style> tag mounted
+      with the component, i.e. after global.css in document order and at the
+      same specificity as a class, so anything this app has to say about the
+      launcher's own box has to be said on a box the design system is not also
+      writing to. Today that is one line — see `.assistant-dock-launcher`.
     */
     <VStack className="assistant-dock-launcher" gap={0}>
       <AppBeam preset={launcherPreset}>
@@ -272,8 +285,21 @@ export function AssistantDock(): React.JSX.Element {
           tooltip={isOpen ? 'Close the assistant' : 'Open the assistant'}
           icon={<Icon icon={AssistantGlyph} size="sm" />}
           isIconOnly
-          size="lg"
-          variant="primary"
+          /*
+            28px and ghost, which is the shell's own utility-glyph scale — the
+            update and appearance buttons in the sidebar footer are the same
+            pair. A 44px filled disc was right for a bubble floating over a
+            page and would be the loudest thing in a 36px chrome band. Nothing
+            is lost: attention still arrives as the beam, which is the state
+            that actually needs to be seen.
+
+            The beam is sized to this home too — `launcher-idle` had to give up
+            `pulse-outside`, whose halo is 30px of *layout* in every direction
+            and hung 12px past the window. See `./beam/presets.ts`; move the
+            launcher back into open space and that is the decision to revisit.
+          */
+          size="sm"
+          variant="ghost"
           onClick={toggle}
           // The trigger half of the dialog relationship, which `usePopover`
           // used to assemble. No `aria-modal` anywhere: see the hook comment.
@@ -347,9 +373,12 @@ export function AssistantDock(): React.JSX.Element {
             </VStack>
           </Card>
         </AppBeam>,
-        // Above and end-aligned: the launcher is pinned to the bottom-right
-        // corner, so this is the only pair that opens into the window.
-        { placement: 'above', alignment: 'end' },
+        // Below and end-aligned: the launcher sits in the breadcrumb band at
+        // the top of the content column, so the window is underneath it. The
+        // end alignment keeps the panel's inline-end edge on the launcher's,
+        // which is the window's own edge — the only alignment that cannot push
+        // the panel off screen.
+        { placement: 'below', alignment: 'end' },
       )}
     </VStack>
   );

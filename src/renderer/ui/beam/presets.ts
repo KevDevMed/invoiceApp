@@ -8,13 +8,22 @@
  * React and of the `border-beam` runtime, so it can be unit-tested directly.
  * The only dependency on the library is `import type`, which is erased.
  *
- * The six presets between them cover every `BorderBeamSize` and every
- * `BorderBeamColorVariant` the library ships. That is a deliberate product
- * requirement, not an accident of taste, and `__tests__/presets.test.ts`
- * guards it from both sides: drop a variant and the runtime exhaustiveness
- * test fails, while a `border-beam` upgrade that *adds* a size or variant
- * fails `npm run typecheck` there, so a newly-shipped element cannot go
- * quietly uncovered.
+ * The six presets between them cover every `BorderBeamColorVariant` and every
+ * `BorderBeamSize` *except one*. That is a deliberate product requirement, not
+ * an accident of taste, and `__tests__/presets.test.ts` guards it from both
+ * sides: drop a variant and the runtime exhaustiveness test fails, while a
+ * `border-beam` upgrade that *adds* a size or variant fails `npm run typecheck`
+ * there, so a newly-shipped element cannot go quietly uncovered.
+ *
+ * The exception is `pulse-outside`, and it is excluded by geometry rather than
+ * by taste. It is the only size whose layers have negative insets — a bloom at
+ * `inset: -30px` — so it silently enlarges whatever wears it by 30px on every
+ * side. Nothing in this app has that much room: the launcher is in a 36px
+ * chrome band, the composer and the approval card are inside the dock panel's
+ * card and its message scroller, and the panel's own two states are the app's
+ * "is it thinking" signal, which is a travelling border rather than a breath.
+ * An unused size is the honest outcome; the test says so out loud, so a preset
+ * that reaches for it later has to argue with a failing assertion first.
  */
 
 import type { BorderBeamColorVariant, BorderBeamSize } from 'border-beam';
@@ -97,19 +106,40 @@ export function resolveScheme(mode: ThemeMode, prefersDark: boolean): BeamScheme
  *   full strength.
  */
 const PRESETS: Record<BeamPreset, Omit<BeamPropBag, 'theme'>> = {
-  // Closed launcher at rest. Bloom outward so the halo reads around a small
-  // circular button rather than inside it. Twice the default breath, barely
-  // there: this one is on screen permanently.
+  /*
+    Closed launcher at rest. Twice the default breath, barely there: this one is
+    on screen permanently.
+
+    `pulse-inner`, not `pulse-outside`, and that is geometry rather than taste.
+    The launcher used to be a 44px bubble floating in the window's bottom-right
+    corner, where an uncropped halo had 20px of clearance on two sides and
+    nothing to overflow. It now sits at the inline end of the 36px breadcrumb
+    band (see `ui/AssistantDock.tsx` for why), and `pulse-outside` is the one
+    size in the library with negative insets: its bloom layer is
+    `position: absolute; inset: -30px`, i.e. 30px of blurred halo in every
+    direction around a 28px button. Sixteen of those pixels are the shell
+    gutter; the other twelve hung past the content box and gave *every route* a
+    horizontal scrollbar (`.astryx-layout-content` scrollWidth 1196 against
+    clientWidth 1184 at 1440, and the same 12px at every width).
+
+    Clipping it was the alternative and it is not one: 30px of glow in a 36px
+    band has to be cut on three sides, and a hard rectangular edge through a
+    blur reads as a rendering fault. Every other size is `inset: 0` — contained
+    in the element's own box — so this is the version that cannot overflow
+    anything, in either theme, in either frame.
+  */
   'launcher-idle': {
-    size: 'pulse-outside',
+    size: 'pulse-inner',
     colorVariant: 'mono',
     strength: 0.24,
     duration: 4.6,
     staticColors: true,
   },
-  // Launcher with an unread reply or a pending approval. Contained breathe so
-  // the change is a fill, not a bigger halo — a size change in the corner of
-  // the screen reads as a layout bug. Ocean carries the colour shift instead.
+  // Launcher with an unread reply or a pending approval. The same contained
+  // breathe as at rest, so the change is a fill rather than a bigger halo — a
+  // size change reads as a layout bug, and in a 36px band a bigger halo is one.
+  // Ocean at more than twice the strength, at nearly half the period, carries
+  // the whole difference between "alive" and "answer me".
   'launcher-attention': {
     size: 'pulse-inner',
     colorVariant: 'ocean',

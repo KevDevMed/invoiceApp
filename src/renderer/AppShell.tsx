@@ -2,22 +2,37 @@
  * The persistent application frame: identity sidebar and the content outlet
  * every route renders into.
  *
- * Layout note — why there is no `topNav`. On macOS `src/main/window.ts` sets
- * `titleBarStyle: 'hiddenInset'`, so the OS paints the traffic lights over the
- * renderer's top-left corner. AppShell renders `topNav` above *both* columns,
- * starting at x=0, which puts the lights on top of the bar's first element.
- * Instead the sidebar owns the top-left corner (SideNavHeading carries the app
- * identity) and both columns open with a reserved band that keeps the lights
- * over empty, draggable surface. There is no breadcrumb bar: the nav says where
- * you are, and the page's own heading says it again. See `./chrome` for the
- * geometry and `styles/global.css` for the drag regions and the sidebar panel.
+ * Layout note — where the window controls live. On macOS `src/main/window.ts`
+ * sets `titleBarStyle: 'hiddenInset'`, so the OS paints the traffic lights over
+ * the renderer's top-left corner and the app has to keep that corner clear.
+ * Expanded, the sidebar owns it: its first band is 40px of lights and nothing
+ * else, so the drag region is real and no control is aligned to a cluster it
+ * has no relationship with. Collapsed, it cannot — three lights need ~64px and
+ * the rail is 56px — so the lights, the expand toggle and an `InvoiceApp —
+ * <page>` title move into a unified title bar spanning *both* columns and the
+ * rail starts underneath it. That bar is passed as AppShell's `banner`, which is
+ * the one full-width slot above both columns that does not also restyle and
+ * remount the content area the way `topNav` does.
+ *
+ * The content column opens with the open-invoice tab strip and, under it, a
+ * breadcrumb bar. The shell used to argue no breadcrumb was needed — the nav
+ * says where you are and the heading says it again. The strip is what changed
+ * that: it puts a row of sibling documents above the heading, and the collapsed
+ * rail drops the nav labels entirely, so the trail is the only thing left that
+ * states the path. Its inline end carries the live status line and the
+ * assistant launcher: the band is the shell's own, so it is the one strip of
+ * the content column where a shell-wide control cannot land on top of a page's.
+ * See `./ui/breadcrumbTrail` for what the trail says, `./chrome` for the
+ * geometry — including `SHELL_GUTTER`, the single inline inset the strip, the
+ * trail and `./ui/Page` all begin at — and `styles/global.css` for the drag
+ * regions and the panel.
  *
  * Downstream builders replace route *elements* (see routes.tsx). They do not
  * change this file — the shell is the same on every screen. Page-level layout
  * lives in `./ui/Page`.
  */
 
-import { useState } from 'react';
+import { Fragment, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router';
 
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
@@ -25,30 +40,43 @@ import { Icon, type IconName, type IconType } from '@astryxdesign/core/Icon';
 import { IconButton } from '@astryxdesign/core/IconButton';
 import { NavIcon } from '@astryxdesign/core/NavIcon';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
+import { Text } from '@astryxdesign/core/Text';
 import {
   SideNav,
   SideNavCollapseButton,
   SideNavHeading,
   SideNavItem,
   SideNavSection,
+  type SideNavImperativeCollapseHandle,
 } from '@astryxdesign/core/SideNav';
 
 import {
-  contentTitleBarHeight,
+  BRAND_BAND_HEIGHT,
   hasPlaceholderWindowControls,
   isSectionSelected,
+  NAV_GROUP_CAPTION_HEIGHT,
   NAV_GROUPS,
   readDesktopInfo,
+  reservesTrafficLightBand,
   SECTION_ROUTES,
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   sideNavControlRowHeight,
   sideNavPanelGeometry,
+  tabStripBandHeight,
+  TRAFFIC_LIGHT_RESERVE_WIDTH,
+  UNIFIED_TITLE_BAR_HEIGHT,
   wasSideNavCollapsed,
+  windowTitle,
+  type DesktopInfo,
   type NavGroup,
 } from './chrome';
+import { breadcrumbTrail } from './ui/breadcrumbTrail';
 import { isDockVisible } from './ui/dockVisibility';
 import { InvoiceTabs, useInvoiceTabs } from './ui/InvoiceTabs';
+import { DRAFT_TAB_ID, INVOICES_ROUTE, tabIdForPath } from './ui/invoiceTabsState';
+import { ShellBreadcrumbs } from './ui/ShellBreadcrumbs';
+import { invoiceCountLabel, invoiceStatusLine, useInvoiceCounts } from './ui/shellStatus';
 import { updateBadge } from './ui/updateBadge';
 import {
   nextThemeMode,
@@ -254,18 +282,72 @@ export const NAV_ITEMS: readonly NavItem[] = SECTION_ROUTES.map((route) => ({
   ...(NAV_ICONS[route.path] ?? FALLBACK_ICONS),
 }));
 
-function navItem(item: NavItem, pathname: string): React.JSX.Element {
+function navItem(
+  item: NavItem,
+  pathname: string,
+  endContent?: React.ReactNode,
+): React.JSX.Element {
   return (
     <SideNavItem
       key={item.path}
       label={item.label}
       icon={item.icon}
       selectedIcon={item.selectedIcon}
+      // 32px rows with 8px of inline padding — the design system's own `md`,
+      // which is exactly the macOS sidebar metric the design asks for. Stated
+      // rather than left to the default so the row height is a decision this
+      // file made and `data-size="md"` is on the element for the theme to see.
+      size="md"
       // HashRouter: a plain `#/path` href navigates in-place without
       // reloading the document, which is what we need under file://.
       href={`#${item.path}`}
       isSelected={isSectionSelected(pathname, item.path)}
+      endContent={endContent}
     />
+  );
+}
+
+/**
+ * Trailing content on a nav row. One row has any: Invoices carries the number
+ * of unpaid invoices.
+ *
+ * A quiet number rather than a Badge. A Badge is a filled pill and would be the
+ * loudest thing in the panel — louder than the selected row it sits on — for a
+ * figure that is context, not an alert. It is `supporting` type in secondary
+ * ink with tabular figures, so it does not reflow as the count changes.
+ *
+ * The design also puts a status dot on Models. There is no honest source for it
+ * here: model readiness lives behind the `llm:*` channels, which the browser
+ * preview does not serve and which the shell would otherwise have to poll on
+ * every boot for a six-pixel dot. Omitted rather than faked.
+ */
+function navEndContent(item: NavItem, openCount: string | null): React.ReactNode {
+  if (item.path !== INVOICES_ROUTE || openCount === null) return undefined;
+  return (
+    <Text type="supporting" hasTabularNumbers>
+      {openCount}
+    </Text>
+  );
+}
+
+/**
+ * The blank a group caption leaves behind on the collapsed rail.
+ *
+ * Collapsing narrows; it does not rearrange. SideNavSection takes its caption
+ * out of flow when collapsed, which slides every row below it upwards — so the
+ * rail renders a band of the caption's exact height in its place, empty above
+ * the first group and a centred 16px hairline above every later one. The toggle
+ * then reads as a slide rather than a reshuffle, and the rule still says "a new
+ * group starts here" without saying which.
+ *
+ * `aria-hidden`, because the grouping itself is not lost: SideNavSection keeps
+ * its `role="group"` and its caption as visually-hidden text in both states.
+ */
+function NavGroupCaptionRule({ hasRule }: { hasRule: boolean }): React.JSX.Element {
+  return (
+    <VStack height={NAV_GROUP_CAPTION_HEIGHT} justify="center" align="center" aria-hidden>
+      {hasRule ? <HStack className="app-nav-group-rule" /> : null}
+    </VStack>
   );
 }
 
@@ -292,6 +374,8 @@ function ThemeToggleButton(): React.JSX.Element {
       label={label}
       tooltip={label}
       variant="ghost"
+      // 28px, the same as the update glyph it sits beside in the footer.
+      size="sm"
       icon={<Icon icon={next === 'dark' ? MoonIcon : SunIcon} size="sm" />}
       onClick={() => {
         setMode(next);
@@ -326,48 +410,32 @@ function WindowControlPlaceholders(): React.JSX.Element {
 }
 
 /**
- * The band the window controls sit in, and the window's drag surface —
- * `hiddenInset` leaves no title bar to grab.
+ * A reserved band, and the window's drag surface — `hiddenInset` leaves no
+ * title bar to grab.
  *
- * With no children it is empty and `aria-hidden`: pure reserved space, and at
- * `titleBarInset`'s height it collapses to zero on win32/linux, where the OS draws
- * a real title bar — so the *content* column has no dead space there.
+ * Two callers, both of them a column's first row: the sidebar's traffic-light
+ * band, which holds the cluster and deliberately nothing else, and the content
+ * column's tab strip. Both collapse to zero height where the OS paints a real
+ * title bar and there is nothing in them (see `./chrome`), so a win32 build
+ * carries no dead space above its pages.
  *
- * The sidebar's copy is not that height: `sideNavControlRowHeight` falls back to a
- * real 36px control row on win32/linux, because the expanded ghost buttons live in
- * this band and a zero-height band would hide the only collapse toggle. Collapsed,
- * those buttons move to their own rows *below* the band, and on win32/linux the
- * band stays behind empty — a blank 36px row above the toggle. It is knowingly
- * left: macOS is the shipped target and there the row holds the traffic lights,
- * and reshaping the rail on the platforms this project does not distribute is a
- * design decision rather than a fix.
- *
- * The sidebar's copy passes children — the traffic lights at the start of the row, the controls at its end
- * — and then it must *not* be `aria-hidden`, or the controls inside it disappear
- * from the accessibility tree while staying clickable.
- *
- * `isDecorative` is the third case, and it exists because of the placeholders:
- * the collapsed rail's band has children on web (three dots) and none on macOS,
- * yet neither version holds anything interactive — the collapsed control glyphs
- * are in their own rows *below* the band. So the caller says so explicitly
- * rather than this inferring accessibility from `children === undefined`, which
- * would leave the web band exposed as an empty group for no reason.
+ * `isDecorative` exists because of the placeholders: the light band has
+ * children on web (three dots) and none on macOS, yet neither version holds
+ * anything interactive. So the caller says so explicitly rather than this
+ * inferring accessibility from `children === undefined`, which would leave the
+ * web band exposed as an empty group for no reason.
  *
  * Anything interactive in here has to opt out of the drag region or it stops
- * receiving clicks entirely; `<button>` is in the `:where(...)` list in
- * `styles/global.css`, which is what all three controls below render as.
+ * receiving clicks entirely; `<button>` and `<a>` are in the `:where(...)` list
+ * in `styles/global.css`.
  */
 function TitleBarInset({
   height,
   isDecorative = false,
-  justify = 'end',
   children,
 }: {
   height: string;
   isDecorative?: boolean;
-  /** Where the band's content sits. The sidebar ends its controls at the row's
-   *  inline end; the content column's tab strip starts at its inline start. */
-  justify?: 'start' | 'end';
   children?: React.ReactNode;
 }): React.JSX.Element {
   // size="static" so the band keeps its exact height: it is a flex child of a
@@ -386,7 +454,7 @@ function TitleBarInset({
         */
         width="100%"
         align="center"
-        justify={justify}
+        justify="start"
         gap={0.5}
         /*
           No inline padding of its own. SideNav's header wrapper already carries
@@ -416,27 +484,77 @@ function TitleBarInset({
  */
 const SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar';
 
+/**
+ * The collapsed frame's unified title bar: lights, expand toggle, app title.
+ *
+ * Its own component because it is the one part of the shell that belongs to the
+ * *window* rather than to either column. It spans both, which is the whole
+ * point — three traffic lights need about 64px and the collapsed rail is 56px,
+ * so on collapse they move up here and the rail starts underneath, free to be
+ * as narrow as the glyphs in it. That is the standard macOS move and it is why
+ * no geometry in `./chrome` has to reserve a light zone inside a rail any more.
+ *
+ * The leading slot is reserved space, not a container for the placeholders: on
+ * macOS there is nothing to contain, because the OS paints the cluster over the
+ * renderer. Reserving the same width in both builds is what puts the expand
+ * toggle in the same place in both — and past the 70px a real green light
+ * reaches.
+ *
+ * Its own drag class rather than `.app-drag-region`. Same behaviour, different
+ * name, because that class is how the screenshot harness finds the *content
+ * column's* band, and a full-width bar above it would answer that query first.
+ */
+function UnifiedTitleBar({
+  desktop,
+  title,
+  toggle,
+}: {
+  desktop: DesktopInfo;
+  title: string;
+  toggle: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <HStack
+      className="app-unified-title-bar"
+      height={UNIFIED_TITLE_BAR_HEIGHT}
+      width="100%"
+      align="center"
+      justify="start"
+      gap={2}
+      paddingInline={3}
+    >
+      {reservesTrafficLightBand(desktop) ? (
+        <HStack width={TRAFFIC_LIGHT_RESERVE_WIDTH} align="center">
+          {hasPlaceholderWindowControls(desktop) ? <WindowControlPlaceholders /> : null}
+        </HStack>
+      ) : null}
+      {toggle}
+      {/*
+        `size="fill"` and centred inside it, rather than `margin-inline: auto`
+        on the title itself: the bar's leading slot is a fixed width, so a
+        filling item centres the title in everything that is left of the window
+        — which is the same answer while the trailing end stays empty, and stays
+        stable if a control is ever added to it.
+      */}
+      <StackItem size="fill">
+        <HStack align="center" justify="center" gap={1.5}>
+          <NavIcon icon={<Icon icon={AppMarkIcon} size="xsm" />} />
+          <Text type="supporting">{title}</Text>
+        </HStack>
+      </StackItem>
+    </HStack>
+  );
+}
+
 export function AppShell(): React.JSX.Element {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const desktop = readDesktopInfo();
-  const controlRowHeight = sideNavControlRowHeight(desktop);
   /*
-    Open-invoice tabs. The state lives here — the shell is the only thing that
-    outlives a route change — and every decision it makes is in `ui/invoiceTabsState`.
-    The band's height depends on whether the strip has anything to draw, because
-    `titleBarInset` is 0 on win32/linux where the OS paints a real title bar; see
-    `contentTitleBarHeight`.
-  */
-  const invoiceTabs = useInvoiceTabs();
-  const contentBandHeight = contentTitleBarHeight(desktop, invoiceTabs.tabs.length > 0);
-  const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
-  /*
-    Collapse is controlled here for one reason: `headerEndContent` is hidden
-    while the rail is collapsed, so the toggle that lives on the heading row
-    cannot also be the way back out. Knowing the state is what lets the collapsed
-    rail lay the same three controls out differently — below the reserved light
-    band instead of beside the lights — rather than losing any of them.
+    Collapse is controlled here because the two frames are not the same layout:
+    collapsed, the window controls and the way back out move into a title bar
+    above *both* columns, and the sidebar stops reserving a band for them. Only
+    the owner of the state can render two different frames from it.
 
     Seeded from the *same* localStorage byte `resizable.autoSaveId` persists
     below, because controlled collapse and the resizable width are two views of
@@ -444,8 +562,49 @@ export function AppShell(): React.JSX.Element {
     expanded sidebar at the hook's width of 0. See `wasSideNavCollapsed`.
   */
   const [isCollapsed, setIsCollapsed] = useState(wasSideNavCollapsed);
+  /*
+    The expand toggle in the collapsed title bar is rendered outside the SideNav
+    — `banner` is AppShell's slot, not the sidebar's — so it cannot read the
+    collapse context the expanded toggle reads. `handleRef` is the design
+    system's own answer to exactly that placement.
+  */
+  const collapseHandle = useRef<SideNavImperativeCollapseHandle | null>(null);
+  const controlRowHeight = sideNavControlRowHeight(desktop, isCollapsed);
+  /*
+    Open-invoice tabs. The state lives here — the shell is the only thing that
+    outlives a route change — and every decision it makes is in `ui/invoiceTabsState`.
+    The band's height depends on whether the strip has anything to draw, because
+    there is nothing to reserve on win32/linux, where the OS paints a real title
+    bar; see `tabStripBandHeight`.
+  */
+  const invoiceTabs = useInvoiceTabs();
+  const contentBandHeight = tabStripBandHeight(desktop, invoiceTabs.tabs.length > 0);
+  const footerItems = NAV_ITEMS.filter((item) => item.group === undefined);
   const { state: updateState } = useUpdates();
   const badge = updateBadge(updateState);
+
+  /*
+    The two live numbers the shell states: the count on the Invoices row and the
+    breadcrumb's status line. One fetch feeds both, so they cannot disagree on
+    screen — see `ui/shellStatus` for why the shell asks rather than the list
+    page telling it.
+  */
+  const counts = useInvoiceCounts(pathname);
+  const openCount = invoiceCountLabel(counts);
+
+  /*
+    The open invoice's number, for the deepest breadcrumb step. It comes from
+    the tab strip's label cache rather than a second fetch: the strip already
+    asked, and a trail that says `Invoice` while the pill beside it says
+    `INV-0047` is two components disagreeing about one document.
+  */
+  const openTabId = tabIdForPath(pathname);
+  const trail = breadcrumbTrail(
+    pathname,
+    openTabId === null || openTabId === DRAFT_TAB_ID
+      ? undefined
+      : invoiceTabs.labels[openTabId],
+  );
 
   /*
     The sidebar as a floating panel rather than a column welded to the window
@@ -461,25 +620,29 @@ export function AppShell(): React.JSX.Element {
   */
   const sideNavPanel: React.CSSProperties = {
     boxSizing: 'border-box',
-    ...sideNavPanelGeometry(desktop),
+    ...sideNavPanelGeometry(),
   };
 
   /*
     The update control: always on screen, blue only when something is waiting.
 
-    It used to render `null` unless an update was pending, which made the top row
-    change shape under the user. Permanence is the point — this is where you go
-    to ask about updates, so it has to be somewhere you can look. Which phases
-    highlight, and what each phase is called, are `ui/updateBadge`'s decision;
-    the blue itself is `--color-icon-update-pending` (see `theme/appTheme.ts` for
-    why not `color="accent"`), applied through a class because Icon's own
-    `color` prop has no value that resolves to it.
+    It used to render `null` unless an update was pending, which made the row it
+    sits in change shape under the user. Permanence is the point — this is where
+    you go to ask about updates, so it has to be somewhere you can look. Which
+    phases highlight, and what each phase is called, are `ui/updateBadge`'s
+    decision; the blue itself is `--color-icon-update-pending` (see
+    `theme/appTheme.ts` for why not `color="accent"`), applied through a class
+    because Icon's own `color` prop has no value that resolves to it.
+
+    `size="sm"` — a 28px glyph button, which is what the footer row has room for
+    beside a 32px nav row without making the row taller than the ones above it.
   */
   const updateButton = (
     <IconButton
       label={badge.label}
       tooltip={badge.label}
       variant="ghost"
+      size="sm"
       className={badge.isHighlighted ? 'app-update-button-pending' : undefined}
       icon={<Icon icon={UpdateIcon} size="sm" />}
       // The full update UI already lives on Settings; this is a pointer to it,
@@ -492,14 +655,12 @@ export function AppShell(): React.JSX.Element {
   );
 
   /*
-    Painted only in the browser preview, and only ever inside the sidebar's own
-    title band: the lights belong to the window's top-left corner, which the
-    panel owns at every width (see `SIDE_NAV_WIDTH.min` and the 88px rail).
+    Painted only in the browser preview. Expanded they live in the sidebar's own
+    first band, which the panel owns at every width the user can drag it to (see
+    `SIDE_NAV_WIDTH.min`); collapsed they live in the unified title bar.
   */
   const windowControls = hasPlaceholderWindowControls(desktop) ? (
-    <StackItem size="fill">
-      <WindowControlPlaceholders />
-    </StackItem>
+    <WindowControlPlaceholders />
   ) : null;
 
   /*
@@ -510,9 +671,23 @@ export function AppShell(): React.JSX.Element {
     its own `aria-label` *after* the spread. State comes from `isCollapsed`, the
     controlled value SideNav is driven by, so the attribute cannot disagree with
     what the rail is doing.
+
+    Two of them, never both on screen: the expanded one sits in the brand row
+    and reads the collapse context it is nested in, the collapsed one sits in
+    the title bar outside the SideNav and drives it through `handleRef`.
   */
   const collapseToggle = (
     <SideNavCollapseButton label={SIDE_NAV_TOGGLE_LABEL} aria-expanded={!isCollapsed}>
+      <Icon icon={PanelToggleIcon} size="sm" />
+    </SideNavCollapseButton>
+  );
+
+  const expandToggle = (
+    <SideNavCollapseButton
+      handleRef={collapseHandle}
+      label={SIDE_NAV_TOGGLE_LABEL}
+      aria-expanded={!isCollapsed}
+    >
       <Icon icon={PanelToggleIcon} size="sm" />
     </SideNavCollapseButton>
   );
@@ -535,85 +710,117 @@ export function AppShell(): React.JSX.Element {
           sidebar read as the inset panel `sideNavPanel` shapes.
         */
         variant="elevated"
+        /*
+          The collapsed frame's title bar, in the one slot that renders above
+          both columns without changing anything else. `topNav` also spans both
+          columns, but with `variant="elevated"` its presence flips the content
+          area to a transparent background inside an extra wrapper — so toggling
+          it would restyle the pane *and* remount everything under `<Outlet/>`,
+          throwing away an in-progress invoice draft every time the sidebar is
+          collapsed. `banner` is inert by comparison: it changes the header
+          subtree and nothing else.
+        */
+        banner={
+          isCollapsed ? (
+            <UnifiedTitleBar
+              desktop={desktop}
+              title={windowTitle(pathname)}
+              toggle={expandToggle}
+            />
+          ) : undefined
+        }
         sideNav={
           <SideNav
-            className="app-side-nav"
+            className={isCollapsed ? 'app-side-nav app-side-nav-collapsed' : 'app-side-nav'}
             style={sideNavPanel}
+            handleRef={collapseHandle}
+            /*
+              No header at all while collapsed. The two bands it holds — the
+              traffic lights and the brand row — have both moved into the
+              unified title bar, and an empty header is not free: SideNav pads
+              its sticky top on both sides, so the rail would open with 16px of
+              nothing above its first glyph.
+            */
             header={
-              /*
-                `width="100%"` because SideNav's collapsed header wrapper centres
-                its children: without it this column is only as wide as its widest
-                child, and the light band — and so the light cluster — slides
-                sideways whenever the controls beneath it change shape.
-              */
-              <VStack gap={0} width="100%">
-                {/*
-                  The title band: window controls at the start, app controls at
-                  the end. `justify="end"` ends the controls; the placeholders
-                  ride a `size="fill"` item, so on macOS — where there is no
-                  element under the lights at all — the row is unchanged.
+              isCollapsed ? undefined : (
+                /*
+                  `width="100%"` because SideNav's header wrapper centres its
+                  children when collapsed: without it this column is only as
+                  wide as its widest child, and the light band — and so the
+                  cluster — slides sideways whenever the row beneath it changes.
+                */
+                <VStack gap={0} width="100%">
+                  {/*
+                    Band one: the traffic lights, and deliberately nothing else.
+                    That is what makes the drag region real and stops the app's
+                    own controls being aligned to a cluster they have no
+                    relationship with — they are in the footer and in the brand
+                    row now. `isDecorative` because on web this band holds three
+                    unnamed dots and on macOS it holds nothing at all.
+                  */}
+                  <TitleBarInset height={controlRowHeight} isDecorative>
+                    {windowControls}
+                  </TitleBarInset>
+                  {/*
+                    Band two: the brand lockup, with the collapse toggle at the
+                    row's inline end. Also a drag surface — its only two
+                    children are a link and a button, both of which the
+                    `:where(...)` opt-out in `styles/global.css` already covers.
 
-                  Expanded order, left to right: update, appearance, panel
-                  toggle. The panel toggle is last because it is closest to the
-                  pane it hides, which is what the reference does too.
-                */}
-                <TitleBarInset height={controlRowHeight} isDecorative={isCollapsed}>
-                  {windowControls}
-                  {isCollapsed ? null : (
-                    <>
-                      {updateButton}
-                      <ThemeToggleButton />
-                      {collapseToggle}
-                    </>
-                  )}
-                </TitleBarInset>
-                {/*
-                  Collapsed, the same three controls move *below* the reserved
-                  light band. They cannot sit beside the lights: the rail is 88px
-                  wide and starts at x=8, and the cluster ends at x=70 — and they
-                  cannot all share one row either, since three `md` buttons are
-                  96px against the ~70px of content width an 88px rail leaves.
-
-                  So: two rows. The panel toggle takes the first one alone —
-                  it is the way back out of the collapsed state, so it is the
-                  topmost and first-in-reading-order thing under the lights — and
-                  the two occasional glyphs share the second (2 x 32px = 64px,
-                  inside the 70px of content an 88px rail leaves; measured at
-                  x 20-84 against a content box of 17-87). Two rows rather than
-                  three stacked glyphs so the chrome reads as its own cluster
-                  instead of extending the nav column above the app mark.
-                */}
-                {isCollapsed ? (
-                  /* `paddingBlock` so the first glyph clears the light band
-                     rather than butting straight onto its bottom edge. */
-                  <VStack gap={0} align="center" paddingBlock={0.5}>
+                    Not conditional on the platform the way the band above is:
+                    this row carries the only collapse toggle, so on win32/linux
+                    — where there are no lights and the band above is zero — it
+                    is the sidebar's first visible row.
+                  */}
+                  <HStack
+                    className="app-drag-region"
+                    height={BRAND_BAND_HEIGHT}
+                    width="100%"
+                    align="center"
+                    justify="start"
+                    gap={1}
+                  >
+                    <StackItem size="fill">
+                      <SideNavHeading
+                        icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
+                        heading="InvoiceApp"
+                        headingHref="#/invoices"
+                      />
+                    </StackItem>
                     {collapseToggle}
-                    <HStack gap={0} justify="center">
-                      {updateButton}
-                      <ThemeToggleButton />
-                    </HStack>
-                  </VStack>
-                ) : null}
-                <SideNavHeading
-                  icon={<NavIcon icon={<Icon icon={AppMarkIcon} size="sm" />} />}
-                  heading="InvoiceApp"
-                  headingHref="#/invoices"
-                />
-              </VStack>
+                  </HStack>
+                </VStack>
+              )
             }
             /*
-              Settings, and nothing else. The appearance toggle used to share
-              this row; it now lives in the title band with the other two
-              glyphs, which is what the reference asks for — one thing at the
-              foot of the panel, all the window chrome at its head. No wrapper
-              either: an HStack around a single child is a row that does nothing.
+              Settings, and the two utility glyphs beside it — one row, which is
+              where the design puts them and why they are here rather than in
+              SideNav's own `footerIcons` slot: that slot renders its contents
+              on a row of their own *below* the footer, which is two rows for
+              what the design draws as one.
 
-              `footerIcons` is gone for the same reason. It existed only to hold
-              the three controls the collapsed rail had nowhere else to put, and
-              the collapsed rail now puts them at the top, where the user asked
-              for them.
+              Collapsed, the same three stack as rail glyphs. The reference
+              folds the two utilities behind an overflow button at that width;
+              stacking them keeps every control one press away instead of two,
+              and the rail has the height for it.
             */
-            footer={<VStack gap={1}>{footerItems.map((item) => navItem(item, pathname))}</VStack>}
+            footer={
+              isCollapsed ? (
+                <VStack gap={0.5} align="center">
+                  {footerItems.map((item) => navItem(item, pathname))}
+                  {updateButton}
+                  <ThemeToggleButton />
+                </VStack>
+              ) : (
+                <HStack gap={1} align="center">
+                  <StackItem size="fill">
+                    {footerItems.map((item) => navItem(item, pathname))}
+                  </StackItem>
+                  {updateButton}
+                  <ThemeToggleButton />
+                </HStack>
+              )
+            }
             collapsible={{
               isCollapsed,
               onCollapsedChange: setIsCollapsed,
@@ -626,19 +833,22 @@ export function AppShell(): React.JSX.Element {
               autoSaveId: SIDE_NAV_WIDTH_STORAGE_ID,
             }}
           >
-            {NAV_GROUPS.map((group) => (
-              <SideNavSection key={group} title={group}>
-                {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
-                  navItem(item, pathname),
-                )}
-              </SideNavSection>
+            {NAV_GROUPS.map((group, index) => (
+              <Fragment key={group}>
+                {isCollapsed ? <NavGroupCaptionRule hasRule={index > 0} /> : null}
+                <SideNavSection title={group}>
+                  {NAV_ITEMS.filter((item) => item.group === group).map((item) =>
+                    navItem(item, pathname, navEndContent(item, openCount)),
+                  )}
+                </SideNavSection>
+              </Fragment>
             ))}
           </SideNav>
         }
       >
         <VStack gap={0} height="100%">
           {/*
-            The content half of the window's drag surface — and now the strip of
+            The content half of the window's drag surface — and the strip of
             open invoices, which is what the reserved band was being kept for.
             Delete it and the top-right of the window cannot be grabbed at all.
 
@@ -648,7 +858,7 @@ export function AppShell(): React.JSX.Element {
             must not be `aria-hidden`, or the strip inside it would be clickable
             but invisible to a screen reader.
           */}
-          <TitleBarInset height={contentBandHeight} justify="start">
+          <TitleBarInset height={contentBandHeight}>
             {invoiceTabs.tabs.length === 0 ? undefined : (
               /* `size="fill"` so the strip owns the band's width and its own
                  scroller decides what fits, rather than shrink-wrapping the
@@ -658,18 +868,29 @@ export function AppShell(): React.JSX.Element {
               </StackItem>
             )}
           </TitleBarInset>
+          {/*
+            The trail, directly under the strip. Not part of the drag band above
+            it: it is a row of links, and every one of them would otherwise have
+            to opt back out of `-webkit-app-region`.
+
+            It also carries the assistant launcher, at its inline end. The dock
+            used to be a bubble fixed to the bottom-right of the window, which
+            is where the invoice pane puts `Export PDF` and where Reports runs
+            its table — so it covered the primary action of the app's busiest
+            page. Reserving a safe area for it would have meant a dead band
+            under every page including the full-bleed cockpit; putting it in a
+            band the shell already owns means no page can be under it at all.
+            This bar is not a drag region either, so the button needs no
+            `-webkit-app-region` opt-out.
+          */}
+          <ShellBreadcrumbs
+            trail={trail}
+            status={invoiceStatusLine(counts)}
+            action={isDockVisible(pathname) ? <AssistantDock /> : undefined}
+          />
           <StackItem size="fill">
             <Outlet />
           </StackItem>
-          {/*
-            Deliberately a sibling of the content outlet and *outside* both
-            `.app-drag-region` bands above it. An element inside a drag region
-            stops receiving clicks unless it appears in the `:where(...)` opt-out
-            list in `styles/global.css`; the launcher is a fixed-position element
-            in the bottom-right corner, nowhere near the draggable top bands, so
-            it never has to opt back out.
-          */}
-          {isDockVisible(pathname) ? <AssistantDock /> : null}
         </VStack>
       </AstryxAppShell>
     </AssistantProvider>

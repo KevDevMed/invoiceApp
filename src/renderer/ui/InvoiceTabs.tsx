@@ -1,9 +1,16 @@
 /**
  * The open-invoice tab strip, in the content column's title band.
  *
- * One pill per open document, the active one filled, a trailing `+` for a new
- * draft — the workflow the user asked for: "when the user opens a new invoice or
- * wants to see an invoice ... they can see these open in tabs".
+ * One pill per open document, the active one filled and outlined, a trailing `+`
+ * for a new draft — the workflow the user asked for: "when the user opens a new
+ * invoice or wants to see an invoice ... they can see these open in tabs".
+ *
+ * The active pill carries no close glyph at rest: the design draws it as fill,
+ * hairline and label, and nothing else. The control is still there — it keeps
+ * its box, its place in the focus order and its accessible name, and appears on
+ * hover or keyboard focus — because taken literally the design would leave no
+ * way to close the document you are looking at. That is one rule in
+ * `styles/global.css`, next to the pill's own colours.
  *
  * Every *decision* here is imported from `./invoiceTabsState`: route -> tab id, the
  * open/close/plus transitions, where the route goes after the active tab is
@@ -670,6 +677,9 @@ export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.E
             label={NEW_TAB_BUTTON_LABEL}
             tooltip={NEW_TAB_BUTTON_LABEL}
             variant="ghost"
+            // The strip's own scale: a 28px button beside 28px pills, rather
+            // than the 32px default sitting a step above everything it trails.
+            size="sm"
             className="app-invoice-tabs-new"
             icon={<Icon icon={PlusIcon} size="sm" />}
             onClick={state.openDraft}

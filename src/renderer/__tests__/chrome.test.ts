@@ -3,17 +3,16 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
-  COLLAPSED_RAIL_MIN_PX,
-  collapsedRailInlineEndPx,
-  collapsedRailWidth,
-  CONTENT_TITLE_BAR_MIN_HEIGHT,
-  contentTitleBarHeight,
-  DEFAULT_COLLAPSED_RAIL_PX,
-  DEFAULT_COLLAPSED_RAIL_WIDTH,
+  APP_NAME,
+  BRAND_BAND_HEIGHT,
+  BREADCRUMB_BAND_HEIGHT,
+  COLLAPSED_RAIL_PX,
+  COLLAPSED_RAIL_WIDTH,
   hasPlaceholderWindowControls,
   isSectionSelected,
+  NAV_GROUP_CAPTION_HEIGHT,
+  NAV_GROUP_CAPTION_PX,
   NO_TITLE_BAR_INSET,
-  OVERLAY_COLLAPSED_RAIL_WIDTH,
   OVERLAY_TITLE_BAR_INSET,
   PANEL_BORDER_PX,
   PANEL_INSET,
@@ -24,22 +23,37 @@ import {
   readDesktopInfo,
   reservesTrafficLightBand,
   SECTION_ROUTES,
+  sectionLabel,
   RESIZABLE_STORAGE_PREFIX,
-  SIDE_NAV_CONTROL_ROW_MIN_HEIGHT,
-  SIDE_NAV_CONTROL_ROW_MIN_PX,
+  SECTION_CONTAINER_PADDING_PX,
+  SHELL_GUTTER,
+  SHELL_GUTTER_PX,
+  SHELL_GUTTER_STEP,
+  shellBandInsetsPx,
+  TAB_STRIP_EXTRA_INSET_PX,
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   SIDE_NAV_WIDTH_STORAGE_KEY,
   sideNavControlRowHeight,
   sideNavPanelGeometry,
   SIDE_NAV_HEADER_PADDING_INLINE_PX,
+  TAB_STRIP_BAND_HEIGHT,
+  tabStripBandHeight,
   titleBarInset,
   TRAFFIC_LIGHT_DOT_COUNT,
   TRAFFIC_LIGHT_DOT_GAP_PX,
   TRAFFIC_LIGHT_DOT_SIZE_PX,
+  TRAFFIC_LIGHT_RESERVE_PX,
+  TRAFFIC_LIGHT_RESERVE_WIDTH,
   TRAFFIC_LIGHT_ZONE_END_PX,
+  UNIFIED_TITLE_BAR_HEIGHT,
+  UNIFIED_TITLE_BAR_PADDING_INLINE,
+  UNIFIED_TITLE_BAR_PADDING_INLINE_PX,
+  unifiedTitleBarClusterPx,
+  unifiedTitleBarContentStartPx,
   wasSideNavCollapsed,
   WEB_DESKTOP_INFO,
+  windowTitle,
 } from '../chrome';
 
 const DARWIN = { platform: 'darwin', hasOverlayWindowControls: true } as const;
@@ -56,7 +70,7 @@ const REAL_TITLE_BAR = [WIN32, LINUX] as const;
 // Same reasoning as APPROVED_OVERLAY_INSET below: asserting the fallback
 // against WEB_DESKTOP_INFO only proves readDesktopInfo returns whatever that
 // constant happens to hold. A fallback of `{ platform: 'darwin',
-// hasOverlayWindowControls: true }` would reserve a 44px band in the browser
+// hasOverlayWindowControls: true }` would reserve a band in the browser
 // preview and still pass. Written out so the fallback itself is pinned.
 const APPROVED_WEB_FALLBACK = { platform: 'web', hasOverlayWindowControls: false };
 
@@ -98,14 +112,14 @@ describe('readDesktopInfo', () => {
   });
 });
 
-// These are the approved values, written out rather than imported from the
-// module under test. Comparing against OVERLAY_TITLE_BAR_INSET would only
-// re-assert the implementation against itself: --spacing-1 (4px, lights
-// overlap the shell again) or --spacing-10 (a 40px dead gap in the browser
-// preview) would both keep the suite green while shipping the bug this file
-// exists to prevent. --spacing-11 measures 44px, which clears the tallest
-// traffic light at y 12-32; changing either constant must fail here.
-const APPROVED_OVERLAY_INSET = 'var(--spacing-11)';
+// The approved values, written out rather than imported from the module under
+// test. Comparing against OVERLAY_TITLE_BAR_INSET would only re-assert the
+// implementation against itself: --spacing-1 (4px, lights overlap the shell
+// again) or --spacing-2 (an 8px band a 12px dot does not fit in) would both
+// keep the suite green while shipping the bug this file exists to prevent.
+// --spacing-10 measures 40px, which clears the tallest traffic light at
+// y 12-32; changing either constant must fail here.
+const APPROVED_OVERLAY_INSET = 'var(--spacing-10)';
 const APPROVED_NO_INSET = 'var(--spacing-0)';
 
 describe('hasPlaceholderWindowControls', () => {
@@ -139,36 +153,9 @@ describe('reservesTrafficLightBand', () => {
   });
 });
 
-describe('placeholderClusterPx', () => {
-  // The whole point of the placeholders: they have to land where macOS's own
-  // lights land, or the preview is a picture of a layout that never ships.
-  it('starts near the real cluster and ends inside its zone', () => {
-    const { startPx, endPx } = placeholderClusterPx();
-    expect(startPx).toBe(PANEL_INSET_PX + PANEL_BORDER_PX + SIDE_NAV_HEADER_PADDING_INLINE_PX);
-    expect(startPx).toBeGreaterThanOrEqual(8);
-    expect(startPx).toBeLessThanOrEqual(20);
-    expect(endPx).toBeLessThanOrEqual(TRAFFIC_LIGHT_ZONE_END_PX);
-  });
-
-  it('is three 12px dots with 8px gaps, matching macOS', () => {
-    expect(TRAFFIC_LIGHT_DOT_COUNT).toBe(3);
-    expect(TRAFFIC_LIGHT_DOT_SIZE_PX).toBe(12);
-    expect(TRAFFIC_LIGHT_DOT_GAP_PX).toBe(8);
-    const { startPx, endPx } = placeholderClusterPx();
-    expect(endPx - startPx).toBe(3 * 12 + 2 * 8);
-  });
-
-  // The cluster sits inside the collapsed rail, not merely inside the window.
-  it('fits inside the collapsed rail', () => {
-    expect(placeholderClusterPx().endPx).toBeLessThan(collapsedRailInlineEndPx(WEB_DESKTOP_INFO));
-  });
-});
-
 describe('titleBarInset', () => {
-  it('reserves the approved 44px band when the OS overlays window controls', () => {
-    expect(titleBarInset({ platform: 'darwin', hasOverlayWindowControls: true })).toBe(
-      APPROVED_OVERLAY_INSET,
-    );
+  it('reserves the approved 40px band when the OS overlays window controls', () => {
+    expect(titleBarInset(DARWIN)).toBe(APPROVED_OVERLAY_INSET);
   });
 
   // The band is where the lights go, and on web *we* put lights there. Reserving
@@ -199,6 +186,12 @@ describe('SIDE_NAV_WIDTH', () => {
     expect(SIDE_NAV_WIDTH.default).toBeGreaterThanOrEqual(SIDE_NAV_WIDTH.min);
     expect(SIDE_NAV_WIDTH.default).toBeLessThanOrEqual(SIDE_NAV_WIDTH.max);
   });
+
+  // The width the design measures its row rhythm against. Written out rather
+  // than compared to itself.
+  it('opens at the 240px the design is drawn at', () => {
+    expect(SIDE_NAV_WIDTH.default).toBe(240);
+  });
 });
 
 describe('isSectionSelected', () => {
@@ -213,67 +206,189 @@ describe('isSectionSelected', () => {
   });
 });
 
+describe('sectionLabel and windowTitle', () => {
+  it('names the section a route belongs to', () => {
+    expect(sectionLabel('/invoices')).toBe('Invoices');
+    expect(sectionLabel('/invoices/abc/edit')).toBe('Invoices');
+    expect(sectionLabel('/settings')).toBe('Settings');
+  });
+
+  it('has no label off the nav', () => {
+    expect(sectionLabel('/nowhere')).toBeNull();
+  });
+
+  // The collapsed rail throws the nav labels away, so the title bar is the only
+  // thing left saying where you are.
+  it('titles the collapsed frame with the product and the page', () => {
+    expect(windowTitle('/reports')).toBe('InvoiceApp — Reports');
+    expect(windowTitle('/nowhere')).toBe('InvoiceApp');
+    expect(APP_NAME).toBe('InvoiceApp');
+  });
+});
+
 // The spacing scale astryx.css writes onto :root, copied here so the tokens the
-// rail is built from can be resolved to real pixels in a node test. Asserting
-// only the string 'calc(var(--spacing-11) * 2)' would pass just as happily for
-// --spacing-2 (8px), which is the bug this suite exists to prevent.
+// chrome is built from can be resolved to real pixels in a node test. Asserting
+// only the string 'calc(var(--spacing-12) + var(--spacing-2))' would pass just
+// as happily for --spacing-0-5, which is the bug this suite exists to prevent.
 const SPACING_PX: Readonly<Record<string, number>> = {
+  '--spacing-0': 0,
   '--spacing-2': 8,
+  '--spacing-3': 12,
   '--spacing-4': 16,
+  '--spacing-6': 24,
   '--spacing-9': 36,
+  '--spacing-10': 40,
   '--spacing-11': 44,
   '--spacing-12': 48,
 };
 
-/** Resolves the two shapes chrome.ts emits: `var(--x)` and `calc(var(--x) * n)`. */
+/** Resolves the three shapes chrome.ts emits: `var(--x)`, `calc(var(--x) * n)`
+ *  and `calc(var(--x) + var(--y))`. */
 function resolvePx(length: string): number {
+  const token = (name: string | undefined): number => SPACING_PX[name ?? ''] ?? Number.NaN;
+
   const plain = /^var\((--spacing-[\d-]+)\)$/.exec(length);
-  if (plain !== null) return SPACING_PX[plain[1] ?? ''] ?? Number.NaN;
+  if (plain !== null) return token(plain[1]);
 
   const scaled = /^calc\(var\((--spacing-[\d-]+)\) \* (\d+)\)$/.exec(length);
-  if (scaled !== null) return (SPACING_PX[scaled[1] ?? ''] ?? Number.NaN) * Number(scaled[2]);
+  if (scaled !== null) return token(scaled[1]) * Number(scaled[2]);
+
+  const summed = /^calc\(var\((--spacing-[\d-]+)\) \+ var\((--spacing-[\d-]+)\)\)$/.exec(length);
+  if (summed !== null) return token(summed[1]) + token(summed[2]);
 
   return Number.NaN;
 }
 
-describe('collapsedRailWidth', () => {
-  it('clears the traffic-light zone when the OS overlays window controls', () => {
-    const width = collapsedRailWidth({ platform: 'darwin', hasOverlayWindowControls: true });
-    expect(resolvePx(width)).toBeGreaterThanOrEqual(COLLAPSED_RAIL_MIN_PX);
-    expect(resolvePx(width)).toBeGreaterThanOrEqual(88);
-  });
-
-  // A 48px rail with a 12px cluster in it is the bug: the dots would straddle
-  // the panel's edge in the preview exactly as they used to on macOS.
-  it('widens the same rail on web, so the placeholders have the room macOS needs', () => {
-    expect(collapsedRailWidth(WEB_DESKTOP_INFO)).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
-    expect(resolvePx(collapsedRailWidth(WEB_DESKTOP_INFO))).toBe(
-      resolvePx(collapsedRailWidth(DARWIN)),
-    );
-  });
-
-  it('keeps the design system width where the OS draws its own title bar', () => {
-    for (const info of REAL_TITLE_BAR) {
-      expect(collapsedRailWidth(info)).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+/**
+ * The chrome's band heights, as one grid.
+ *
+ * The whole point of 3a's metrics is that the traffic-light band, the brand row
+ * beneath it, the tab strip at the top of the content column and the collapsed
+ * unified title bar are the *same* height, so the two columns read as one grid
+ * rather than four near-misses. Asserted together, because that is the property
+ * — no single one of them is right or wrong on its own.
+ */
+describe('band heights', () => {
+  it('puts every 40px chrome band on the same step', () => {
+    for (const band of [
+      OVERLAY_TITLE_BAR_INSET,
+      BRAND_BAND_HEIGHT,
+      TAB_STRIP_BAND_HEIGHT,
+      UNIFIED_TITLE_BAR_HEIGHT,
+    ]) {
+      expect(resolvePx(band)).toBe(40);
+      expect(band).toMatch(/^var\(--spacing-[\d-]+\)$/);
     }
   });
 
-  it('is built from spacing tokens, never raw pixels', () => {
-    expect(OVERLAY_COLLAPSED_RAIL_WIDTH).toMatch(/^calc\(var\(--spacing-\d+\) \* \d+\)$/);
-    expect(DEFAULT_COLLAPSED_RAIL_WIDTH).toMatch(/^var\(--spacing-\d+\)$/);
+  // Lighter than the strip above it on purpose: it holds one line of supporting
+  // text, and two equal bars would read as a double title bar.
+  it('keeps the breadcrumb bar shorter than the tab strip', () => {
+    expect(resolvePx(BREADCRUMB_BAND_HEIGHT)).toBe(36);
+    expect(resolvePx(BREADCRUMB_BAND_HEIGHT)).toBeLessThan(resolvePx(TAB_STRIP_BAND_HEIGHT));
   });
 
-  // 48px ends inside the lights' x 13-70 zone, which is exactly the collision
-  // the wider rail exists to fix.
-  it('is wider than the design system default it replaces', () => {
-    expect(resolvePx(OVERLAY_COLLAPSED_RAIL_WIDTH)).toBeGreaterThan(
-      resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH),
-    );
+  // A 12px dot in the band, with room above and below it.
+  it('leaves the light band taller than the cluster in it', () => {
+    expect(resolvePx(OVERLAY_TITLE_BAR_INSET)).toBeGreaterThan(TRAFFIC_LIGHT_DOT_SIZE_PX);
+  });
+});
+
+describe('placeholderClusterPx', () => {
+  // The whole point of the placeholders: they have to land where macOS's own
+  // lights land, or the preview is a picture of a layout that never ships.
+  it('starts near the real cluster and ends inside its zone', () => {
+    const { startPx, endPx } = placeholderClusterPx();
+    expect(startPx).toBe(PANEL_INSET_PX + PANEL_BORDER_PX + SIDE_NAV_HEADER_PADDING_INLINE_PX);
+    expect(startPx).toBeGreaterThanOrEqual(8);
+    expect(startPx).toBeLessThanOrEqual(20);
+    expect(endPx).toBeLessThanOrEqual(TRAFFIC_LIGHT_ZONE_END_PX);
+  });
+
+  it('is three 12px dots with 8px gaps, matching macOS', () => {
+    expect(TRAFFIC_LIGHT_DOT_COUNT).toBe(3);
+    expect(TRAFFIC_LIGHT_DOT_SIZE_PX).toBe(12);
+    expect(TRAFFIC_LIGHT_DOT_GAP_PX).toBe(8);
+    const { startPx, endPx } = placeholderClusterPx();
+    expect(endPx - startPx).toBe(3 * 12 + 2 * 8);
+  });
+
+  // The cluster sits inside the *expanded* sidebar, which is never narrower
+  // than SIDE_NAV_WIDTH.min. It no longer has to fit in the collapsed rail —
+  // that is what the unified title bar is for.
+  it('fits inside the narrowest sidebar the user can drag to', () => {
+    expect(placeholderClusterPx().endPx).toBeLessThan(PANEL_INSET_PX + SIDE_NAV_WIDTH.min);
+  });
+});
+
+describe('the collapsed unified title bar', () => {
+  it('is 40px of full-width bar with 12px of inline padding', () => {
+    expect(resolvePx(UNIFIED_TITLE_BAR_HEIGHT)).toBe(40);
+    expect(resolvePx(UNIFIED_TITLE_BAR_PADDING_INLINE)).toBe(UNIFIED_TITLE_BAR_PADDING_INLINE_PX);
+    expect(UNIFIED_TITLE_BAR_PADDING_INLINE_PX).toBe(12);
+  });
+
+  // The bug this pins: dropping the reserved slot, or sizing it off the
+  // placeholders. On macOS there are no placeholders to size it off — the OS
+  // paints over the renderer — and the expand toggle then lands under the
+  // green light.
+  it('keeps everything after the reserve clear of the real lights', () => {
+    expect(resolvePx(TRAFFIC_LIGHT_RESERVE_WIDTH)).toBe(TRAFFIC_LIGHT_RESERVE_PX);
+    expect(unifiedTitleBarContentStartPx()).toBeGreaterThan(TRAFFIC_LIGHT_ZONE_END_PX);
+  });
+
+  it('lands the placeholder cluster where macOS lands its own, inside the reserve', () => {
+    const { startPx, endPx } = unifiedTitleBarClusterPx();
+    expect(startPx).toBe(UNIFIED_TITLE_BAR_PADDING_INLINE_PX);
+    // macOS starts its cluster at x=13; one pixel out is as close as a padding
+    // step gets.
+    expect(Math.abs(startPx - 13)).toBeLessThanOrEqual(1);
+    expect(endPx).toBeLessThanOrEqual(unifiedTitleBarContentStartPx());
+  });
+
+  it('pins the traffic-light zone rather than deriving it', () => {
+    expect(TRAFFIC_LIGHT_ZONE_END_PX).toBe(70);
+  });
+});
+
+describe('COLLAPSED_RAIL_WIDTH', () => {
+  // 56px: a 40px rail glyph inside SideNav's 8px of inline padding either side.
+  // Written out rather than derived — the point of the number is that it is
+  // narrow, and a rail that quietly grew back to 88 would pass a derived test.
+  it('is the 56px the design draws, from spacing tokens', () => {
+    expect(resolvePx(COLLAPSED_RAIL_WIDTH)).toBe(56);
+    expect(COLLAPSED_RAIL_PX).toBe(56);
+    expect(resolvePx(COLLAPSED_RAIL_WIDTH)).toBe(COLLAPSED_RAIL_PX);
+    expect(COLLAPSED_RAIL_WIDTH).toMatch(/^calc\(var\(--spacing-[\d-]+\) \+ var\(--spacing-[\d-]+\)\)$/);
+  });
+
+  // The regression this guards: the rail used to be 88px *because* the traffic
+  // lights lived in it. They do not any more, and a rail wide enough to hold
+  // them is a rail that has quietly gone back to the old frame.
+  it('is too narrow to hold the traffic lights, which is why they moved out', () => {
+    expect(PANEL_INSET_PX + COLLAPSED_RAIL_PX).toBeLessThan(TRAFFIC_LIGHT_ZONE_END_PX);
+  });
+
+  it('is the same width on every platform', () => {
+    for (const info of [DARWIN, WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
+      expect(sideNavPanelGeometry().minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
+      expect(reservesTrafficLightBand(info)).toBe(reservesTrafficLightBand(info));
+    }
+  });
+});
+
+describe('NAV_GROUP_CAPTION_HEIGHT', () => {
+  // Collapsing narrows, it does not rearrange: the rail draws a band of exactly
+  // this height where each caption was, so every nav row keeps its Y.
+  it('matches the caption block it stands in for', () => {
+    expect(resolvePx(NAV_GROUP_CAPTION_HEIGHT)).toBe(NAV_GROUP_CAPTION_PX);
+    expect(NAV_GROUP_CAPTION_PX).toBe(24);
+    expect(NAV_GROUP_CAPTION_HEIGHT).toMatch(/^var\(--spacing-[\d-]+\)$/);
   });
 });
 
 /**
- * A localStorage double. `entries` is what the store holds; `failOn` makes
+ * A localStorage double. `entries` is what the store holds; `failing` makes
  * `getItem` throw the way a Safari private window does.
  */
 function fakeStorage(entries: Record<string, string>, failing = false) {
@@ -337,13 +452,14 @@ describe('wasSideNavCollapsed', () => {
   });
 });
 
-// The approved inset, written out rather than imported. Comparing the geometry
-// against PANEL_INSET would only re-assert the module against itself.
+// The approved inset, written out rather than imported from the module under
+// test. Comparing the geometry against PANEL_INSET would only re-assert the
+// module against itself.
 const APPROVED_PANEL_INSET = 'var(--spacing-2)';
 
 describe('sideNavPanelGeometry', () => {
   it('insets the panel equally on all four edges', () => {
-    const geometry = sideNavPanelGeometry(DARWIN);
+    const geometry = sideNavPanelGeometry();
     expect(geometry.marginBlock).toBe(APPROVED_PANEL_INSET);
     expect(geometry.marginInline).toBe(APPROVED_PANEL_INSET);
     expect(PANEL_INSET).toBe(APPROVED_PANEL_INSET);
@@ -354,133 +470,92 @@ describe('sideNavPanelGeometry', () => {
   it('subtracts exactly both block insets from the panel height', () => {
     expect(PANEL_INSET_TOTAL_PX).toBe(PANEL_INSET_PX * 2);
     expect(resolvePx(PANEL_INSET_TOTAL)).toBe(resolvePx(PANEL_INSET) * 2);
-    expect(sideNavPanelGeometry(DARWIN).blockSize).toBe(`calc(100% - ${PANEL_INSET_TOTAL})`);
+    expect(sideNavPanelGeometry().blockSize).toBe(`calc(100% - ${PANEL_INSET_TOTAL})`);
   });
 
   it('keeps the collapsed-rail floor as the only width lever', () => {
-    expect(sideNavPanelGeometry(DARWIN).minInlineSize).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
-    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).minInlineSize).toBe(OVERLAY_COLLAPSED_RAIL_WIDTH);
-    expect(sideNavPanelGeometry(WIN32).minInlineSize).toBe(DEFAULT_COLLAPSED_RAIL_WIDTH);
+    expect(sideNavPanelGeometry().minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
   });
 
   // Radius, background, shadow and border belong to the theme. An inline style
   // beats a theme rule, so a stray one here silently overrides the theme.
   it('carries no appearance properties', () => {
-    for (const info of [DARWIN, WEB_DESKTOP_INFO]) {
-      expect(Object.keys(sideNavPanelGeometry(info)).sort()).toEqual([
-        'blockSize',
-        'marginBlock',
-        'marginInline',
-        'minInlineSize',
-      ]);
-    }
+    expect(Object.keys(sideNavPanelGeometry()).sort()).toEqual([
+      'blockSize',
+      'marginBlock',
+      'marginInline',
+      'minInlineSize',
+    ]);
   });
 
   it('is built from spacing tokens, never raw pixels', () => {
-    const geometry = sideNavPanelGeometry(DARWIN);
+    const geometry = sideNavPanelGeometry();
     expect(geometry.marginBlock).toMatch(/^var\(--spacing-[\d-]+\)$/);
     expect(geometry.marginInline).toMatch(/^var\(--spacing-[\d-]+\)$/);
     expect(geometry.blockSize).toMatch(/^calc\(100% - var\(--spacing-[\d-]+\)\)$/);
   });
 });
 
-describe('collapsedRailInlineEndPx', () => {
-  // The inset moved the rail's start edge off x=0, eating into the clearance
-  // the rail width was picked for. Rail and inset must be checked together.
-  it('still clears the traffic lights once the panel is inset', () => {
-    expect(collapsedRailInlineEndPx(DARWIN)).toBeGreaterThan(TRAFFIC_LIGHT_ZONE_END_PX);
-    expect(collapsedRailInlineEndPx(DARWIN)).toBe(PANEL_INSET_PX + COLLAPSED_RAIL_MIN_PX);
-  });
-
-  it('pins the traffic-light zone rather than deriving it', () => {
-    expect(TRAFFIC_LIGHT_ZONE_END_PX).toBe(70);
-  });
-
-  it('clears the placeholder cluster in the browser preview too', () => {
-    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBe(PANEL_INSET_PX + COLLAPSED_RAIL_MIN_PX);
-    expect(collapsedRailInlineEndPx(WEB_DESKTOP_INFO)).toBeGreaterThan(TRAFFIC_LIGHT_ZONE_END_PX);
-  });
-
-  it('uses the design system rail where the OS draws its own title bar', () => {
-    for (const info of REAL_TITLE_BAR) {
-      expect(collapsedRailInlineEndPx(info)).toBe(PANEL_INSET_PX + DEFAULT_COLLAPSED_RAIL_PX);
-    }
-    expect(resolvePx(DEFAULT_COLLAPSED_RAIL_WIDTH)).toBe(DEFAULT_COLLAPSED_RAIL_PX);
-  });
-});
-
 describe('sideNavControlRowHeight', () => {
-  // On macOS the buttons share the band with the lights, so it is the same
-  // 44px `titleBarInset` already reserves.
-  it('matches the reserved title-bar band on macOS', () => {
-    expect(sideNavControlRowHeight(DARWIN)).toBe(titleBarInset(DARWIN));
-    expect(resolvePx(sideNavControlRowHeight(DARWIN))).toBe(44);
+  it('is the reserved light band while the sidebar is expanded', () => {
+    expect(sideNavControlRowHeight(DARWIN, false)).toBe(titleBarInset(DARWIN));
+    expect(resolvePx(sideNavControlRowHeight(DARWIN, false))).toBe(40);
   });
 
-  // The third of the three geometry values the preview has to agree with darwin
-  // on: a 12px cluster in a 36px band is not the 44px band that ships.
-  it('gives web the same band as macOS, not the shorter fallback', () => {
-    expect(sideNavControlRowHeight(WEB_DESKTOP_INFO)).toBe(sideNavControlRowHeight(DARWIN));
-    expect(resolvePx(sideNavControlRowHeight(WEB_DESKTOP_INFO))).toBe(44);
+  // The geometry the preview has to agree with darwin on: a 12px cluster in a
+  // 36px band is not the 40px band that ships.
+  it('gives web the same band as macOS', () => {
+    expect(sideNavControlRowHeight(WEB_DESKTOP_INFO, false)).toBe(
+      sideNavControlRowHeight(DARWIN, false),
+    );
   });
 
-  // The bug this pins: `titleBarInset` is 0 where the OS draws its own title
-  // bar. Reuse it for the control row and the row collapses to nothing, hiding
-  // the only collapse toggle.
-  it('never collapses to zero where there is no title-bar band', () => {
-    for (const info of REAL_TITLE_BAR) {
-      expect(titleBarInset(info)).toBe(NO_TITLE_BAR_INSET);
-      expect(sideNavControlRowHeight(info)).not.toBe(NO_TITLE_BAR_INSET);
-      expect(resolvePx(sideNavControlRowHeight(info))).toBeGreaterThanOrEqual(
-        SIDE_NAV_CONTROL_ROW_MIN_PX,
-      );
+  // The bug this pins: keeping the band while collapsed. The lights are in the
+  // unified title bar then, and a rail that still reserved 40px for them would
+  // open with a dead gap above its first glyph.
+  it('reserves nothing once the sidebar is collapsed', () => {
+    for (const info of [DARWIN, WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
+      expect(sideNavControlRowHeight(info, true)).toBe(NO_TITLE_BAR_INSET);
     }
   });
 
-  it('is tall enough for an icon button, from spacing tokens', () => {
-    expect(SIDE_NAV_CONTROL_ROW_MIN_PX).toBeGreaterThanOrEqual(32);
-    expect(resolvePx(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT)).toBe(SIDE_NAV_CONTROL_ROW_MIN_PX);
-    expect(SIDE_NAV_CONTROL_ROW_MIN_HEIGHT).toMatch(/^var\(--spacing-[\d-]+\)$/);
+  // Nothing interactive lives in this band any more — the collapse toggle is in
+  // the brand row below it and the utility glyphs are in the footer — so a
+  // zero-height band on win32/linux hides nothing.
+  it('reserves nothing where the OS draws its own title bar', () => {
+    for (const info of REAL_TITLE_BAR) {
+      expect(sideNavControlRowHeight(info, false)).toBe(NO_TITLE_BAR_INSET);
+    }
   });
 });
 
-describe('contentTitleBarHeight', () => {
-  it('is the reserved light band wherever there is a cluster to clear', () => {
+describe('tabStripBandHeight', () => {
+  it('is a full band wherever there is a cluster to clear, tabs or not', () => {
     for (const info of [DARWIN, WEB_DESKTOP_INFO] as const) {
-      for (const hasContent of [false, true]) {
-        expect(contentTitleBarHeight(info, hasContent)).toBe(titleBarInset(info));
-        expect(resolvePx(contentTitleBarHeight(info, hasContent))).toBe(44);
+      for (const hasTabs of [false, true]) {
+        expect(tabStripBandHeight(info, hasTabs)).toBe(TAB_STRIP_BAND_HEIGHT);
+        expect(resolvePx(tabStripBandHeight(info, hasTabs))).toBe(40);
       }
     }
   });
 
-  it('stays flat zero on win32/linux while the band is empty', () => {
+  it('stays flat zero on win32/linux while the strip is empty', () => {
     // The band with nothing in it is reserved space and nothing else. Giving it
     // a height where the OS already paints a title bar is dead space at the top
     // of every page.
     for (const info of REAL_TITLE_BAR) {
-      expect(contentTitleBarHeight(info, false)).toBe(NO_TITLE_BAR_INSET);
-      expect(contentTitleBarHeight(info, false)).toBe('var(--spacing-0)');
+      expect(tabStripBandHeight(info, false)).toBe(NO_TITLE_BAR_INSET);
+      expect(tabStripBandHeight(info, false)).toBe('var(--spacing-0)');
     }
   });
 
-  it('grows to a real control height on win32/linux once tabs are open', () => {
-    // The bug this pins: `titleBarInset` is 0 there, so a tab strip rendered
-    // into that band is invisible — zero height, nothing to see or click.
+  it('grows to the full band on win32/linux once tabs are open', () => {
+    // The bug this pins: a tab strip rendered into a zero-height band is
+    // invisible — nothing to see and nothing to click.
     for (const info of REAL_TITLE_BAR) {
-      expect(contentTitleBarHeight(info, true)).not.toBe(NO_TITLE_BAR_INSET);
-      expect(resolvePx(contentTitleBarHeight(info, true))).toBeGreaterThanOrEqual(
-        SIDE_NAV_CONTROL_ROW_MIN_PX,
-      );
+      expect(tabStripBandHeight(info, true)).toBe(TAB_STRIP_BAND_HEIGHT);
+      expect(resolvePx(tabStripBandHeight(info, true))).toBe(40);
     }
-  });
-
-  it('reserves the full 44px the sm Toolbar occupies, not the sidebar’s 36px', () => {
-    // A `size="sm"` Toolbar is a 28px element plus 8px of block padding above
-    // and below it. 36px would clip the pills the band exists to show.
-    expect(resolvePx(CONTENT_TITLE_BAR_MIN_HEIGHT)).toBe(44);
-    expect(resolvePx(CONTENT_TITLE_BAR_MIN_HEIGHT)).toBeGreaterThan(SIDE_NAV_CONTROL_ROW_MIN_PX);
-    expect(CONTENT_TITLE_BAR_MIN_HEIGHT).toBe(OVERLAY_TITLE_BAR_INSET);
   });
 });
 
@@ -501,6 +576,21 @@ describe('SECTION_ROUTES', () => {
       'Settings',
     ]);
   });
+
+  // The grouping the design draws: Billing, then Insights, then Local AI.
+  it('groups the sections the way the sidebar captions them', () => {
+    expect(
+      SECTION_ROUTES.filter((route) => route.group !== undefined).map(
+        (route) => [route.group, route.label] as const,
+      ),
+    ).toEqual([
+      ['Billing', 'Invoices'],
+      ['Billing', 'Clients'],
+      ['Insights', 'Reports'],
+      ['Local AI', 'Models'],
+      ['Local AI', 'Assistant'],
+    ]);
+  });
 });
 
 /*
@@ -508,8 +598,8 @@ describe('SECTION_ROUTES', () => {
  * project is `environment: 'node'` with no DOM harness, so the component cannot
  * be mounted here — and every test above proves only that the helpers return
  * the right values, not that the shell still calls them. Drop the geometry
- * spread, or hand the sidebar's control row `titleBarInset` (0px off macOS,
- * which hides the only collapse toggle), and everything above stays green.
+ * spread, or leave the sidebar reserving a light band it no longer holds, and
+ * everything above stays green.
  *
  * Deliberately loose: each assertion pins one *usage*, not a line, a shape or a
  * formatting choice, so ordinary edits to the file do not fail them.
@@ -521,10 +611,10 @@ describe('AppShell consumes the chrome helpers', () => {
     expect(source).toMatch(/\.\.\.sideNavPanelGeometry\(/);
   });
 
-  it('sizes the sidebar control row from its own helper, not the title-bar inset', () => {
-    expect(source).toMatch(/sideNavControlRowHeight\(/);
-    // The bug: `height={inset}` on the sidebar's band. `inset` is the content
-    // column's, and it is `var(--spacing-0)` everywhere but macOS.
+  it('sizes the sidebar light band from its own helper, collapse included', () => {
+    // The bug: calling it without the collapse flag, which leaves the rail
+    // reserving 40px for lights that are in the title bar above it.
+    expect(source).toMatch(/sideNavControlRowHeight\(desktop, isCollapsed\)/);
     expect(source).toMatch(/height=\{controlRowHeight\}/);
   });
 
@@ -542,31 +632,119 @@ describe('AppShell consumes the chrome helpers', () => {
 
   it('renders the update control unconditionally', () => {
     // The regression: `badge.isVisible ? <IconButton .../> : null`, which is how
-    // the top row used to change shape under the user.
+    // the row it sits in used to change shape under the user.
     expect(source).toMatch(/const updateButton = \(\s*<IconButton/);
     expect(source).not.toMatch(/badge\.isVisible/);
     // ...and the highlight is the class, not a hardcoded colour.
     expect(source).toMatch(/badge\.isHighlighted \? 'app-update-button-pending' : undefined/);
   });
 
-  it('has no footerIcons bar left to hide the top controls in', () => {
-    // The prop, not the word: the comment explaining its removal may stay.
-    expect(source).not.toMatch(/footerIcons=/);
+  it('moves the utility glyphs into the footer, beside Settings', () => {
+    // The regression: putting them back in the traffic-light band, which is the
+    // alignment problem 3a exists to fix. `footerItems` is the Settings row.
+    const footer = source.slice(source.indexOf('footer={'), source.indexOf('collapsible={'));
+    expect(footer).toMatch(/footerItems\.map/);
+    expect(footer).toMatch(/\{updateButton\}/);
+    expect(footer).toMatch(/<ThemeToggleButton \/>/);
   });
 
-  it('puts all three controls in the title band, panel toggle last', () => {
-    // Order asserted as one match so a reshuffle fails: update, appearance,
-    // panel toggle, ending at the row's inline end.
-    expect(source).toMatch(
-      /\{updateButton\}\s*<ThemeToggleButton \/>\s*\{collapseToggle\}/,
-    );
+  it('gives the collapsed frame a unified title bar above both columns', () => {
+    // AppShell's `banner` is the slot that spans both columns without the
+    // remount `topNav` causes. The bug: rendering it always, or never.
+    expect(source).toMatch(/banner=\{\s*isCollapsed \? \(/);
+    expect(source).toMatch(/<UnifiedTitleBar/);
+    expect(source).toMatch(/title=\{windowTitle\(pathname\)\}/);
   });
 
-  it('keeps the collapse toggle first in reading order on the collapsed rail', () => {
-    // Collapsed, the rows are below the light band and the way out is topmost.
-    const collapsedRows = source.slice(source.indexOf('{isCollapsed ? ('));
-    expect(collapsedRows.indexOf('{collapseToggle}')).toBeLessThan(
-      collapsedRows.indexOf('{updateButton}'),
-    );
+  it('drops the sidebar header entirely while collapsed', () => {
+    // Both of its bands moved into the title bar; an empty header still costs
+    // SideNav's 8px of sticky-top padding on either side.
+    expect(source).toMatch(/header=\{\s*isCollapsed \? undefined :/);
+  });
+
+  it('keeps every nav row at its Y across the collapse toggle', () => {
+    // The rule 3a is built on: collapsing narrows, it does not rearrange.
+    expect(source).toMatch(/isCollapsed \? <NavGroupCaptionRule hasRule=\{index > 0\} \/> : null/);
+  });
+
+  it('renders the breadcrumb bar under the tab strip', () => {
+    const bandIndex = source.indexOf('height={contentBandHeight}');
+    expect(bandIndex).toBeGreaterThan(-1);
+    expect(source.indexOf('<ShellBreadcrumbs')).toBeGreaterThan(bandIndex);
+  });
+
+  /*
+   * The assistant launcher belongs to the shell's own chrome, not to the corner
+   * of the window. The regression this pins is the one that was shipped: the
+   * dock as a sibling of `<Outlet/>`, floating over whatever the page had put
+   * in its bottom-right — which on the invoices cockpit is `Export PDF`.
+   */
+  it('hands the assistant launcher to the breadcrumb bar, not to the page', () => {
+    const bar = source.slice(source.indexOf('<ShellBreadcrumbs'), source.lastIndexOf('<Outlet'));
+    expect(bar).toMatch(/action=\{isDockVisible\(pathname\) \? <AssistantDock \/> : undefined\}/);
+    // Nothing renders the dock anywhere else — in particular not beside the
+    // outlet, which is where it used to be.
+    expect(source.match(/<AssistantDock \/>/g)).toHaveLength(1);
+  });
+});
+
+/*
+ * The three bands' left edges, read out of the files that set them.
+ *
+ * `shellBandInsetsPx` says what the relationship is; these say the shell still
+ * expresses it. The staircase this replaced (strip 280, trail 272, heading 324
+ * at a 1440 window) was three files each doing something individually
+ * defensible, so the invariant has to be checked across all three or it is not
+ * being checked at all.
+ */
+describe('the shell gutter holds across the files that use it', () => {
+  const read = (file: string): string => readFileSync(new URL(file, import.meta.url), 'utf8');
+
+  it('is the same 16px in both of the shapes it is written in', () => {
+    expect(SHELL_GUTTER).toBe(`var(--spacing-${SHELL_GUTTER_STEP})`);
+    expect(resolvePx(SHELL_GUTTER)).toBe(SHELL_GUTTER_PX);
+  });
+
+  // The property, in one line: every band in the content column starts at the
+  // same inline inset.
+  it('puts the tab strip, the breadcrumb trail and the page column on one edge', () => {
+    const insets = shellBandInsetsPx();
+    expect(insets.tabStrip).toBe(SHELL_GUTTER_PX);
+    expect(insets.breadcrumbs).toBe(SHELL_GUTTER_PX);
+    expect(insets.pageMin).toBe(SHELL_GUTTER_PX);
+  });
+
+  it('leaves the tab strip on the container padding Toolbar already carries', () => {
+    // The bug: adding padding on top of Section's own, which is exactly how the
+    // strip ended up 8px right of the trail beneath it.
+    expect(TAB_STRIP_EXTRA_INSET_PX).toBe(0);
+    expect(SECTION_CONTAINER_PADDING_PX).toBe(SHELL_GUTTER_PX);
+    const css = read('../styles/global.css');
+    const rule = css.slice(css.indexOf('.app-invoice-tabs {'), css.indexOf('.app-invoice-tabs ['));
+    expect(rule).toMatch(/padding-inline-start:\s*0;/);
+    expect(rule).not.toMatch(/padding-inline-start:\s*var\(/);
+  });
+
+  it('pads the breadcrumb bar and the page column from the same constant', () => {
+    for (const file of ['../ui/ShellBreadcrumbs.tsx', '../ui/Page.tsx']) {
+      const source = read(file);
+      expect(source).toMatch(/SHELL_GUTTER_STEP/);
+      expect(source).toMatch(/paddingInline=\{SHELL_GUTTER_STEP\}/);
+    }
+  });
+
+  /*
+   * The page column is the one that does *not* simply sit on the gutter, and
+   * that is deliberate: `Page` caps its column and centres it, so on a wide
+   * window it steps in from the gutter by half of whatever the cap leaves over.
+   * The cap is load-bearing — the screenshot harness asserts equal gutters on
+   * Clients and Settings at 1600 — so what the shell can guarantee is the
+   * minimum, and that a step away from the gutter is a whole gutter rather than
+   * the 8px that read as a mistake.
+   */
+  it('keeps the page column capped and centred', () => {
+    const source = read('../ui/Page.tsx');
+    expect(source).toMatch(/maxWidth = 1120/);
+    expect(source).toMatch(/align="center"/);
   });
 });

@@ -173,6 +173,15 @@ const INVOICE_TAB_COLORS = {
   '--color-invoice-tab-ink': 'var(--color-text-secondary)',
   '--color-invoice-tab-ink-active': 'var(--color-text-primary)',
   '--color-invoice-tab-surface-active': `color-mix(in srgb, var(--color-text-primary) ${TAB_ACTIVE_TINT_PERCENT}%, transparent)`,
+  /*
+    And the active pill's edge, which the fill alone cannot supply. A 10% tint
+    is a wash, not a shape: on the light window it is barely a shade off the
+    body colour, so the pill reads as a smudge rather than a raised chip. The
+    hairline is what gives it an outline in both modes — `--color-border` is
+    lighter than this theme's light body and paints an invisible edge there
+    (the same reason `PANEL_EDGE` uses the emphasised token), so this does too.
+  */
+  '--color-invoice-tab-border-active': 'var(--color-border-emphasized)',
 } as const;
 
 export const appTheme = defineTheme({
@@ -280,8 +289,34 @@ export const appTheme = defineTheme({
         boxShadow: PANEL_SHADOW,
       },
     },
+    /*
+      Group captions: 11-ish px, uppercase, tracked out — the macOS sidebar
+      caption, not a sentence-case sub-heading.
+
+      Set on the *section* rather than on its caption because the caption span
+      carries its own StyleX rule and nothing written here can outrank it on the
+      properties it declares. Neither `text-transform` nor `letter-spacing` is
+      one of those, so both inherit down to it — and the size stays the design
+      system's `--text-supporting`, which is the nearest step on the scale.
+
+      They also inherit down to every nav *row* in the section, which is what
+      the reset on `side-nav-item` below is for: the item root is a descendant
+      of this one, so restoring the two properties there stops the labels
+      shouting. Keeping both rules in this file is what keeps the pair visible
+      as a pair; split them and the reset reads as dead code.
+    */
+    'side-nav-section': {
+      base: {
+        textTransform: 'uppercase',
+        letterSpacing: '0.06em',
+      },
+    },
     'side-nav-item': {
-      base: { borderRadius: 'var(--radius-element)' },
+      base: {
+        borderRadius: 'var(--radius-element)',
+        textTransform: 'none',
+        letterSpacing: 'normal',
+      },
       selected: { backgroundColor: NAV_SELECTED_TINT },
     },
     /*

@@ -7,7 +7,16 @@
  * invoice and a draft that is still being typed. Section order mirrors the PDF
  * template in src/main/pdf/invoice-template.ts, so screen and export tell the
  * same story.
+ *
+ * The document is *paper*: a physical object that is light in dark mode too,
+ * because that is what the recipient receives and what the PDF prints. It gets
+ * there without a single literal colour — `color-scheme: light` on the sheet
+ * makes every `light-dark()` token underneath it resolve to its light value, so
+ * the paper is the theme's own light palette rather than a second set of hex
+ * codes that would drift from it.
  */
+
+import { useMemo } from 'react';
 
 import { Avatar } from '@astryxdesign/core/Avatar';
 import { Badge } from '@astryxdesign/core/Badge';
@@ -17,6 +26,7 @@ import { Heading } from '@astryxdesign/core/Heading';
 import { MetadataList, MetadataListItem } from '@astryxdesign/core/MetadataList';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Table, pixel, proportional } from '@astryxdesign/core/Table';
+import type { TablePlugin } from '@astryxdesign/core/Table';
 import { Text } from '@astryxdesign/core/Text';
 
 import type { InvoiceStatus } from '../../../shared/types';
@@ -110,9 +120,20 @@ function TotalRow({
 
 export interface InvoiceDocumentProps {
   readonly model: InvoiceDocumentModel;
+  /**
+   * The document line the user is editing right now (`model.lines[n].key`), or
+   * null when nothing is being edited. The editor passes it so the keystroke can
+   * be seen landing in the document — the row lights up on the paper as it is
+   * typed, which is what makes the preview feel like the same object as the
+   * form rather than a delayed copy of it.
+   */
+  readonly activeLineKey?: string | null;
 }
 
-export function InvoiceDocument({ model }: InvoiceDocumentProps): React.JSX.Element {
+export function InvoiceDocument({
+  model,
+  activeLineKey = null,
+}: InvoiceDocumentProps): React.JSX.Element {
   const rows: LineRow[] = model.lines.map((line) => ({
     key: line.key,
     description: line.description,
@@ -121,8 +142,37 @@ export function InvoiceDocument({ model }: InvoiceDocumentProps): React.JSX.Elem
     amount: line.amount,
   }));
 
+  /**
+   * Row-level highlight through the table's own plugin pipeline: the column
+   * budgets below were tuned to stop Amount clipping off the edge of the
+   * preview, and re-hand-rolling the table in children mode to paint one `<tr>`
+   * would put those back in play for no gain.
+   */
+  const highlight = useMemo<Record<string, TablePlugin<LineRow>>>(
+    () => ({
+      activeLine: {
+        transformBodyRow: (props, item) =>
+          item.key === activeLineKey
+            ? {
+                ...props,
+                htmlProps: {
+                  ...props.htmlProps,
+                  style: {
+                    ...props.htmlProps.style,
+                    background: 'var(--color-background-yellow)',
+                  },
+                },
+              }
+            : props,
+      },
+    }),
+    [activeLineKey],
+  );
+
   return (
-    <Card padding={6}>
+    // `colorScheme` is the sheet's one piece of physical-object styling: see the
+    // file header. Everything inside it stays on tokens.
+    <Card padding={6} style={{ colorScheme: 'light' }}>
       <VStack gap={5}>
         <HStack gap={3} vAlign="start" wrap="wrap">
           <StackItem size="fill">
@@ -169,6 +219,7 @@ export function InvoiceDocument({ model }: InvoiceDocumentProps): React.JSX.Elem
           data={rows}
           idKey="key"
           density="compact"
+          plugins={highlight}
           columns={[
             // Only the description flexes. `proportional(n)` carries a 120px
             // minimum per column, and four of those overflow the editor's

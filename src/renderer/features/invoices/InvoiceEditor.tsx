@@ -1,20 +1,32 @@
 /**
- * Invoice editor: a two-column maker. The left column is a single "Invoice
- * details" card — the customer as an identity row, the derived billing address,
- * dates with the derived payment term, currency, tax, an editable line-item
- * table, live totals, notes, and a settled action row at the bottom. The right
- * column is a live preview: the same `InvoiceDocument` the detail page renders,
- * rebuilt from the draft on every keystroke, drawn at a fixed paper width and
- * uniformly scaled to the pane (see ./previewScale). The columns stack when the
- * window is narrow.
+ * Invoice editor: a form on the left, the paper it produces on the right.
+ *
+ * The form is deliberately quiet. A line item is text on a hairline grid, not a
+ * row of boxes — a cell only draws itself as a control when it has focus — so
+ * ten lines read as a table instead of thirty inputs. There is no "Add item"
+ * button: one blank ghost row always waits at the bottom, Enter commits a row
+ * and opens the next, and Backspace on an already-empty row deletes it. The
+ * per-row icon cluster is gone too: a drag handle on the left and an overflow
+ * menu on the right, both near-invisible until the row is hovered or focused.
+ *
+ * A row that is not finished never leaves the form. `completeLines`
+ * (./editorLines) is the single gate in front of both the document and the
+ * money math, which is what stops the preview filling up with $0.00 lines as
+ * rows are added. The math itself is untouched: `computeInvoiceTotals` from
+ * src/shared/money.ts is the same integer arithmetic the backend persists, so
+ * the preview and the saved invoice cannot disagree.
+ *
+ * The right column is a fixed-width rail holding one sheet of A4 (see
+ * ./editorPreviewRail): it never grows and never scrolls sideways, the row being
+ * edited lights up on the paper, and the save actions sit at its foot.
+ *
+ * Dates run the other way round from the old form. The user picks a payment
+ * term and the due date is *derived* from it and rendered as a derived value —
+ * which is how an invoice is actually written.
  *
  * A client can be created without leaving the page: the Customer field opens the
  * clients feature's own `ClientForm` in a dialog and folds the saved client into
  * the local list, so no draft field is lost and nothing is re-fetched.
- *
- * Live totals use the exact same integer math the backend persists
- * (`computeInvoiceTotals` from src/shared/money.ts), so the preview and the
- * saved invoice can never disagree.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -27,14 +39,13 @@ import type { ISODateString } from '@astryxdesign/core/Calendar';
 import { Card } from '@astryxdesign/core/Card';
 import { DateInput } from '@astryxdesign/core/DateInput';
 import { Divider } from '@astryxdesign/core/Divider';
-import { FormLayout } from '@astryxdesign/core/FormLayout';
-import { Grid } from '@astryxdesign/core/Grid';
+import { DropdownMenu } from '@astryxdesign/core/DropdownMenu';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Icon } from '@astryxdesign/core/Icon';
 import { IconButton } from '@astryxdesign/core/IconButton';
+import { InputGroup, InputGroupText } from '@astryxdesign/core/InputGroup';
 import { Item } from '@astryxdesign/core/Item';
 import { NumberInput } from '@astryxdesign/core/NumberInput';
-import { Section } from '@astryxdesign/core/Section';
 import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
@@ -42,72 +53,59 @@ import { Text } from '@astryxdesign/core/Text';
 import { TextArea } from '@astryxdesign/core/TextArea';
 import { TextInput } from '@astryxdesign/core/TextInput';
 
-import {
-  computeInvoiceTotals,
-  formatCents,
-  formatMilli,
-  parseAmountToCents,
-  parseQuantityToMilli,
-} from '../../../shared/money';
-import type { Client, InvoiceItemInput, InvoiceStatus } from '../../../shared/types';
+import { computeInvoiceTotals, formatCents, formatMilli } from '../../../shared/money';
+import type { Client, InvoiceStatus } from '../../../shared/types';
 import { SETTINGS_KEYS } from '../../../shared/types';
 import { ClientForm } from '../clients/ClientForm';
 import { Page, PageHeader } from '../../ui/Page';
 import { normaliseNotes } from './detail';
 import type { InvoiceDocumentModel } from './document';
-import { buildDocumentModel, netTermDays } from './document';
+import { buildDocumentModel, formatDocumentDate } from './document';
+import {
+  bpsToPercent,
+  draftCaption,
+  dueDateFor,
+  isNotesOverBudget,
+  notesCounter,
+  paymentTermLabel,
+  paymentTermOf,
+  paymentTermOptions,
+  percentToBps,
+} from './editorFields';
+import {
+  ITEM_LIST_MAX_HEIGHT,
+  LINE_AMOUNT_WIDTH,
+  LINE_GUTTER_WIDTH,
+  LINE_MENU_WIDTH,
+  LINE_QTY_WIDTH,
+  LINE_RATE_WIDTH,
+  PREVIEW_RAIL_WIDTH,
+} from './editorLayout';
+import type { LineDraft } from './editorLines';
+import {
+  buildItemInputs,
+  commitLineAt,
+  completeLines,
+  countedLines,
+  duplicateLineAt,
+  emptyLine,
+  isBlankLine,
+  moveLine,
+  nextLineKey,
+  parseLine,
+  removeBlankLineAt,
+  removeLineAt,
+  withTrailingBlank,
+} from './editorLines';
+import { PreviewRail } from './editorPreviewRail';
 import { STATUS_OPTIONS, money, todayIso } from './format';
-import { InvoiceDocument } from './InvoiceDocument';
-import { PAPER_WIDTH_PX, previewScale, scaledPreviewHeight } from './previewScale';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'SEK', 'NOK', 'BRL'];
 
-/**
- * Budgeted widths for the line table's columns, in px. The header row and every
- * data row read the same four numbers, which is what makes the grid line up as a
- * table instead of a stack of unrelated rows.
- */
-const QTY_WIDTH = 64;
-const COST_WIDTH = 92;
-const AMOUNT_WIDTH = 84;
-const ROW_ACTIONS_WIDTH = 88;
+/** The keyboard contract, said once above the list instead of in a tooltip. */
+const KEYBOARD_HINT = '⏎ new row · ⌫ on empty removes';
 
-/** Budgeted width of the read-only payment-terms field beside the two dates. */
-const PAYMENT_TERMS_WIDTH = 148;
-
-interface LineDraft {
-  key: number;
-  description: string;
-  quantity: string; // decimal text, parsed to milli
-  unitPrice: string; // decimal text, parsed to cents
-}
-
-interface ParsedLine {
-  description: string;
-  quantityMilli: number | null;
-  unitPriceCents: number | null;
-}
-
-function parseLine(line: LineDraft): ParsedLine {
-  let quantityMilli: number | null = null;
-  let unitPriceCents: number | null = null;
-  try {
-    quantityMilli = parseQuantityToMilli(line.quantity);
-  } catch {
-    quantityMilli = null;
-  }
-  try {
-    unitPriceCents = parseAmountToCents(line.unitPrice);
-  } catch {
-    unitPriceCents = null;
-  }
-  return { description: line.description, quantityMilli, unitPriceCents };
-}
-
-let nextKey = 1;
-function emptyLine(): LineDraft {
-  return { key: nextKey++, description: '', quantity: '1', unitPrice: '0.00' };
-}
+export type { LineDraft } from './editorLines';
 
 /** Every editable field of the draft, in one shape. */
 export interface InvoiceDraft {
@@ -187,93 +185,119 @@ export function billingAddressFor(client: Client | null): string | null {
   return parts.length > 0 ? parts.join(', ') : null;
 }
 
-/** Derived payment-terms label for the date row: `Net 14`, `Due on receipt`, or an em dash. */
+/**
+ * The term two dates describe: `Net 14`, `Due on receipt`, or an em dash for an
+ * interval that is not a term at all (a due date before the issue date).
+ */
 export function paymentTermsLabel(issueDate: string, dueDate: string): string {
-  const days = netTermDays(issueDate, dueDate);
-  if (days === null || days < 0) return '—';
-  if (days === 0) return 'Due on receipt';
-  return `Net ${String(days)}`;
+  const days = paymentTermOf(issueDate, dueDate);
+  return days === null ? '—' : paymentTermLabel(days);
+}
+
+/** Six dots: the universal "pick this row up" glyph, which has no semantic name. */
+function GripIcon(props: React.SVGProps<SVGSVGElement>): React.JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" {...props}>
+      <circle cx="9" cy="6" r="1.5" />
+      <circle cx="15" cy="6" r="1.5" />
+      <circle cx="9" cy="12" r="1.5" />
+      <circle cx="15" cy="12" r="1.5" />
+      <circle cx="9" cy="18" r="1.5" />
+      <circle cx="15" cy="18" r="1.5" />
+    </svg>
+  );
 }
 
 function FieldValue({
   label,
+  hint,
   children,
 }: {
   readonly label: string;
+  readonly hint?: string;
   readonly children: React.ReactNode;
 }): React.JSX.Element {
   return (
     <VStack gap={1}>
-      <Text type="label" color="secondary">
-        {label}
-      </Text>
+      <HStack gap={1} vAlign="center">
+        <Text type="label" color="secondary">
+          {label}
+        </Text>
+        {hint !== undefined ? (
+          <Text type="label" color="disabled">
+            {hint}
+          </Text>
+        ) : null}
+      </HStack>
       {children}
     </VStack>
   );
 }
 
+/** The three cells of a line row that the user can type into. */
+type CellField = 'description' | 'quantity' | 'unitPrice';
+
 /**
- * The preview sheet: `InvoiceDocument` drawn at one fixed paper width and
- * scaled, never reflowed. Narrowing the pane shrinks the whole page — column
- * proportions and internal type scale intact — instead of re-wrapping it into a
- * layout the exported PDF would never produce.
+ * A borderless line-item cell.
  *
- * Two boxes, because a `transform: scale()` is paint-only and the scaled sheet
- * still occupies its full unscaled box in layout: the frame is given the scaled
- * height and clips, the sheet inside it is the fixed-width, transformed one.
- *
- * `ResizeObserver` is present in Electron and in the browser preview harness;
- * where it is not, both measurements stay at 0, which `previewScale` reads as
- * "not measured" and answers with scale 1. Missing observer degrades to an
- * unscaled sheet rather than a crash.
+ * The whole point of the 2a table: at rest the input paints nothing — no border,
+ * no fill — so the row reads as a line of text; the cell that has focus is the
+ * only one that draws itself as a control. Both looks are inline because they
+ * are driven by React state rather than `:focus-within`: an inline style is the
+ * only thing that outranks the component's own focus styling, and the row needs
+ * to know which cell is focused anyway (it highlights itself, and the document
+ * highlights the matching line).
  */
-function PaperPreview({ model }: { readonly model: InvoiceDocumentModel }): React.JSX.Element {
-  const frameRef = useRef<HTMLElement | null>(null);
-  const sheetRef = useRef<HTMLElement | null>(null);
-  const [paneWidth, setPaneWidth] = useState(0);
-  const [naturalHeight, setNaturalHeight] = useState(0);
-
-  useEffect(() => {
-    const frame = frameRef.current;
-    const sheet = sheetRef.current;
-    if (!frame || !sheet) return;
-    if (typeof ResizeObserver === 'undefined') return;
-
-    // `clientWidth`/`offsetHeight` rather than the entry's rects: both are
-    // untransformed layout numbers, which is what the scale is computed from.
-    // A `getBoundingClientRect` height here would already carry the scale and
-    // feed itself.
-    const measure = (): void => {
-      setPaneWidth(frame.clientWidth);
-      setNaturalHeight(sheet.offsetHeight);
-    };
-    const observer = new ResizeObserver(measure);
-    observer.observe(frame);
-    observer.observe(sheet);
-    measure();
-    return () => {
-      observer.disconnect();
-    };
-  }, []);
-
-  const scale = previewScale(paneWidth);
-  const height = scaledPreviewHeight(naturalHeight, scale);
-
+function LineCell({
+  label,
+  value,
+  placeholder,
+  align,
+  isFocused,
+  hasError,
+  inputRef,
+  onChange,
+  onFocus,
+  onBlur,
+  onKeyDown,
+}: {
+  readonly label: string;
+  readonly value: string;
+  readonly placeholder?: string;
+  readonly align: 'start' | 'end';
+  readonly isFocused: boolean;
+  readonly hasError: boolean;
+  readonly inputRef: (node: HTMLInputElement | null) => void;
+  readonly onChange: (value: string) => void;
+  readonly onFocus: () => void;
+  readonly onBlur: () => void;
+  readonly onKeyDown: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+}): React.JSX.Element {
+  const borderColor = hasError
+    ? 'var(--color-border-red)'
+    : isFocused
+      ? 'var(--color-border-blue)'
+      : 'transparent';
   return (
-    <VStack
-      ref={frameRef}
-      style={{ overflow: 'hidden', height: height > 0 ? `${String(height)}px` : undefined }}
-    >
-      <VStack
-        ref={sheetRef}
-        width={PAPER_WIDTH_PX}
-        // Top-inline-start origin: the sheet shrinks towards the corner it is
-        // aligned to, so it never drifts away from the pane's edge.
-        style={{ transform: `scale(${String(scale)})`, transformOrigin: 'top left' }}
-      >
-        <InvoiceDocument model={model} />
-      </VStack>
-    </VStack>
+    <TextInput
+      label={label}
+      isLabelHidden
+      size="sm"
+      value={value}
+      placeholder={placeholder}
+      ref={inputRef}
+      onChange={onChange}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      onKeyDown={onKeyDown}
+      style={{
+        background: isFocused ? 'var(--color-background-surface)' : 'transparent',
+        borderColor,
+        borderRadius: 'var(--radius-inner)',
+        boxShadow: 'none',
+        textAlign: align,
+      }}
+    />
   );
 }
 
@@ -298,6 +322,17 @@ export function InvoiceEditor(): React.JSX.Element {
   const [taxRateBps, setTaxRateBps] = useState(blank.taxRateBps);
   const [notes, setNotes] = useState(blank.notes);
   const [lines, setLines] = useState<LineDraft[]>(blank.lines);
+  const [isDirty, setIsDirty] = useState(false);
+
+  // Row chrome: which row the caret is in, which cell of it, and which row the
+  // pointer is over. All three only decide what is drawn, never what is saved.
+  const [focusedCell, setFocusedCell] = useState<{
+    readonly key: number;
+    readonly field: CellField;
+  } | null>(null);
+  const [hoverKey, setHoverKey] = useState<number | null>(null);
+  const [draggingKey, setDraggingKey] = useState<number | null>(null);
+  const [pendingFocus, setPendingFocus] = useState<number | null>(null);
 
   // null when the dialog is closed; `client` null inside it means "create".
   const [clientDialog, setClientDialog] = useState<{ readonly client: Client | null } | null>(null);
@@ -313,6 +348,17 @@ export function InvoiceEditor(): React.JSX.Element {
       isMounted.current = false;
     };
   }, []);
+
+  // The description input of every row, so a keyboard transition can put the
+  // caret in the row it just created. Keyed by draft key: an index would point
+  // at the wrong row the moment one is inserted above it.
+  const descriptionInputs = useRef(new Map<number, HTMLInputElement | null>());
+
+  useEffect(() => {
+    if (pendingFocus === null) return;
+    descriptionInputs.current.get(pendingFocus)?.focus();
+    setPendingFocus(null);
+  }, [pendingFocus, lines]);
 
   useEffect(() => {
     let cancelled = false;
@@ -333,6 +379,7 @@ export function InvoiceEditor(): React.JSX.Element {
     setTaxRateBps(draft.taxRateBps);
     setNotes(draft.notes);
     setLines(draft.lines);
+    setIsDirty(false);
     setLoadError(null);
     setActionError(null);
     setNotice(null);
@@ -374,13 +421,17 @@ export function InvoiceEditor(): React.JSX.Element {
           setCurrency(invoice.currency);
           setTaxRateBps(invoice.taxRateBps);
           setNotes(invoice.notes ?? '');
+          // The ghost row is an invariant of the list, so a saved invoice gets
+          // one the moment it lands in the form.
           setLines(
-            invoice.items.map((item) => ({
-              key: nextKey++,
-              description: item.description,
-              quantity: formatMilli(item.quantityMilli),
-              unitPrice: formatCents(item.unitPriceCents),
-            })),
+            withTrailingBlank(
+              invoice.items.map((item) => ({
+                key: nextLineKey(),
+                description: item.description,
+                quantity: formatMilli(item.quantityMilli),
+                unitPrice: formatCents(item.unitPriceCents),
+              })),
+            ),
           );
         }
       } catch (cause) {
@@ -395,24 +446,17 @@ export function InvoiceEditor(): React.JSX.Element {
   }, [id, isNew]);
 
   const parsed = useMemo(() => lines.map(parseLine), [lines]);
-  const validItems = useMemo(
-    () =>
-      parsed.filter(
-        (line): line is ParsedLine & { quantityMilli: number; unitPriceCents: number } =>
-          line.quantityMilli !== null && line.quantityMilli > 0 && line.unitPriceCents !== null,
-      ),
-    [parsed],
-  );
+  const items = useMemo(() => completeLines(lines), [lines]);
   const totals = useMemo(
     () =>
       computeInvoiceTotals(
-        validItems.map((line) => ({
+        items.map((line) => ({
           quantityMilli: line.quantityMilli,
           unitPriceCents: line.unitPriceCents,
         })),
         taxRateBps,
       ),
-    [validItems, taxRateBps],
+    [items, taxRateBps],
   );
 
   const selectedClient = useMemo(
@@ -421,9 +465,12 @@ export function InvoiceEditor(): React.JSX.Element {
   );
   const billingAddress = useMemo(() => billingAddressFor(selectedClient), [selectedClient]);
 
-  // Rebuilt on every keystroke — only valid lines feed it, so a half-typed
-  // quantity never throws; that row simply has not appeared in the preview yet.
-  const documentModel = useMemo(
+  const termDays = paymentTermOf(issueDate, dueDate);
+  const termOptions = useMemo(() => paymentTermOptions(termDays), [termDays]);
+
+  // Rebuilt on every keystroke — only complete lines feed it, so a half-typed
+  // quantity never throws and a blank row never appears on the paper.
+  const documentModel: InvoiceDocumentModel = useMemo(
     () =>
       buildDocumentModel({
         number: invoiceNumber,
@@ -435,7 +482,7 @@ export function InvoiceEditor(): React.JSX.Element {
         // Same normalisation the save below uses, so the preview can never
         // promise a document without a Notes block and then store one.
         notes: normaliseNotes(notes),
-        items: validItems,
+        items,
         totals,
         client: selectedClient,
         business: { name: businessName, address: businessAddress },
@@ -448,7 +495,7 @@ export function InvoiceEditor(): React.JSX.Element {
       currency,
       taxRateBps,
       notes,
-      validItems,
+      items,
       totals,
       selectedClient,
       businessName,
@@ -456,21 +503,55 @@ export function InvoiceEditor(): React.JSX.Element {
     ],
   );
 
+  /**
+   * Which line of the *document* the caret is in, if any.
+   *
+   * The map runs through `items`, not `lines`, because a blank or half-typed row
+   * has no line on the paper to light up — the document's keys are positions in
+   * what it actually renders.
+   */
+  const activeLineKey = useMemo(() => {
+    if (focusedCell === null) return null;
+    const index = items.findIndex((line) => line.key === focusedCell.key);
+    return index >= 0 ? `line-${String(index)}` : null;
+  }, [focusedCell, items]);
+
+  const editLines = (next: LineDraft[]): void => {
+    setIsDirty(true);
+    setLines(withTrailingBlank(next));
+  };
   const updateLine = (key: number, patch: Partial<LineDraft>): void => {
-    setLines((prev) => prev.map((line) => (line.key === key ? { ...line, ...patch } : line)));
+    editLines(lines.map((line) => (line.key === key ? { ...line, ...patch } : line)));
   };
-  const moveLine = (index: number, delta: -1 | 1): void => {
-    setLines((prev) => {
-      const target = index + delta;
-      if (target < 0 || target >= prev.length) return prev;
-      const next = [...prev];
-      const [line] = next.splice(index, 1);
-      if (line) next.splice(target, 0, line);
-      return next;
-    });
-  };
-  const removeLine = (key: number): void => {
-    setLines((prev) => (prev.length > 1 ? prev.filter((line) => line.key !== key) : prev));
+
+  /**
+   * Enter commits the row and opens the next one; Backspace on a row that is
+   * already empty deletes it. Both are list transformations in ./editorLines —
+   * the component only decides that the keystroke was one of them, and only
+   * claims Backspace when the caret has nothing left to delete in the cell it is
+   * in, so ordinary editing is never intercepted.
+   */
+  const handleCellKeyDown = (
+    event: React.KeyboardEvent<HTMLInputElement>,
+    index: number,
+    cellValue: string,
+  ): void => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const result = commitLineAt(lines, index);
+      setIsDirty(true);
+      setLines(result.lines);
+      if (result.focusKey !== null) setPendingFocus(result.focusKey);
+      return;
+    }
+    if (event.key === 'Backspace' && cellValue === '') {
+      const result = removeBlankLineAt(lines, index);
+      if (!result) return;
+      event.preventDefault();
+      setIsDirty(true);
+      setLines(result.lines);
+      if (result.focusKey !== null) setPendingFocus(result.focusKey);
+    }
   };
 
   /**
@@ -481,33 +562,24 @@ export function InvoiceEditor(): React.JSX.Element {
   const acceptClient = (saved: Client): void => {
     setClients((prev) => upsertClient(prev, saved));
     setClientId(saved.id);
+    setIsDirty(true);
     setClientDialog(null);
   };
 
-  const buildItems = (): InvoiceItemInput[] | string => {
-    if (clientId === '') return 'Pick a client before saving.';
-    const items: InvoiceItemInput[] = [];
-    for (const [index, line] of parsed.entries()) {
-      if (line.description.trim() === '') return `Line ${index + 1} needs a description.`;
-      if (line.quantityMilli === null || line.quantityMilli <= 0) {
-        return `Line ${index + 1} needs a positive quantity.`;
-      }
-      if (line.unitPriceCents === null) return `Line ${index + 1} has an invalid unit price.`;
-      items.push({
-        description: line.description.trim(),
-        quantityMilli: line.quantityMilli,
-        unitPriceCents: line.unitPriceCents,
-        position: index,
-      });
+  /**
+   * `mode` is where the user lands: `stay` keeps them in the form with the saved
+   * invoice open, `open` hands them the finished document. A new invoice can be
+   * saved either way, which is what makes "Save draft" and "Create invoice" two
+   * different buttons rather than one button and a lie.
+   */
+  const save = async (mode: 'stay' | 'open'): Promise<void> => {
+    if (clientId === '') {
+      setActionError('Pick a client before saving.');
+      return;
     }
-    if (items.length === 0) return 'An invoice needs at least one line item.';
-    return items;
-  };
-
-  const save = async (): Promise<void> => {
-    const items = buildItems();
-    if (typeof items === 'string') {
-      setActionError(items);
+    const built = buildItemInputs(lines);
+    if (typeof built === 'string') {
+      setActionError(built);
       return;
     }
     setIsSaving(true);
@@ -521,17 +593,22 @@ export function InvoiceEditor(): React.JSX.Element {
         currency,
         taxRateBps,
         notes: normaliseNotes(notes),
-        items,
+        items: built,
       };
       if (isNew) {
         const created = await window.api.invoke('invoices:create', payload);
-        // Lands on the read-only detail page; this component unmounts mid-flight.
-        await navigate(`/invoices/${created.id}`, { replace: true });
+        // Either way this component unmounts mid-flight: both routes remount the
+        // editor (or leave it) under a new key.
+        await navigate(mode === 'open' ? `/invoices/${created.id}` : `/invoices/${created.id}/edit`, {
+          replace: true,
+        });
       } else {
         const updated = await window.api.invoke('invoices:update', { id, patch: payload });
         if (!isMounted.current) return;
         setInvoiceNumber(updated.number);
+        setIsDirty(false);
         setNotice('Invoice saved.');
+        if (mode === 'open') await navigate(`/invoices/${String(id)}`);
       }
     } catch (cause) {
       if (isMounted.current) setActionError(cause instanceof Error ? cause.message : String(cause));
@@ -588,21 +665,18 @@ export function InvoiceEditor(): React.JSX.Element {
     );
   }
 
+  const itemCount = countedLines(lines);
+
   return (
     <Page maxWidth={1440}>
       <PageHeader
         title={isNew ? 'New invoice' : (invoiceNumber ?? 'Invoice')}
-        description={
-          isNew
-            ? 'Pick a client, add line items, and the preview follows along.'
-            : 'Edit the invoice, change its status, or export it as a PDF.'
-        }
         actions={
           <>
             <Button
               label="Back"
               variant="ghost"
-              onClick={() => void navigate(isNew ? '/invoices' : `/invoices/${id}`)}
+              onClick={() => void navigate(isNew ? '/invoices' : `/invoices/${String(id)}`)}
             />
             {!isNew ? (
               <Selector
@@ -623,339 +697,563 @@ export function InvoiceEditor(): React.JSX.Element {
       {actionError ? <Banner status="error" title={actionError} isDismissable /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable /> : null}
 
-      {/* `align` left at its default `stretch`: both columns take the row's full
-          height, so the two cards end level however tall either one's content
-          gets. On one column the stretch is a no-op and the cards simply stack. */}
-      <Grid columns={{ minWidth: 460, max: 2 }} gap={4}>
-        <Card padding={4} height="100%">
-          <VStack gap={4} height="100%">
-            <Heading level={2}>Invoice details</Heading>
+      {/* Form left, paper right. The rail is a fixed width — it holds a page, and
+          a page is a fixed shape — so only the form column takes up the slack.
+          `wrap` puts the rail under the form when the window cannot hold both. */}
+      <HStack gap={4} align="stretch" wrap="wrap">
+        <StackItem size="fill">
+          <Card padding={4} height="100%">
+            <VStack gap={4} height="100%">
+              <HStack gap={2} vAlign="center">
+                <StackItem size="fill">
+                  <Heading level={2}>Invoice details</Heading>
+                </StackItem>
+                <Text type="supporting" color="secondary">
+                  {draftCaption({
+                    number: invoiceNumber,
+                    status,
+                    isNew,
+                    isSaving,
+                    hasUnsavedChanges: isDirty,
+                  })}
+                </Text>
+              </HStack>
 
-            {/* Who — the client, as an identity row once one is chosen. */}
-            <VStack gap={2}>
-              {selectedClient ? (
-                <FieldValue label="Customer">
-                  {/* Card, not Section: Section is a page region and bleeds to
-                      its container's edges, which inside this card reads as a
-                      full-width grey band rather than one identity row. */}
-                  <Card variant="muted" padding={2}>
-                    <VStack gap={1}>
-                      <Item
-                      startContent={<Avatar size="sm" name={selectedClient.name} />}
-                      label={selectedClient.name}
-                      description={selectedClient.email ?? 'No email on file'}
-                      density="compact"
-                      endContent={
-                        <HStack gap={1} vAlign="center">
-                          <Button
-                            label="Edit"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setClientDialog({ client: selectedClient })}
+              {/* Who — the client, as an identity row once one is chosen. */}
+              <HStack gap={2} align="end" wrap="wrap">
+                <StackItem size="fill">
+                  {selectedClient ? (
+                    <FieldValue label="Customer">
+                      {/* Card, not Section: Section is a page region and bleeds
+                          to its container's edges, which inside this card reads
+                          as a full-width grey band rather than one identity row. */}
+                      <Card variant="muted" padding={2}>
+                        <VStack gap={1}>
+                          <Item
+                            startContent={<Avatar size="sm" name={selectedClient.name} />}
+                            label={selectedClient.name}
+                            description={selectedClient.email ?? 'No email on file'}
+                            density="compact"
+                            endContent={
+                              <HStack gap={1} vAlign="center">
+                                <Button
+                                  label="Edit"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => setClientDialog({ client: selectedClient })}
+                                />
+                                <Button
+                                  label="Change"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => {
+                                    setIsDirty(true);
+                                    setClientId('');
+                                  }}
+                                />
+                              </HStack>
+                            }
                           />
-                          <Button
-                            label="Change"
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => setClientId('')}
-                          />
-                        </HStack>
-                      }
-                      />
-                      {/* Inside the identity block, not below it: the address
-                          belongs to the client shown above it, and when there is
-                          no address the row simply is not rendered — an empty
-                          "choose a client to see their address" line is dead
-                          vertical space in the state the form is usually in. */}
-                      {billingAddress ? (
-                        <Text type="supporting" color="secondary">
-                          {billingAddress}
-                        </Text>
-                      ) : null}
-                    </VStack>
-                  </Card>
-                </FieldValue>
-              ) : (
-                <HStack gap={2} align="end" wrap="wrap">
-                  <StackItem size="fill">
+                          {/* Inside the identity block, not below it: the address
+                              belongs to the client shown above it, and when there
+                              is no address the row simply is not rendered — an
+                              empty "choose a client to see their address" line is
+                              dead vertical space in the state the form is
+                              usually in. */}
+                          {billingAddress ? (
+                            <Text type="supporting" color="secondary">
+                              {billingAddress}
+                            </Text>
+                          ) : null}
+                        </VStack>
+                      </Card>
+                    </FieldValue>
+                  ) : (
                     <Selector
                       label="Customer"
                       placeholder="Choose a client"
-                      options={clients.map((client) => ({ value: client.id, label: client.name }))}
+                      options={clients.map((client) => ({
+                        value: client.id,
+                        label: client.name,
+                      }))}
                       value={clientId || null}
                       hasSearch
                       hasClear
                       onChange={(value) => {
+                        setIsDirty(true);
                         setClientId(value ?? '');
                       }}
                     />
-                  </StackItem>
-                  <Button
-                    label="New client"
-                    variant="secondary"
-                    onClick={() => setClientDialog({ client: null })}
-                  />
-                </HStack>
-              )}
-            </VStack>
-
-            <Divider />
-
-            {/* When — three columns of equal structure, so the derived term
-                reads as a (read-only) field beside the two dates instead of a
-                sentence dropped into their row. Neither DateInput carries a
-                description, which is what keeps the three boxes on one line. */}
-            <HStack gap={2} align="start" wrap="wrap">
-              <StackItem size="fill">
-                <DateInput
-                  label="Issue date"
-                  value={issueDate as ISODateString}
-                  onChange={(value) => {
-                    if (value) setIssueDate(value);
-                  }}
-                />
-              </StackItem>
-              <StackItem size="fill">
-                <DateInput
-                  label="Due date"
-                  value={dueDate as ISODateString}
-                  onChange={(value) => {
-                    if (value) setDueDate(value);
-                  }}
-                />
-              </StackItem>
-              {/* Budgeted rather than filling: when the pane is too narrow for
-                  three fields the readout wraps to the next line at its own
-                  small width instead of stretching into a full-width banner. */}
-              <VStack width={PAYMENT_TERMS_WIDTH}>
-                <FieldValue label="Payment terms">
-                  <Card variant="muted" padding={2}>
-                    <Text>{paymentTermsLabel(issueDate, dueDate)}</Text>
-                  </Card>
-                </FieldValue>
-              </VStack>
-            </HStack>
-
-            {/* Each field owns its own column, and both carry a description, so
-                the tax hint sits under its own input instead of floating above
-                and to the right of the Currency selector. */}
-            <FormLayout direction="horizontal">
-              <Selector
-                label="Currency"
-                description="Used for every amount"
-                options={CURRENCIES}
-                value={currency}
-                onChange={setCurrency}
-              />
-              <NumberInput
-                label="Tax rate (bps)"
-                description="825 = 8.25%"
-                value={taxRateBps}
-                min={0}
-                max={1_000_000}
-                step={25}
-                isIntegerOnly
-                onChange={(value) => {
-                  setTaxRateBps(Math.max(0, Math.trunc(value)));
-                }}
-              />
-            </FormLayout>
-
-            <Divider />
-
-            {/* What — a table: the column headers are rendered once, above every
-                row, and every row's own labels are hidden but still announced. */}
-            <VStack gap={2}>
-              <Heading level={3}>Item details</Heading>
-              <HStack gap={2} vAlign="center">
-                <StackItem size="fill">
-                  <Text type="label" color="secondary">
-                    Item
-                  </Text>
+                  )}
                 </StackItem>
-                <VStack width={QTY_WIDTH}>
-                  <Text type="label" color="secondary">
-                    Qty
-                  </Text>
-                </VStack>
-                <VStack width={COST_WIDTH}>
-                  <Text type="label" color="secondary">
-                    Cost
-                  </Text>
-                </VStack>
-                <VStack width={AMOUNT_WIDTH} hAlign="end">
-                  <Text type="label" color="secondary">
-                    Amount
-                  </Text>
-                </VStack>
-                <VStack width={ROW_ACTIONS_WIDTH} hAlign="end">
-                  <Text type="label" color="secondary">
-                    Actions
-                  </Text>
-                </VStack>
+                <Button
+                  label="New client"
+                  variant="secondary"
+                  onClick={() => setClientDialog({ client: null })}
+                />
               </HStack>
-              <Divider variant="subtle" />
 
-              {lines.map((line, index) => {
-                const lineParsed = parsed[index];
-                const amount =
-                  lineParsed &&
-                  lineParsed.quantityMilli !== null &&
-                  lineParsed.quantityMilli > 0 &&
-                  lineParsed.unitPriceCents !== null
-                    ? money(
-                        computeInvoiceTotals(
-                          [
-                            {
-                              quantityMilli: lineParsed.quantityMilli,
-                              unitPriceCents: lineParsed.unitPriceCents,
-                            },
-                          ],
-                          0,
-                        ).subtotalCents,
-                        currency,
-                      )
-                    : '—';
-                return (
-                  <HStack key={line.key} gap={2} vAlign="center">
+              {/* When — the user picks a term and the due date follows from it.
+                  The derived field is drawn differently (dashed, dimmer) so it
+                  reads as a consequence rather than a third thing to fill in. */}
+              <HStack gap={2} align="start" wrap="wrap">
+                <StackItem size="fill">
+                  <Selector
+                    label="Payment terms"
+                    placeholder="Choose terms"
+                    options={termOptions}
+                    value={termDays === null ? undefined : String(termDays)}
+                    onChange={(value) => {
+                      const days = Number.parseInt(value, 10);
+                      if (!Number.isFinite(days)) return;
+                      setIsDirty(true);
+                      setDueDate(dueDateFor(issueDate, days));
+                    }}
+                  />
+                </StackItem>
+                <StackItem size="fill">
+                  <DateInput
+                    label="Issue date"
+                    value={issueDate as ISODateString}
+                    onChange={(value) => {
+                      if (!value) return;
+                      setIsDirty(true);
+                      setIssueDate(value);
+                      // The term is what the user chose; the dates move under it.
+                      if (termDays !== null) setDueDate(dueDateFor(value, termDays));
+                    }}
+                  />
+                </StackItem>
+                <StackItem size="fill">
+                  <FieldValue label="Due" hint="· auto">
+                    <VStack
+                      justify="center"
+                      style={{
+                        minHeight: 'var(--size-element-md)',
+                        paddingInline: 'var(--spacing-2)',
+                        borderRadius: 'var(--radius-element)',
+                        border: 'var(--border-width) dashed var(--color-border-emphasized)',
+                        background: 'var(--color-background-muted)',
+                      }}
+                    >
+                      <Text color="secondary" hasTabularNumbers>
+                        {formatDocumentDate(dueDate)}
+                      </Text>
+                    </VStack>
+                  </FieldValue>
+                </StackItem>
+              </HStack>
+
+              <HStack gap={2} align="start" wrap="wrap">
+                <StackItem size="fill">
+                  <Selector
+                    label="Currency"
+                    options={CURRENCIES}
+                    value={currency}
+                    onChange={(value) => {
+                      setIsDirty(true);
+                      setCurrency(value);
+                    }}
+                  />
+                </StackItem>
+                <StackItem size="fill">
+                  {/* Basis points are how the invoice stores tax; per cent is how
+                      people say it. The split control puts the unit in the field
+                      instead of in a hint under it. */}
+                  <InputGroup label="Sales tax">
+                    <NumberInput
+                      label="Sales tax rate"
+                      isLabelHidden
+                      value={bpsToPercent(taxRateBps)}
+                      min={0}
+                      max={100}
+                      step={0.25}
+                      onChange={(value) => {
+                        setIsDirty(true);
+                        setTaxRateBps(percentToBps(value));
+                      }}
+                    />
+                    <InputGroupText>%</InputGroupText>
+                  </InputGroup>
+                </StackItem>
+              </HStack>
+
+              <Divider />
+
+              {/* What — a table, not a stack of controls. */}
+              <VStack gap={2}>
+                <HStack gap={2} vAlign="center">
+                  <StackItem size="fill">
+                    <HStack gap={1} vAlign="center">
+                      <Heading level={3}>Items</Heading>
+                      <Text color="secondary">{`· ${String(itemCount)}`}</Text>
+                    </HStack>
+                  </StackItem>
+                  <Text
+                    type="supporting"
+                    color="secondary"
+                    style={{ fontFamily: 'var(--font-family-code)' }}
+                  >
+                    {KEYBOARD_HINT}
+                  </Text>
+                </HStack>
+
+                {/* The list scrolls, the page doesn't: forty lines must not push
+                    the notes field and the action row off the window. */}
+                <VStack style={{ maxHeight: ITEM_LIST_MAX_HEIGHT, overflowY: 'auto' }}>
+                  <HStack
+                    gap={2}
+                    vAlign="center"
+                    style={{
+                      position: 'sticky',
+                      top: 0,
+                      zIndex: 1,
+                      background: 'var(--color-background-card)',
+                      paddingBottom: 'var(--spacing-1)',
+                      borderBottom: 'var(--border-width) solid var(--color-border)',
+                    }}
+                  >
+                    <VStack width={LINE_GUTTER_WIDTH} />
                     <StackItem size="fill">
-                      <TextInput
-                        label={`Item ${index + 1}`}
-                        isLabelHidden
-                        value={line.description}
-                        placeholder="What was delivered?"
-                        onChange={(value) => updateLine(line.key, { description: value })}
+                      <Text type="label" color="secondary">
+                        Description
+                      </Text>
+                    </StackItem>
+                    <VStack width={LINE_QTY_WIDTH} hAlign="end">
+                      <Text type="label" color="secondary">
+                        Qty
+                      </Text>
+                    </VStack>
+                    <VStack width={LINE_RATE_WIDTH} hAlign="end">
+                      <Text type="label" color="secondary">
+                        Rate
+                      </Text>
+                    </VStack>
+                    <VStack width={LINE_AMOUNT_WIDTH} hAlign="end">
+                      <Text type="label" color="secondary">
+                        Amount
+                      </Text>
+                    </VStack>
+                    <VStack width={LINE_GUTTER_WIDTH} />
+                  </HStack>
+
+                  {lines.map((line, index) => {
+                    const lineParsed = parsed[index];
+                    const isGhost = isBlankLine(line);
+                    const isLast = index === lines.length - 1;
+                    const isActive = focusedCell?.key === line.key;
+                    const isRevealed = isActive || hoverKey === line.key;
+                    const amount =
+                      lineParsed &&
+                      lineParsed.description.trim() !== '' &&
+                      lineParsed.quantityMilli !== null &&
+                      lineParsed.quantityMilli > 0 &&
+                      lineParsed.unitPriceCents !== null
+                        ? money(
+                            computeInvoiceTotals(
+                              [
+                                {
+                                  quantityMilli: lineParsed.quantityMilli,
+                                  unitPriceCents: lineParsed.unitPriceCents,
+                                },
+                              ],
+                              0,
+                            ).subtotalCents,
+                            currency,
+                          )
+                        : '—';
+                    const cell = (field: CellField): boolean =>
+                      focusedCell?.key === line.key && focusedCell.field === field;
+                    const onCellFocus = (field: CellField) => () => {
+                      setFocusedCell({ key: line.key, field });
+                    };
+                    const onCellBlur = (field: CellField) => () => {
+                      setFocusedCell((prev) =>
+                        prev?.key === line.key && prev.field === field ? null : prev,
+                      );
+                    };
+
+                    return (
+                      <HStack
+                        key={line.key}
+                        gap={2}
+                        vAlign="center"
+                        draggable={draggingKey === line.key}
+                        onMouseEnter={() => setHoverKey(line.key)}
+                        onMouseLeave={() => setHoverKey(null)}
+                        onDragOver={(event) => {
+                          if (draggingKey === null) return;
+                          event.preventDefault();
+                        }}
+                        onDrop={(event) => {
+                          if (draggingKey === null) return;
+                          event.preventDefault();
+                          const from = lines.findIndex((row) => row.key === draggingKey);
+                          setDraggingKey(null);
+                          if (from < 0 || from === index) return;
+                          editLines(moveLine(lines, from, index));
+                        }}
+                        onDragEnd={() => setDraggingKey(null)}
+                        style={{
+                          paddingBlock: 'var(--spacing-0-5)',
+                          borderRadius: 'var(--radius-inner)',
+                          borderBottom: isLast
+                            ? 'var(--border-width) solid transparent'
+                            : 'var(--border-width) solid var(--color-border)',
+                          background: isActive ? 'var(--color-overlay-hover)' : 'transparent',
+                        }}
+                      >
+                        <VStack
+                          width={LINE_GUTTER_WIDTH}
+                          hAlign="center"
+                          style={{ opacity: isRevealed || isGhost ? 1 : 0.15 }}
+                        >
+                          {isGhost ? (
+                            // The ghost row is not a row you can pick up — it is
+                            // the invitation to start one, so it carries the
+                            // gesture's mark instead of its handle.
+                            <Text color="disabled">+</Text>
+                          ) : (
+                            /* The handle arms the row for a pointer drag and
+                               reorders it from the keyboard, so the same control
+                               works for both. */
+                            <IconButton
+                              label={`Move line ${String(index + 1)}`}
+                              icon={<Icon icon={GripIcon} size="sm" />}
+                              size="sm"
+                              variant="ghost"
+                              onPointerDown={() => setDraggingKey(line.key)}
+                              // A press that never became a drag still has to
+                              // disarm the row: `dragend` only fires for a drag
+                              // that actually happened.
+                              onPointerUp={() => setDraggingKey(null)}
+                              onKeyDown={(event) => {
+                                if (event.key === 'ArrowUp') {
+                                  event.preventDefault();
+                                  editLines(moveLine(lines, index, index - 1));
+                                }
+                                if (event.key === 'ArrowDown') {
+                                  event.preventDefault();
+                                  editLines(moveLine(lines, index, index + 1));
+                                }
+                              }}
+                            />
+                          )}
+                        </VStack>
+                        <StackItem size="fill">
+                          <LineCell
+                            label={`Description, line ${String(index + 1)}`}
+                            value={line.description}
+                            placeholder={isGhost ? 'Add another item…' : 'What was delivered?'}
+                            align="start"
+                            isFocused={cell('description')}
+                            hasError={false}
+                            inputRef={(node) => {
+                              if (node) descriptionInputs.current.set(line.key, node);
+                              else descriptionInputs.current.delete(line.key);
+                            }}
+                            onChange={(value) => updateLine(line.key, { description: value })}
+                            onFocus={onCellFocus('description')}
+                            onBlur={onCellBlur('description')}
+                            onKeyDown={(event) => handleCellKeyDown(event, index, line.description)}
+                          />
+                        </StackItem>
+                        <VStack width={LINE_QTY_WIDTH}>
+                          <LineCell
+                            label={`Quantity, line ${String(index + 1)}`}
+                            value={line.quantity}
+                            align="end"
+                            isFocused={cell('quantity')}
+                            hasError={
+                              !isGhost &&
+                              lineParsed !== undefined &&
+                              (lineParsed.quantityMilli === null || lineParsed.quantityMilli <= 0)
+                            }
+                            inputRef={() => undefined}
+                            onChange={(value) => updateLine(line.key, { quantity: value })}
+                            onFocus={onCellFocus('quantity')}
+                            onBlur={onCellBlur('quantity')}
+                            onKeyDown={(event) => handleCellKeyDown(event, index, line.quantity)}
+                          />
+                        </VStack>
+                        <VStack width={LINE_RATE_WIDTH}>
+                          <LineCell
+                            label={`Rate, line ${String(index + 1)}`}
+                            value={line.unitPrice}
+                            align="end"
+                            isFocused={cell('unitPrice')}
+                            hasError={
+                              !isGhost &&
+                              lineParsed !== undefined &&
+                              lineParsed.unitPriceCents === null
+                            }
+                            inputRef={() => undefined}
+                            onChange={(value) => updateLine(line.key, { unitPrice: value })}
+                            onFocus={onCellFocus('unitPrice')}
+                            onBlur={onCellBlur('unitPrice')}
+                            onKeyDown={(event) => handleCellKeyDown(event, index, line.unitPrice)}
+                          />
+                        </VStack>
+                        <VStack width={LINE_AMOUNT_WIDTH} hAlign="end">
+                          <Text
+                            hasTabularNumbers
+                            color={amount === '—' ? 'secondary' : undefined}
+                          >
+                            {amount}
+                          </Text>
+                        </VStack>
+                        <VStack
+                          width={LINE_GUTTER_WIDTH}
+                          hAlign="center"
+                          style={{ opacity: isRevealed && !isGhost ? 1 : 0.15 }}
+                        >
+                          {isGhost ? null : (
+                            <DropdownMenu
+                              hasChevron={false}
+                              menuWidth={LINE_MENU_WIDTH}
+                              button={{
+                                label: `Line ${String(index + 1)} actions`,
+                                icon: <Icon icon="moreHorizontal" size="sm" />,
+                                isIconOnly: true,
+                                variant: 'ghost',
+                                size: 'sm',
+                              }}
+                              items={[
+                                {
+                                  label: 'Move up',
+                                  isDisabled: index === 0,
+                                  onClick: () => editLines(moveLine(lines, index, index - 1)),
+                                },
+                                {
+                                  label: 'Move down',
+                                  isDisabled: index >= lines.length - 2,
+                                  onClick: () => editLines(moveLine(lines, index, index + 1)),
+                                },
+                                { label: 'Duplicate', onClick: () => editLines(duplicateLineAt(lines, index)) },
+                                { type: 'divider' },
+                                { label: 'Remove', onClick: () => editLines(removeLineAt(lines, index)) },
+                              ]}
+                            />
+                          )}
+                        </VStack>
+                      </HStack>
+                    );
+                  })}
+                </VStack>
+
+                <HStack
+                  gap={2}
+                  vAlign="center"
+                  style={{
+                    paddingTop: 'var(--spacing-1-5)',
+                    borderTop: 'var(--border-width) solid var(--color-border)',
+                  }}
+                >
+                  <StackItem size="fill">
+                    <Text type="supporting" color="secondary">
+                      Blank rows never appear on the invoice.
+                    </Text>
+                  </StackItem>
+                  <Text type="supporting" color="secondary" hasTabularNumbers>
+                    {`${String(items.length)} on the invoice · ${money(totals.totalCents, currency)}`}
+                  </Text>
+                </HStack>
+              </VStack>
+
+              <Divider />
+
+              <VStack gap={2}>
+                <HStack gap={2} vAlign="center">
+                  <StackItem size="fill">
+                    <HStack gap={1} vAlign="center">
+                      <Text type="label" color="secondary">
+                        Notes to customer
+                      </Text>
+                      <Text type="label" color="disabled">
+                        · optional, prints on the invoice
+                      </Text>
+                    </HStack>
+                  </StackItem>
+                  <Text
+                    type="supporting"
+                    color="secondary"
+                    hasTabularNumbers
+                    // Over budget the note still saves — the database allows far
+                    // more — it just stops fitting the printed block, so the
+                    // counter warns rather than the field erroring.
+                    style={
+                      isNotesOverBudget(notes) ? { color: 'var(--color-text-yellow)' } : undefined
+                    }
+                  >
+                    {notesCounter(notes)}
+                  </Text>
+                </HStack>
+                <TextArea
+                  label="Notes to customer"
+                  isLabelHidden
+                  value={notes}
+                  rows={2}
+                  onChange={(value) => {
+                    setIsDirty(true);
+                    setNotes(value);
+                  }}
+                />
+              </VStack>
+
+              <StackItem size="fill" />
+            </VStack>
+          </Card>
+        </StackItem>
+
+        <VStack width={PREVIEW_RAIL_WIDTH}>
+          <Card padding={4} height="100%">
+            <PreviewRail
+              model={documentModel}
+              activeLineKey={activeLineKey}
+              actions={
+                isNew ? (
+                  <>
+                    <StackItem size="fill">
+                      <Button
+                        label="Save draft"
+                        variant="secondary"
+                        width="100%"
+                        isLoading={isSaving}
+                        onClick={() => {
+                          void save('stay');
+                        }}
                       />
                     </StackItem>
-                    <VStack width={QTY_WIDTH}>
-                      <TextInput
-                        label={`Qty ${index + 1}`}
-                        isLabelHidden
-                        value={line.quantity}
-                        status={
-                          lineParsed &&
-                          (lineParsed.quantityMilli === null || lineParsed.quantityMilli <= 0)
-                            ? { type: 'error' }
-                            : undefined
-                        }
-                        onChange={(value) => updateLine(line.key, { quantity: value })}
+                    <StackItem size="fill">
+                      <Button
+                        label="Create invoice"
+                        variant="primary"
+                        width="100%"
+                        isLoading={isSaving}
+                        onClick={() => {
+                          void save('open');
+                        }}
                       />
-                    </VStack>
-                    <VStack width={COST_WIDTH}>
-                      <TextInput
-                        label={`Cost ${index + 1}`}
-                        isLabelHidden
-                        value={line.unitPrice}
-                        status={
-                          lineParsed && lineParsed.unitPriceCents === null
-                            ? { type: 'error' }
-                            : undefined
-                        }
-                        onChange={(value) => updateLine(line.key, { unitPrice: value })}
-                      />
-                    </VStack>
-                    <VStack width={AMOUNT_WIDTH} hAlign="end">
-                      <Text hasTabularNumbers>{amount}</Text>
-                    </VStack>
-                    <HStack gap={0.5} width={ROW_ACTIONS_WIDTH} hAlign="end" vAlign="center">
-                      <IconButton
-                        label={`Move line ${index + 1} up`}
-                        icon={<Icon icon="arrowUp" size="sm" />}
-                        size="sm"
-                        variant="ghost"
-                        isDisabled={index === 0}
-                        onClick={() => moveLine(index, -1)}
-                      />
-                      <IconButton
-                        label={`Move line ${index + 1} down`}
-                        icon={<Icon icon="arrowDown" size="sm" />}
-                        size="sm"
-                        variant="ghost"
-                        isDisabled={index === lines.length - 1}
-                        onClick={() => moveLine(index, 1)}
-                      />
-                      <IconButton
-                        label={`Remove line ${index + 1}`}
-                        icon={<Icon icon="close" size="sm" />}
-                        size="sm"
-                        variant="ghost"
-                        isDisabled={lines.length === 1}
-                        onClick={() => removeLine(line.key)}
-                      />
-                    </HStack>
-                  </HStack>
-                );
-              })}
-
-              <HStack gap={2}>
-                <Button
-                  label="Add item"
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setLines((prev) => [...prev, emptyLine()])}
-                />
-              </HStack>
-            </VStack>
-
-            <Divider />
-
-            <HStack gap={5} justify="end" wrap="wrap">
-              <FieldValue label="Subtotal">
-                <Text type="supporting" hasTabularNumbers>
-                  {money(totals.subtotalCents, currency)}
-                </Text>
-              </FieldValue>
-              <FieldValue label="Tax">
-                <Text type="supporting" hasTabularNumbers>
-                  {money(totals.taxCents, currency)}
-                </Text>
-              </FieldValue>
-              <FieldValue label="Total">
-                <Text weight="semibold" hasTabularNumbers>
-                  {money(totals.totalCents, currency)}
-                </Text>
-              </FieldValue>
-            </HStack>
-
-            <TextArea
-              label="Notes to customer"
-              value={notes}
-              rows={2}
-              isOptional
-              onChange={setNotes}
+                    </StackItem>
+                  </>
+                ) : (
+                  <StackItem size="fill">
+                    <Button
+                      label="Save changes"
+                      variant="primary"
+                      width="100%"
+                      isLoading={isSaving}
+                      onClick={() => {
+                        void save('stay');
+                      }}
+                    />
+                  </StackItem>
+                )
+              }
             />
-
-            {/* Takes up whatever height the stretched column has spare, so the
-                action row settles at the bottom of the card. */}
-            <StackItem size="fill" />
-            <Divider />
-            <HStack gap={2} justify="end">
-              <Button
-                label={isNew ? 'Create invoice' : 'Save changes'}
-                variant="primary"
-                isLoading={isSaving}
-                onClick={() => {
-                  void save();
-                }}
-              />
-            </HStack>
-          </VStack>
-        </Card>
-
-        <Card padding={4} height="100%">
-          <VStack gap={3} height="100%">
-            <Heading level={2}>Preview</Heading>
-            {/* The sheet's height is deterministic, so the row it is in is at
-                least as tall as it needs — but the region scrolls anyway rather
-                than let a taller sheet spill out of the card. */}
-            <StackItem size="fill" isScrollable>
-              <Section variant="muted" padding={4}>
-                <PaperPreview model={documentModel} />
-              </Section>
-            </StackItem>
-          </VStack>
-        </Card>
-      </Grid>
+          </Card>
+        </VStack>
+      </HStack>
 
       {clientDialog ? (
         <ClientForm

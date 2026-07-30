@@ -12,10 +12,42 @@ import { computeTotals } from '../../src/domain/invoices/totals';
 import { listItems, listInvoices } from '../../src/domain/invoices/repository';
 import { summary } from '../../src/domain/reports/queries';
 import { SETTINGS_KEYS } from '../../src/shared/types';
-import { isEmpty, reset, seed } from '../seed';
+import { isEmpty, reset, seed, stampsFor } from '../seed';
 
 /** A fixed "today" so the generated dates do not depend on the wall clock. */
 const REFERENCE = new Date('2026-07-27T12:00:00.000Z');
+const REFERENCE_DAY = REFERENCE.toISOString().slice(0, 10);
+const MS_PER_DAY = 86_400_000;
+
+/** Whole days between a stored calendar day and the reference date. */
+function daysBefore(day: string): number {
+  return Math.round((Date.parse(`${REFERENCE_DAY}T00:00:00Z`) - Date.parse(`${day}T00:00:00Z`)) / MS_PER_DAY);
+}
+
+interface StampRow {
+  readonly number: string;
+  readonly status: string;
+  readonly issueDate: string;
+  readonly created: string;
+  readonly updated: string;
+  readonly paid: string | null;
+}
+
+/**
+ * The three timestamps as calendar days. Sliced in SQL rather than parsed,
+ * because `calendarDateOf` in the renderer is a `slice(0, 10)` too — comparing
+ * anything else would be comparing something the list never shows.
+ */
+function stampRows(db: Db): StampRow[] {
+  return db
+    .prepare<[], StampRow>(
+      `SELECT number, status, issue_date AS issueDate, substr(created_at, 1, 10) AS created,
+              substr(updated_at, 1, 10) AS updated, substr(paid_at, 1, 10) AS paid
+         FROM invoices ORDER BY number`,
+    )
+    .all()
+    .map((row) => ({ ...row, paid: row.paid ?? null }));
+}
 
 /** What the seed is contracted to produce. Change these when the seed changes. */
 const EXPECTED_CLIENTS = 10;
@@ -46,8 +78,11 @@ function counts(db: Db): { clients: number; invoices: number; items: number; set
 }
 
 /**
- * Everything about the seeded data except the values that are allowed to differ
- * between two runs: row ids and creation timestamps.
+ * Everything about the seeded data except the one value that is allowed to
+ * differ between two runs: the row id. The timestamps are in here on purpose —
+ * they are derived from the reference date now, not from the wall clock, and a
+ * seed that went back to stamping them with `new Date()` has to fail a test
+ * rather than quietly make every draft say it was edited today.
  */
 interface Fingerprint {
   readonly clients: readonly string[];
@@ -66,7 +101,8 @@ function fingerprint(db: Db): Fingerprint {
     invoices: db
       .prepare<[], Record<string, unknown>>(
         `SELECT i.number, c.name AS client, i.status, i.issue_date, i.due_date, i.currency,
-                i.tax_rate_bps, i.subtotal_cents, i.tax_cents, i.total_cents
+                i.tax_rate_bps, i.subtotal_cents, i.tax_cents, i.total_cents,
+                i.created_at, i.updated_at, i.paid_at
          FROM invoices i JOIN clients c ON c.id = i.client_id
          ORDER BY i.number`,
       )
@@ -310,6 +346,93 @@ describe('seed', () => {
     }
 
     db.close();
+  });
+
+  it('stamps every row from its own dates, and keeps the three of them coherent', () => {
+    const db = freshDb();
+    seed(db, REFERENCE);
+
+    for (const row of stampRows(db)) {
+      // Raised on the day it was issued.
+      expect(row.created, row.number).toBe(row.issueDate);
+      // Nothing moved before it existed, and nothing moved in the future.
+      expect(row.updated >= row.created, `${row.number} updated`).toBe(true);
+      expect(row.updated <= REFERENCE_DAY, `${row.number} updated`).toBe(true);
+
+      if (row.status !== 'paid') {
+        expect(row.paid, row.number).toBeNull();
+        continue;
+      }
+      expect(row.paid, row.number).not.toBeNull();
+      expect(row.paid! >= row.issueDate, `${row.number} paid`).toBe(true);
+      expect(row.paid! <= REFERENCE_DAY, `${row.number} paid`).toBe(true);
+      // Payment is the last thing that happens to a paid invoice.
+      expect(row.updated, row.number).toBe(row.paid);
+    }
+
+    db.close();
+  });
+
+  it('spreads the timings each group prints, instead of repeating one date', () => {
+    const db = freshDb();
+    seed(db, REFERENCE);
+    const rows = stampRows(db);
+
+    /*
+      The list's second line is a relative time — `edited 25 Jul`, `paid 24 Jul`
+      — so the fixture is only worth screenshotting if those differ down a
+      group. A seed that stamped `updated_at` at seed time would print the same
+      sentence on all ten drafts, which is the regression this guards.
+    */
+    const drafts = rows.filter((row) => row.status === 'draft').map((row) => daysBefore(row.updated));
+    expect(drafts).toHaveLength(EXPECTED_STATUS_COUNTS.draft ?? 0);
+    expect(new Set(drafts).size).toBe(drafts.length);
+    expect(Math.min(...drafts)).toBeLessThanOrEqual(1); // one edited today or yesterday
+    expect(Math.max(...drafts)).toBeGreaterThanOrEqual(120); // and one gone stale
+
+    const paid = rows
+      .filter((row) => row.status === 'paid')
+      .map((row) => daysBefore(row.paid ?? row.updated));
+    expect(paid).toHaveLength(EXPECTED_STATUS_COUNTS.paid ?? 0);
+    expect(new Set(paid).size).toBeGreaterThanOrEqual(paid.length - 4);
+    expect(Math.min(...paid)).toBeLessThanOrEqual(7); // settled this week
+    expect(Math.max(...paid)).toBeGreaterThanOrEqual(200); // and settled last year
+
+    const voided = rows.filter((row) => row.status === 'void').map((row) => daysBefore(row.updated));
+    expect(new Set(voided).size).toBe(voided.length);
+
+    db.close();
+  });
+
+  it('stampsFor clamps a wish that would land before issue or after today', () => {
+    const base = { client: 0, netDays: 30, items: [] } as const;
+
+    // Paid on terms the invoice is not old enough for: paid early, today, not
+    // in the future.
+    const early = stampsFor({ ...base, status: 'paid', issuedDaysAgo: 4 }, REFERENCE);
+    expect(early.paidAt?.slice(0, 10)).toBe(REFERENCE_DAY);
+    expect(early.updatedAt).toBe(early.paidAt);
+
+    // Paid on terms, the ordinary case.
+    const onTerms = stampsFor(
+      { ...base, status: 'paid', issuedDaysAgo: 100, paidAfterDays: 37 },
+      REFERENCE,
+    );
+    expect(daysBefore(onTerms.paidAt?.slice(0, 10) ?? '')).toBe(63);
+
+    // Edited longer ago than the invoice has existed: edited on the day it was
+    // raised, never before it.
+    const draft = stampsFor(
+      { ...base, status: 'draft', issuedDaysAgo: 6, editedDaysAgo: 40 },
+      REFERENCE,
+    );
+    expect(draft.updatedAt.slice(0, 10)).toBe(draft.createdAt.slice(0, 10));
+    expect(draft.paidAt).toBeNull();
+
+    // A state whose row prints a due date keeps the day it was raised.
+    const sent = stampsFor({ ...base, status: 'sent', issuedDaysAgo: 20 }, REFERENCE);
+    expect(sent.updatedAt).toBe(sent.createdAt);
+    expect(sent.paidAt).toBeNull();
   });
 
   it('stores totals the real domain arithmetic produces, not hand-written ones', () => {
