@@ -2018,7 +2018,117 @@ async function main() {
     const afterLabel = await stripScroll(labelPage);
     check('the delayed number does arrive on the active tab', await activeTabName(labelPage), lateNumber);
     check('a label arriving late does not undo the user’s manual scroll', afterLabel?.scrollLeft, 0);
+
+    /*
+      The third ordering, and the one the ownership rule first got wrong: the
+      *strip* moves the scroll between the pill parking and its number arriving.
+
+      A resize is not the user scrolling. The observer used to call
+      `scrollIntoView` without re-parking, so the pill then read a `scrollLeft` it
+      did not recognise, assumed the user had taken over, and refused the
+      correction — leaving the active pill 11.94px past the scroller's edge and its
+      close control 3.94px past, with the number already painted.
+    */
+    await labelPage.evaluate(() => {
+      window.__delayInvoiceLabels = true;
+    });
+    await openInvoiceFromList(labelPage, 9);
+    const resizeNumber = expected.numbersInOrder[9];
+    checkTrue(
+      'a tenth tab is active and still holding the placeholder',
+      (await activeTabName(labelPage)) !== resizeNumber,
+      `active: ${JSON.stringify(await activeTabName(labelPage))}, awaited number: ${resizeNumber}`,
+    );
+    /*
+      The strip scrolls itself — not the user — after the pill has parked. 1000px
+      and not 1600: the clipping only exists while the pill is *flush* with the
+      scroller's edge, and at 1600px ten pills stop overflowing altogether, so the
+      pill gains slack and the 12px it is about to grow by costs nothing. The
+      resize has to leave the strip still overflowing to reproduce anything.
+    */
+    await labelPage.setViewportSize({ width: 1000, height: 960 });
+    await labelPage.waitForTimeout(400);
+    await labelPage.waitForTimeout(2600);
+    const afterResizeLabel = await plusReach(labelPage);
+    check(
+      'the number arrives on the tab opened before the resize',
+      await activeTabName(labelPage),
+      resizeNumber,
+    );
+    checkTrue(
+      'a resize between parking and the label still leaves the active pill in view',
+      afterResizeLabel !== null && afterResizeLabel.activePillVisible === true,
+      JSON.stringify(afterResizeLabel),
+    );
     await labelPage.close();
+
+    /*
+      A close must not reach across the app for focus it never had.
+
+      The handoff exists because closing destroys the button that had focus and
+      the browser drops the user on `<body>`. Dispatched while the user is typing
+      in the invoices search box it destroys nothing they hold, so taking focus
+      there pulls the caret out of a text field mid-word. The late `rAF` branch
+      always guarded this; the immediate one did not.
+    */
+    const focusPage = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    focusPage.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    await focusPage.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    for (let index = 0; index < 3; index++) await openInvoiceFromList(focusPage, index);
+    await focusPage.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    const search = focusPage.getByRole('textbox', { name: 'Search' }).first();
+    await search.waitFor({ timeout: 15_000 });
+    await search.click();
+    await search.type('typing survives close');
+    const closeFirst = (await tabNames(focusPage))[0];
+    await focusPage
+      .getByRole('button', { name: `Close invoice ${closeFirst}`, exact: true })
+      .first()
+      .dispatchEvent('click');
+    await focusPage.waitForTimeout(120);
+    const focusEarly = await focusPage.evaluate(() => document.activeElement?.tagName ?? null);
+    await focusPage.waitForTimeout(700);
+    const focusLate = await focusPage.evaluate(() => ({
+      tag: document.activeElement?.tagName ?? null,
+      value: document.activeElement instanceof HTMLInputElement ? document.activeElement.value : null,
+      inStrip: document.activeElement?.closest('.app-invoice-tabs') !== null,
+    }));
+    checkTrue(
+      'a close while the user is typing leaves focus in the search box',
+      focusEarly === 'INPUT' && focusLate.tag === 'INPUT' && focusLate.inStrip === false,
+      `at 120ms: ${focusEarly}, at 820ms: ${JSON.stringify(focusLate)}`,
+    );
+    check('the caret keeps what the user had typed', focusLate.value, 'typing survives close');
+    checkTrue(
+      'and the tab really did close',
+      !(await tabNames(focusPage)).includes(closeFirst),
+      `closed: ${closeFirst}, tabs: ${JSON.stringify(await tabNames(focusPage))}`,
+    );
+    /*
+      The other half of the same rule: when the strip *did* own the focus, closing
+      with the keyboard must still hand it to the neighbour rather than `<body>`.
+      Guarding the handoff must not disable it.
+    */
+    const keyboardTarget = (await tabNames(focusPage))[0];
+    await focusPage
+      .getByRole('button', { name: `Close invoice ${keyboardTarget}`, exact: true })
+      .first()
+      .focus();
+    await focusPage.keyboard.press('Enter');
+    await focusPage.waitForTimeout(700);
+    const handoff = await focusPage.evaluate(() => ({
+      tag: document.activeElement?.tagName ?? null,
+      name: document.activeElement?.textContent?.trim() ?? null,
+      inStrip: document.activeElement?.closest('.app-invoice-tabs') !== null,
+    }));
+    checkTrue(
+      'closing from the strip still hands focus to the surviving neighbour',
+      handoff.inStrip === true && handoff.tag === 'BUTTON',
+      JSON.stringify(handoff),
+    );
+    await focusPage.close();
 
     // --- ten tabs, two widths: the + stays reachable -----------------------
     // The old version of this gate asserted only `scrollWidth === clientWidth`
