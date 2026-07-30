@@ -64,9 +64,12 @@ const RELEASE_COMMIT_RE = /^chore\(release\):/i;
 //   1. the marker appears anywhere in the SUBJECT line;
 //   2. a BODY line whose ENTIRE content is the marker, allowing an optional
 //      leading list bullet (`-`, `*`, `+`), surrounding whitespace and one
-//      trailing punctuation character — `[skip release]`, `- [skip release]`,
+//      trailing sentence-punctuation character — exactly `.` `,` `;` `:` `!`,
+//      and nothing else — `[skip release]`, `- [skip release]`,
 //      `[skip release].`. Checked on lines that survived fence and blockquote
-//      stripping.
+//      stripping. `?` is deliberately NOT in that set: `[skip release]?` reads
+//      as a question ABOUT the marker, not an instruction to use it, and the
+//      narrower set is the direction every round here has settled on.
 //
 // Nothing else opts out — `Please [skip release] for this commit.` does NOT.
 // That is a DELIBERATE NARROWING, not an oversight: do not widen it back. Two
@@ -105,14 +108,28 @@ const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[skip release\][ \t]*[
 const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
 
 // A line that opens or closes a fenced code block: a run of at least three
-// backticks or tildes, indented up to three spaces (CommonMark's limit).
-// Group 1 is the run; group 2 is the rest of the line (the info string on an
-// opener). The run LENGTH is captured, not just its first three characters:
-// round 2 looked at `(```|~~~)` only, so it could not tell a four-backtick
-// fence from a three-backtick one and it read a long inline code span as a
-// fence. CommonMark's rule is the simplest correct one and it is what this
-// implements — see scanBody.
-const FENCE_RE = /^ {0,3}((?:`{3,})|(?:~{3,}))(.*)$/;
+// backticks or tildes, optionally preceded by a LIST-ITEM MARKER and by up to
+// three spaces of indent on either side of it. Group 1 is everything before the
+// run (its indent, list marker included), group 2 is the run, group 3 is the
+// rest of the line (the info string on an opener). The run LENGTH is captured,
+// not just its first three characters: round 2 looked at `(```|~~~)` only, so it
+// could not tell a four-backtick fence from a three-backtick one and it read a
+// long inline code span as a fence. CommonMark's rule is the simplest correct
+// one and it is what this implements — see scanBody.
+//
+// WHY THE LIST MARKER IS HERE (round 5). Without it, `- ```text` was not an
+// opener at all, and both directions of that were wrong: a `[skip release]`
+// written inside the bullet's code block opted the commit out (a release the
+// author needed silently never happening), and, worse, the block's indented
+// closing ``` was then read as a NEW opener, so a genuine `BREAKING CHANGE:`
+// footer after the bullet was swallowed as fenced content and the wrong version
+// was cut (measured: `patch` where `minor`/`major` was correct).
+const FENCE_RE = /^( {0,3}(?:(?:[-*+]|\d{1,9}[.)]) {1,4})? {0,3})((?:`{3,})|(?:~{3,}))(.*)$/;
+
+// What a CLOSING fence's prefix may be: indent only. A closer carries no list
+// marker of its own — inside a list item it sits on the bullet's continuation
+// indent — so `- ``` ` can open a fence but never close one.
+const CLOSER_PREFIX_RE = /^ *$/;
 
 // A blockquote line: `>` after at most three spaces of indent.
 const BLOCKQUOTE_RE = /^ {0,3}>/;
@@ -158,30 +175,53 @@ type ScannedLine = {
 //     opener. Round 2 opened a fence on it and swallowed the genuine breaking
 //     footer that followed — the worse failure of the two, because post-1.0 it
 //     silently under-releases a breaking change.
+//   - a fence can live inside a LIST ITEM (round 5): `- ```text` opens, and the
+//     closer that follows carries the bullet's continuation indent rather than
+//     starting at column 0. Indent is therefore tracked on the opener and the
+//     closer is judged RELATIVE to it (CommonMark allows a closer up to three
+//     spaces further in).
+//
+// WHERE THE LIST SUPPORT STOPS, deliberately. This is NOT a CommonMark list
+// parser and must not grow into one. What is handled: at most one list marker
+// (`-`, `*`, `+`, or an ordered `1.` / `1)`) plus its whitespace directly before
+// an opening fence, and a closer indented anywhere from column 0 to the
+// opener's own indent + 3. What is NOT handled: nested/multi-level list markers
+// (`- - ```), a fence separated from its bullet by intervening lines, tab-based
+// indentation measured as tab stops (a tab counts as one column here), and
+// lazy-continuation subtleties — including the strict-CommonMark reading in
+// which a closer dedented out of the list item leaves the fence UNCLOSED. Being
+// lenient about a dedented closer is the cautious direction for this module in
+// only one respect (it ends the fence rather than swallowing the whole message),
+// so it is a judgement call, not a correctness claim: a human reading a bullet
+// with a fence in it sees the next ``` as the close, and that is the bar here.
 function scanBody(message: string): ScannedLine[] {
   const [subject = ''] = message.split('\n');
   const lines = message.slice(subject.length).split('\n');
 
   const scanned: ScannedLine[] = [];
-  let open: { char: string; length: number } | null = null;
+  let open: { char: string; length: number; indent: number } | null = null;
   for (const line of lines) {
     const match = FENCE_RE.exec(line);
-    const run = match?.[1];
-    const rest = match?.[2] ?? '';
+    const prefix = match?.[1] ?? '';
+    const run = match?.[2];
+    const rest = match?.[3] ?? '';
     if (open !== null) {
-      // Inside a fence: same character, at least as long, nothing but
-      // whitespace after it.
+      // Inside a fence: same character, at least as long, no list marker of its
+      // own, indented no more than three columns past the opener, nothing but
+      // whitespace after the run.
       const closes =
         run !== undefined &&
         run[0] === open.char &&
         run.length >= open.length &&
+        CLOSER_PREFIX_RE.test(prefix) &&
+        prefix.length <= open.indent + 3 &&
         rest.trim() === '';
       if (closes) open = null;
       scanned.push({ text: line, fenced: true, opensFence: false, quoted: false });
       continue;
     }
     if (run !== undefined && !(run[0] === '`' && rest.includes('`'))) {
-      open = { char: run[0] as string, length: run.length };
+      open = { char: run[0] as string, length: run.length, indent: prefix.length };
       scanned.push({ text: line, fenced: true, opensFence: true, quoted: false });
       continue;
     }

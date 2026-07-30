@@ -275,6 +275,41 @@ BREAKING CHANGE: invoice.total is now invoice.amountTotal.`;
       expect(resolveReleaseBump('1.2.3', [footerAfterFence])).toBe('major');
     });
 
+    it('recognizes a fence inside a list item, and its indented closer', () => {
+      // ROUND 5, the merge blocker. `- ```text` was not read as an opener, so
+      // the block's indented closing ``` became a NEW opener and the genuine
+      // footer below it was swallowed as fenced content (measured: `patch` at
+      // both 0.1.7 and 1.2.3, where minor/major is correct).
+      const bulletFence = `fix: change API
+
+- \`\`\`text
+  oldCall()
+  \`\`\`
+
+BREAKING CHANGE: oldCall was removed.`;
+      expect(resolveReleaseBump('0.1.7', [bulletFence])).toBe('minor');
+      expect(resolveReleaseBump('1.2.3', [bulletFence])).toBe('major');
+      // Every bullet form, ordered ones included, and a closer that sits on the
+      // bullet's continuation indent rather than at column 0.
+      for (const marker of ['-', '*', '+', '1.', '1)']) {
+        const message = `fix: change API
+
+${marker} \`\`\`text
+  BREAKING CHANGE: example only, inside the bullet's fence
+  \`\`\`
+
+BREAKING CHANGE: oldCall was removed.`;
+        expect(resolveReleaseBump('1.2.3', [message])).toBe('major');
+      }
+      // ...and the fenced content still cannot force a bump on its own.
+      const onlyFenced = `fix: change API
+
+- \`\`\`text
+  BREAKING CHANGE: example only
+  \`\`\``;
+      expect(resolveReleaseBump('1.2.3', [onlyFenced])).toBe('patch');
+    });
+
     it('keeps an unterminated fence swallowing everything after it', () => {
       const unterminated = `fix(api): document parser
 
@@ -434,6 +469,32 @@ YAML parsed with js-yaml.`;
       const quoted = `${FIX}\n\n> [skip release]`;
       expect(resolveReleaseBump('0.1.7', [fenced])).toBe('patch');
       expect(resolveReleaseBump('0.1.7', [quoted])).toBe('patch');
+    });
+
+    it('does not fire on a marker inside a bullet-indented fence', () => {
+      // ROUND 5. `- ```text` was not read as an opener, so the marker inside
+      // the bullet's code block opted the commit out and the release the author
+      // needed silently never happened. Ordered bullets included.
+      for (const marker of ['-', '*', '+', '1.', '1)']) {
+        const message = `${FIX}
+
+${marker} \`\`\`text
+  [skip release]
+  \`\`\``;
+        expect(resolveReleaseBump('0.1.7', [message])).toBe('patch');
+      }
+    });
+
+    it('does not fire on the marker followed by a question mark', () => {
+      // The trailing-punctuation set is exactly `.` `,` `;` `:` `!`. `?` is not
+      // in it: a line reading `[skip release]?` is a question about the marker,
+      // not a use of it. Pinned so the comment and the regex cannot drift.
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n[skip release]?`])).toBe('patch');
+      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n- [skip release]?`])).toBe('patch');
+      // ...while all five accepted characters still opt out.
+      for (const punctuation of ['.', ',', ';', ':', '!']) {
+        expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n[skip release]${punctuation}`])).toBe('none');
+      }
     });
   });
 

@@ -31,12 +31,13 @@
 # docs/chore/ci/test/style/build contributes nothing to the bump, and so does a
 # commit carrying `[skip release]` in one of exactly two forms: anywhere in its
 # SUBJECT line, or on a BODY line whose entire content is the marker (an
-# optional `-`/`*`/`+` bullet, surrounding whitespace and one trailing
-# punctuation character allowed). Nothing else opts out — the marker mentioned
-# in prose, backticked, or inside a fence or blockquote does not, whatever the
-# line wrapping. If EVERY commit in the range since the last tag contributes
-# nothing, the range resolves to `none` and the run ends green with nothing
-# pushed.
+# optional `-`/`*`/`+` bullet, surrounding whitespace and one trailing `.` `,`
+# `;` `:` or `!` allowed — no other punctuation, so `[skip release]?` does not
+# opt out). Nothing else opts out — the marker mentioned in prose, backticked,
+# or inside a fence (bullet-indented fences included) or a blockquote does not,
+# whatever the line wrapping. If EVERY commit in the range since the last tag
+# contributes nothing, the range resolves to `none` and the run ends green with
+# nothing pushed.
 #
 # PRECEDENCE: breaking beats the non-contributing list. The types above are
 # non-contributing only in the absence of a breaking marker — `chore!: drop
@@ -149,9 +150,12 @@ jobs:
       #
       # fetch-depth: 0 (the default is a single commit) because the push path
       # walks history: it needs every v* tag to find the last release, and every
-      # commit after it to read the subjects. A shallow clone has neither, and
-      # would silently resolve the whole range as "no tag found" — releasing off
-      # the entire history instead of the last cycle.
+      # commit after it to read the subjects. A depth-1 clone has neither, so
+      # `git describe` finds no tag and the range falls back to `HEAD` — which
+      # in that clone is exactly ONE commit. Measured on a depth-1 replay: the
+      # resolver sees the head commit only, so every earlier unreleased commit
+      # in the cycle is invisible and the bump is decided by whatever landed
+      # last (a `docs` head hides an unreleased `feat` behind it: `none`).
       - uses: actions/checkout@v4
         with:
           ref: main
