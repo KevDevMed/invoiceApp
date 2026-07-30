@@ -240,9 +240,37 @@ describe('DepartingTabs', () => {
     */
     const queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
     expect(settleDepartures(queued, '/invoices/a/edit')).toBe(NO_DEPARTING_TABS);
-    // A route that names nobody departing changes nothing either way.
-    expect(settleDepartures(queued, '/settings')).toBe(queued);
-    expect(settleDepartures(queued, '/invoices/zz')).toBe(queued);
+  });
+
+  it('gives way to a winning navigation that names no tab at all', () => {
+    /*
+      The same rule, and the hole the "names a departing tab" version left: the
+      close asks for `/invoices/b`, something else in the task asks for
+      `/settings` and wins, so `/invoices/b` never arrives. `/settings` names no
+      tab, so nothing released the set — `a` stayed suppressed for the life of the
+      window, and the user could sit on invoice A's page with no A pill and
+      re-open A as often as they liked without a pill ever appearing.
+
+      There is nothing of this task's left to wait for either way, so what the
+      winner points at cannot matter: a route this task never queued settles it.
+    */
+    const queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    expect(settleDepartures(queued, '/settings')).toBe(NO_DEPARTING_TABS);
+    expect(settleDepartures(queued, '/invoices/zz')).toBe(NO_DEPARTING_TABS);
+    expect(settleDepartures(queued, INVOICES_ROUTE)).toBe(NO_DEPARTING_TABS);
+  });
+
+  it('keeps waiting while the router works through this task’s own routes', () => {
+    // The settle route is in `routes` too (`recordNavigation` puts it there), so
+    // the order of the two exits matters: an arrival at `/invoices/c` releases
+    // because it is the finishing line, not because it is unqueued.
+    const queued = recordNavigation(
+      recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b'),
+      '/invoices/c',
+    );
+    expect(settleDepartures(queued, '/invoices/a')).toBe(queued);
+    expect(settleDepartures(queued, '/invoices/b')).toBe(queued);
+    expect(settleDepartures(queued, '/invoices/c')).toBe(NO_DEPARTING_TABS);
   });
 });
 
@@ -371,6 +399,34 @@ describe('closes in one browser task', () => {
       tabs: ['a', 'b'],
       route: '/invoices/a',
     });
+  });
+
+  it('re-opens a closed invoice after an unrelated route won the close’s navigation', () => {
+    /*
+      Tabs [a, b] on `/invoices/a`. Closing `a` asks for `/invoices/b`, and before
+      the router commits it something else in the same task asks for `/settings`
+      and wins — `/invoices/b` never arrives. Measured before the fix: `a` stayed
+      queued as departing on every render that followed, so the user sat on
+      `/invoices/a` with no A pill and re-opening A did nothing, for the life of
+      the window (only the abandoned `/invoices/b` or a reload recovered).
+    */
+    let departing = recordDeparture(
+      NO_DEPARTING_TABS,
+      'a',
+      ['/invoices/a', '/invoices/b'],
+      '/invoices/b',
+    );
+    let tabs = removeTab(['a', 'b'], 'a');
+    expect(tabs).toEqual(['b']);
+
+    // Renders: the batch's stale route, then the winner, then the user's own later
+    // navigations — each its own task, long after `/invoices/b` stopped coming.
+    for (const committed of ['/invoices/a', '/settings', INVOICES_ROUTE, '/invoices/a']) {
+      departing = settleDepartures(departing, committed);
+      tabs = syncTabs(tabs, committed, departing);
+    }
+    expect(departing.ids).toEqual([]);
+    expect(tabs).toEqual(['b', 'a']);
   });
 
   it('ignores repeat clicks on a stale close control', () => {

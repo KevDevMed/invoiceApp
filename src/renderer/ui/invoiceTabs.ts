@@ -142,9 +142,9 @@ export function openTabForPath(
  * followed by an explicit `/invoices/:id/edit` in one task, where `settleRoute`
  * never arrives). Without a way out the suppression would hold for the life of
  * the window and that invoice could never have a pill again. So a committed route
- * that names a departing tab and is *not* in this list is a navigation that won:
- * the departures are dropped and the sync re-opens the tab, which is what the
- * route asked for.
+ * that is *not* in this list is a navigation that won, whatever it points at: the
+ * departures are dropped, and the sync then does what that route asks — re-open
+ * the tab when the winner names one, nothing when it names none.
  */
 export interface DepartingTabs {
   /** Tabs closed in this browser task, until the router reports `settleRoute`. */
@@ -206,19 +206,31 @@ export function recordNavigation(departing: DepartingTabs, settleRoute: string):
 /**
  * The queued departures, dropped once this task's navigations are accounted for.
  *
- * Two ways out: the router reached the route the strip is heading for, or it
- * landed on a departing tab's route that this task never asked for — a navigation
- * from somewhere else, which wins. Returns the *same object* while there is still
- * something to wait for, so the caller can write the result back unconditionally
- * without looping.
+ * One rule: the departures are waiting for the router to catch up with *this
+ * task's* navigations, so they are released the moment there is nothing of this
+ * task's left to wait for.
+ *
+ * - The router reported `settleRoute`: every queued navigation has landed, the
+ *   render-derived route is authoritative again, and the set goes. Checked first,
+ *   because `recordNavigation` also puts `settleRoute` into `routes`, so a settle
+ *   arrival is a *queued* route and must not be read as an outside one.
+ * - The router reported a route this task never queued: somebody else navigated
+ *   and won, `settleRoute` is never coming, and there is nothing left to wait for
+ *   either. This is why the suppression cannot outlive the window — it covers the
+ *   measured case (a close followed by an explicit `/invoices/:id/edit` in one
+ *   task, where the winner names a departing tab) and equally a winner that names
+ *   no tab at all, like `/settings`, which used to wedge the set forever and left
+ *   the closed invoice unable to ever get a pill again.
+ * - Anything else is one of this task's own queued routes, still being worked
+ *   through: keep waiting.
+ *
+ * Returns the *same object* while there is still something to wait for, so the
+ * caller can write the result back unconditionally without looping.
  */
 export function settleDepartures(departing: DepartingTabs, pathname: string): DepartingTabs {
   if (departing.ids.length === 0) return departing;
   if (pathname === departing.settleRoute) return NO_DEPARTING_TABS;
-  const id = tabIdForPath(pathname);
-  if (id !== null && departing.ids.includes(id) && !departing.routes.includes(pathname)) {
-    return NO_DEPARTING_TABS;
-  }
+  if (!departing.routes.includes(pathname)) return NO_DEPARTING_TABS;
   return departing;
 }
 
