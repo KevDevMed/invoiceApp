@@ -107,27 +107,153 @@ export function openTabForPath(
 }
 
 /**
- * The tab list after a render, given a close that is still in flight.
+ * The closes the router has not caught up with yet.
  *
- * `openTabForPath` alone is not enough, and the bug it hides is worth naming.
- * Closing the active tab does two things — drop the tab, navigate away — and the
- * router reports the new route one render *later* than the shorter list. On that
- * intermediate render the route still points at the tab that was just closed, so
- * a plain sync re-appends it: close the active tab and it comes straight back,
- * at the end of the strip.
+ * ## Why this is a set of ids and not one pathname
  *
- * `closingPathname` is the route being left. While the router still reports it,
- * the list is left exactly as it is. Any other route — including the one the
- * close navigated to — syncs normally, so a genuinely re-opened invoice still
- * gets its tab back.
+ * Closing a tab does two things — drop the tab, navigate away — and the router
+ * reports the new route one render *later* than the shorter list. Measured, with
+ * three closes dispatched in one browser task: the first render after the batch
+ * carries the *final* tab list and the *original* pathname. A plain sync on that
+ * render re-appends the tab the first close dropped, which is exactly the "close
+ * the active tab and it comes straight back" bug — one render late and at the end
+ * of the strip.
+ *
+ * One scalar "the pathname being left" cannot describe that render. N closes in
+ * one task queue N departures, the batched writes collapse to the last one, and
+ * the render that needs suppressing is the *first* departure's route. So the
+ * suppression is keyed by *tab id*: `syncTabs` only ever appends
+ * `tabIdForPath(pathname)`, so the only question it has to answer is "is this a
+ * tab the user has just closed and the router has not caught up with", and every
+ * queued close can answer it at once.
+ *
+ * `settleRoute` is the last route the strip navigated to. It is what says *when*
+ * the departures are done: once the router reports that route, every queued
+ * navigation has landed, the render-derived route is authoritative again, and the
+ * whole set is dropped — so navigating back to a closed invoice re-opens its tab
+ * as it should. The invariant is that `ids` is only ever non-empty alongside a
+ * non-null `settleRoute`; a close with no navigation of any kind in flight needs
+ * no suppression at all, because the route it syncs against is already committed.
+ *
+ * `routes` is every route this task is accounted for — the ones the strip asked
+ * for, and the one it was leaving. It is the escape hatch, and it is not
+ * theoretical: something else can navigate in the same task and overwrite the
+ * strip's own `navigate` before the router ever commits it (measured: a close
+ * followed by an explicit `/invoices/:id/edit` in one task, where `settleRoute`
+ * never arrives). Without a way out the suppression would hold for the life of
+ * the window and that invoice could never have a pill again. So a committed route
+ * that names a departing tab and is *not* in this list is a navigation that won:
+ * the departures are dropped and the sync re-opens the tab, which is what the
+ * route asked for.
+ */
+export interface DepartingTabs {
+  /** Tabs closed in this browser task, until the router reports `settleRoute`. */
+  readonly ids: readonly string[];
+  /** Every route this task explains: where it was, and where it asked to go. */
+  readonly routes: readonly string[];
+  /** The last route the strip navigated to, or `null` with nothing in flight. */
+  readonly settleRoute: string | null;
+}
+
+/** Nothing in flight: the render-derived route is authoritative. */
+export const NO_DEPARTING_TABS: DepartingTabs = { ids: [], routes: [], settleRoute: null };
+
+function withRoutes(routes: readonly string[], added: readonly string[]): readonly string[] {
+  const fresh = added.filter((route) => !routes.includes(route));
+  return fresh.length === 0 ? routes : [...routes, ...fresh];
+}
+
+/**
+ * One more queued close.
+ *
+ * `settleRoute` is where the router is now headed — this close's own destination
+ * when it navigates, else the navigation an earlier action in the same task
+ * already queued. `null` for both means nothing is in flight and there is
+ * nothing to suppress, so the set is left empty rather than growing an id that
+ * would never be released.
+ *
+ * `accounted` is every route this task explains at the moment of the close: the
+ * route it is leaving — the one the first render after the batch still reports, so
+ * it must never be mistaken for an outside navigation — plus every route the strip
+ * has queued so far, including the ones queued before this close.
+ */
+export function recordDeparture(
+  departing: DepartingTabs,
+  id: string,
+  accounted: readonly string[],
+  settleRoute: string | null,
+): DepartingTabs {
+  if (settleRoute === null) return departing;
+  const routes = withRoutes(departing.routes, [...accounted, settleRoute]);
+  if (departing.ids.includes(id)) return { ids: departing.ids, routes, settleRoute };
+  return { ids: [...departing.ids, id], routes, settleRoute };
+}
+
+/**
+ * A navigation that is not a close — a pill click, or the `+`.
+ *
+ * It still moves the finishing line: the user's newest destination is the route
+ * the queued departures have to wait for. With nothing departing there is
+ * nothing to wait for, and the same object comes back so no render is spent.
+ */
+export function recordNavigation(departing: DepartingTabs, settleRoute: string): DepartingTabs {
+  if (departing.ids.length === 0) return departing;
+  const routes = withRoutes(departing.routes, [settleRoute]);
+  if (departing.settleRoute === settleRoute && routes === departing.routes) return departing;
+  return { ids: departing.ids, routes, settleRoute };
+}
+
+/**
+ * The queued departures, dropped once this task's navigations are accounted for.
+ *
+ * Two ways out: the router reached the route the strip is heading for, or it
+ * landed on a departing tab's route that this task never asked for — a navigation
+ * from somewhere else, which wins. Returns the *same object* while there is still
+ * something to wait for, so the caller can write the result back unconditionally
+ * without looping.
+ */
+export function settleDepartures(departing: DepartingTabs, pathname: string): DepartingTabs {
+  if (departing.ids.length === 0) return departing;
+  if (pathname === departing.settleRoute) return NO_DEPARTING_TABS;
+  const id = tabIdForPath(pathname);
+  if (id !== null && departing.ids.includes(id) && !departing.routes.includes(pathname)) {
+    return NO_DEPARTING_TABS;
+  }
+  return departing;
+}
+
+/**
+ * The tab list after a render, given the closes still in flight.
+ *
+ * Arriving at a tabbable route appends its tab — unless that tab is one the user
+ * has just closed and the router has not caught up with, which is the whole point
+ * of `DepartingTabs`. Any other route syncs normally, so a genuinely re-opened
+ * invoice still gets its tab back.
  */
 export function syncTabs(
   tabs: readonly string[],
   pathname: string,
-  closingPathname: string | null,
+  departing: DepartingTabs,
 ): readonly string[] {
-  if (closingPathname !== null && pathname === closingPathname) return tabs;
+  const id = tabIdForPath(pathname);
+  if (id !== null && departing.ids.includes(id)) return tabs;
   return openTabForPath(tabs, pathname);
+}
+
+/**
+ * One tab gone from whatever list is handed in. Same reference when it is not
+ * there.
+ *
+ * This is deliberately the *whole* of what a close writes to the tab list. The
+ * close's route and focus decisions are one authoritative outcome computed once,
+ * outside the state write; re-running the transition inside the updater instead
+ * re-derives "which tab is active" from a `previous` React chose, which is not
+ * the list the outcome was decided against — and that mis-derivation is what left
+ * one of two same-task closes un-applied.
+ */
+export function removeTab(tabs: readonly string[], id: string): readonly string[] {
+  if (!tabs.includes(id)) return tabs;
+  return tabs.filter((tab) => tab !== id);
 }
 
 /** Which tab takes over when `id` is closed: the right neighbour, else the left. */
@@ -201,11 +327,12 @@ export interface CloseOutcome {
   /** `null` means "stay where you are" — only ever for a non-active close. */
   readonly route: string | null;
   /**
-   * The pathname to suppress syncing against until the router catches up, or
-   * `null` when this close does not navigate and so nothing has to be
-   * suppressed. See `syncTabs`.
+   * The route the router has to reach before this close is reconciled: this
+   * close's own destination, else a navigation an earlier action in the same task
+   * already queued. `null` when nothing at all is in flight, and then nothing has
+   * to be suppressed. See `DepartingTabs`.
    */
-  readonly closingPathname: string | null;
+  readonly settleRoute: string | null;
   readonly focus: CloseFocusTarget;
 }
 
@@ -236,7 +363,7 @@ export function closeTab(
   return {
     tabs: transition.tabs,
     route: transition.route,
-    closingPathname: transition.route === null ? null : from,
+    settleRoute: transition.route ?? queuedRoute,
     focus: closeFocusTarget(tabs, id),
   };
 }

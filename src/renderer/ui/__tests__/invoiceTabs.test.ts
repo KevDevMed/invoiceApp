@@ -18,9 +18,14 @@ import {
   DRAFT_TAB_LABEL,
   INVOICES_ROUTE,
   NEW_TAB_BUTTON_LABEL,
+  NO_DEPARTING_TABS,
   openTabForPath,
   PENDING_TAB_LABEL,
   plusTransition,
+  recordDeparture,
+  recordNavigation,
+  removeTab,
+  settleDepartures,
   successorTabId,
   syncTabs,
   tabCloseLabel,
@@ -111,27 +116,269 @@ describe('openTabForPath', () => {
 });
 
 describe('syncTabs', () => {
-  it('refuses to re-open the tab whose close is still in flight', () => {
+  const departing = (ids: readonly string[], settleRoute: string | null) => ({
+    ids,
+    routes: [settleRoute ?? ''],
+    settleRoute,
+  });
+
+  it('refuses to re-open a tab whose close is still in flight', () => {
     // The regression: the shorter list lands one render before the router
     // reports the new route, so the route still points at the closed tab.
-    expect(syncTabs(['b'], '/invoices/a', '/invoices/a')).toEqual(['b']);
-    expect(syncTabs(['b'], '/invoices/a/edit', '/invoices/a/edit')).toEqual(['b']);
+    expect(syncTabs(['b'], '/invoices/a', departing(['a'], '/invoices/b'))).toEqual(['b']);
+    expect(syncTabs(['b'], '/invoices/a/edit', departing(['a'], '/invoices/b'))).toEqual(['b']);
   });
 
-  it('syncs normally once the route has caught up', () => {
-    expect(syncTabs(['b'], '/invoices/b', '/invoices/a')).toEqual(['b']);
-    expect(syncTabs(['b'], '/invoices/c', '/invoices/a')).toEqual(['b', 'c']);
+  it('suppresses every queued departure, not only the last one', () => {
+    // The scalar this replaced could name one departing route; three closes in
+    // one task queue three, and the render that needs suppressing carries the
+    // *first*. Every one of them has to be refused on that render.
+    const queued = departing(['a', 'b', 'c'], '/invoices/d');
+    for (const path of ['/invoices/a', '/invoices/b', '/invoices/c']) {
+      expect(syncTabs(['d'], path, queued)).toEqual(['d']);
+    }
   });
 
-  it('behaves like openTabForPath when nothing is closing', () => {
-    expect(syncTabs([], '/invoices/a', null)).toEqual(['a']);
+  it('syncs normally for a route no close is departing from', () => {
+    expect(syncTabs(['b'], '/invoices/b', departing(['a'], '/invoices/b'))).toEqual(['b']);
+    expect(syncTabs(['b'], '/invoices/c', departing(['a'], '/invoices/b'))).toEqual(['b', 'c']);
+  });
+
+  it('behaves like openTabForPath when nothing is departing', () => {
+    expect(syncTabs([], '/invoices/a', NO_DEPARTING_TABS)).toEqual(['a']);
     const tabs = ['a'];
-    expect(syncTabs(tabs, '/invoices', null)).toBe(tabs);
+    expect(syncTabs(tabs, '/invoices', NO_DEPARTING_TABS)).toBe(tabs);
   });
 
   it('still re-opens an invoice the user navigates back to later', () => {
-    // The suppression is scoped to the one route being left, not to the id.
-    expect(syncTabs([], '/invoices/a', '/invoices/zz')).toEqual(['a']);
+    // Once the departures are settled the suppression is gone, which is what
+    // keeps Back after a close a re-open rather than a route with no pill.
+    expect(syncTabs([], '/invoices/a', NO_DEPARTING_TABS)).toEqual(['a']);
+    expect(syncTabs([], '/invoices/a', departing(['zz'], '/invoices/q'))).toEqual(['a']);
+  });
+});
+
+describe('removeTab', () => {
+  it('removes one id and keeps the order of the rest', () => {
+    expect(removeTab(['a', 'b', 'c'], 'b')).toEqual(['a', 'c']);
+  });
+
+  it('returns the same list, by reference, for an id that is not open', () => {
+    const tabs = ['a', 'b'];
+    expect(removeTab(tabs, 'zz')).toBe(tabs);
+  });
+
+  it('removes only the named id whatever else the list has gained', () => {
+    /*
+      The state updater's whole contract. React can hand it a `previous` that is
+      not the list the close was resolved against — the route sync appends during
+      render — and re-deriving the transition from that list is what removed the
+      wrong id. Removal cannot depend on which tab is active.
+    */
+    expect(removeTab(['a', 'b', 'late'], 'a')).toEqual(['b', 'late']);
+  });
+});
+
+describe('DepartingTabs', () => {
+  it('accumulates every queued close instead of replacing it', () => {
+    let queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    queued = recordDeparture(queued, 'b', ['/invoices/a'], '/invoices/c');
+    queued = recordDeparture(queued, 'c', ['/invoices/a'], '/invoices/d');
+    expect(queued.ids).toEqual(['a', 'b', 'c']);
+    expect(queued.settleRoute).toBe('/invoices/d');
+    // Every route the task explains: where it started, and each place it asked
+    // to go. Anything else naming a departing tab is somebody else navigating.
+    expect(queued.routes).toEqual(['/invoices/a', '/invoices/b', '/invoices/c', '/invoices/d']);
+  });
+
+  it('records nothing when no navigation is in flight to wait for', () => {
+    // An inactive close on a committed route syncs against that route, so there
+    // is nothing to suppress — and an id nothing would ever release.
+    expect(recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/b'], null)).toBe(NO_DEPARTING_TABS);
+  });
+
+  it('never queues one id twice', () => {
+    const once = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    expect(recordDeparture(once, 'a', ['/invoices/a'], '/invoices/b').ids).toEqual(['a']);
+  });
+
+  it('moves the finishing line to the newest navigation', () => {
+    const queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    expect(recordNavigation(queued, '/invoices/d')).toEqual({
+      ids: ['a'],
+      routes: ['/invoices/a', '/invoices/b', '/invoices/d'],
+      settleRoute: '/invoices/d',
+    });
+  });
+
+  it('spends no render on a navigation with nothing departing', () => {
+    expect(recordNavigation(NO_DEPARTING_TABS, '/invoices/d')).toBe(NO_DEPARTING_TABS);
+    const queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    expect(recordNavigation(queued, '/invoices/b')).toBe(queued);
+  });
+
+  it('releases the whole set once the router reports the route asked for', () => {
+    const queued = recordDeparture(
+      recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b'),
+      'b',
+      ['/invoices/a'],
+      INVOICES_ROUTE,
+    );
+    // Still catching up: the same object back, so the render cannot loop.
+    expect(settleDepartures(queued, '/invoices/a')).toBe(queued);
+    expect(settleDepartures(queued, '/invoices/b')).toBe(queued);
+    expect(settleDepartures(queued, INVOICES_ROUTE)).toBe(NO_DEPARTING_TABS);
+    expect(settleDepartures(NO_DEPARTING_TABS, '/invoices/a')).toBe(NO_DEPARTING_TABS);
+  });
+
+  it('gives way to a navigation this task never asked for', () => {
+    /*
+      Measured: a close followed by an explicit `/invoices/:id/edit` in the same
+      task overwrites the strip's own `navigate` before the router commits it, so
+      `settleRoute` never arrives. Without this the suppression would outlive the
+      window and that invoice could never have a pill again.
+    */
+    const queued = recordDeparture(NO_DEPARTING_TABS, 'a', ['/invoices/a'], '/invoices/b');
+    expect(settleDepartures(queued, '/invoices/a/edit')).toBe(NO_DEPARTING_TABS);
+    // A route that names nobody departing changes nothing either way.
+    expect(settleDepartures(queued, '/settings')).toBe(queued);
+    expect(settleDepartures(queued, '/invoices/zz')).toBe(queued);
+  });
+});
+
+/**
+ * The hook's loop, as data.
+ *
+ * Measured on the running app (`HashRouter`, React 19): every click dispatched in
+ * one browser task runs before any re-render, and the first render *after* that
+ * batch carries the final tab list together with the pathname the task started
+ * on — the committed route only catches up over the renders that follow. So a
+ * task is "the handlers, then a render per committed pathname, starting with the
+ * old one". That first render is where a resurrected tab came from.
+ */
+function runTask(
+  tabs: readonly string[],
+  pathname: string,
+  actions: readonly ({ readonly close: string } | { readonly select: string })[],
+  commits: readonly string[],
+): { readonly tabs: readonly string[]; readonly route: string } {
+  // `latest` is the hook's ref; `state` is what React holds. They are separate
+  // on purpose: the ref moves inside the task, the state only between renders.
+  let latest = tabs;
+  let state = tabs;
+  let departing = NO_DEPARTING_TABS;
+  let queuedRoutes: readonly string[] = [];
+  let route = pathname;
+
+  for (const action of actions) {
+    if ('select' in action) {
+      const selected = tabRoute(action.select);
+      queuedRoutes = [...queuedRoutes, selected];
+      departing = recordNavigation(departing, selected);
+      route = selected;
+      continue;
+    }
+    const outcome = closeTab(latest, action.close, pathname, queuedRoutes.at(-1) ?? null);
+    if (outcome.tabs === latest) continue;
+    latest = outcome.tabs;
+    state = removeTab(state, action.close);
+    if (outcome.route !== null) {
+      queuedRoutes = [...queuedRoutes, outcome.route];
+      route = outcome.route;
+    }
+    departing = recordDeparture(departing, action.close, [pathname, ...queuedRoutes], outcome.settleRoute);
+  }
+
+  for (const committed of [pathname, ...commits]) {
+    departing = settleDepartures(departing, committed);
+    state = syncTabs(state, committed, departing);
+  }
+  return { tabs: state, route };
+}
+
+describe('closes in one browser task', () => {
+  it('applies three chained active closes and resurrects none of them', () => {
+    // G1/Tier 2: open a b c d, activate a, close a, b, c in one task. Measured
+    // before the fix: pills [d, a] — the first closed invoice came back, and the
+    // strip and the address bar disagreed.
+    expect(runTask(['a', 'b', 'c', 'd'], '/invoices/a', [{ close: 'a' }, { close: 'b' }, { close: 'c' }], [
+      '/invoices/b',
+      '/invoices/c',
+      '/invoices/d',
+    ])).toEqual({ tabs: ['d'], route: '/invoices/d' });
+  });
+
+  it('closes the active tab and the successor it just handed the route to', () => {
+    // F1/Tier 1: close active a, then close the incoming b. Measured before the
+    // fix: `#/invoices` with tab a surviving and no active pill.
+    expect(runTask(['a', 'b'], '/invoices/a', [{ close: 'a' }, { close: 'b' }], [INVOICES_ROUTE])).toEqual(
+      { tabs: [], route: INVOICES_ROUTE },
+    );
+  });
+
+  it('survives N simultaneous closes, not just two', () => {
+    const tabs = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+    const closes = tabs.slice(0, 6).map((id) => ({ close: id }));
+    const commits = tabs.slice(1).map((id) => `/invoices/${id}`);
+    expect(runTask(tabs, '/invoices/a', closes, commits)).toEqual({
+      tabs: ['g'],
+      route: '/invoices/g',
+    });
+  });
+
+  it('keeps a close that lands during an in-flight pill selection', () => {
+    // G2: click d's pill, then d's close, in one task. Measured before the fix:
+    // all four tabs remained and the route settled on the tab just closed,
+    // because the close read the stale rendered pathname, called d inactive, and
+    // the route sync then re-appended it.
+    expect(runTask(['a', 'b', 'c', 'd'], '/invoices/a', [{ select: 'd' }, { close: 'd' }], [
+      '/invoices/d',
+      '/invoices/c',
+    ])).toEqual({ tabs: ['a', 'b', 'c'], route: '/invoices/c' });
+  });
+
+  it('lets a pill clicked after a close win the route', () => {
+    expect(runTask(['a', 'b', 'c', 'd'], '/invoices/b', [{ close: 'b' }, { select: 'd' }], [
+      '/invoices/c',
+      '/invoices/d',
+    ])).toEqual({ tabs: ['a', 'c', 'd'], route: '/invoices/d' });
+  });
+
+  it('re-opens a closed invoice the user goes Back to, once the close has settled', () => {
+    const closed = runTask(['a', 'b'], '/invoices/a', [{ close: 'a' }], ['/invoices/b']);
+    expect(closed.tabs).toEqual(['b']);
+    // Back is its own task, by which point the departures are released.
+    expect(syncTabs(closed.tabs, '/invoices/a', NO_DEPARTING_TABS)).toEqual(['b', 'a']);
+  });
+
+  it('leaves four inactive closes alone — no navigation, so nothing to suppress', () => {
+    expect(
+      runTask(
+        ['a', 'b', 'c', 'd', 'e', 'f'],
+        '/invoices/f',
+        [{ close: 'a' }, { close: 'b' }, { close: 'c' }, { close: 'd' }],
+        [],
+      ),
+    ).toEqual({ tabs: ['e', 'f'], route: '/invoices/f' });
+  });
+
+  it('lets an explicit navigation to the closed invoice’s own route re-open it', () => {
+    // The close asks for `/invoices/a`; something else in the same task asks for
+    // the editor of the invoice being closed and gets there first. That route
+    // wants that document, so the tab comes back rather than the app sitting on a
+    // route with no pill — and the suppression cannot outlive the window.
+    expect(runTask(['a', 'b'], '/invoices/b', [{ close: 'b' }], ['/invoices/b/edit'])).toEqual({
+      tabs: ['a', 'b'],
+      route: '/invoices/a',
+    });
+  });
+
+  it('ignores repeat clicks on a stale close control', () => {
+    const repeated = Array.from({ length: 10 }, () => ({ close: 'a' }));
+    expect(runTask(['a', 'b', 'c'], '/invoices/c', repeated, [])).toEqual({
+      tabs: ['b', 'c'],
+      route: '/invoices/c',
+    });
   });
 });
 
@@ -217,20 +464,26 @@ describe('closeTab', () => {
     expect(first).toEqual({
       tabs: ['b'],
       route: '/invoices/b',
-      closingPathname: '/invoices/a',
+      settleRoute: '/invoices/b',
       focus: { kind: 'tab', id: 'b' },
     });
     const second = closeTab(first.tabs, 'b', '/invoices/a', first.route);
     expect(second.tabs).toEqual([]);
     expect(second.route).toBe(INVOICES_ROUTE);
-    expect(second.closingPathname).toBe('/invoices/b');
-    // ...and the route the second close leaves behind cannot resurrect the tab.
-    expect(syncTabs(second.tabs, '/invoices/b', second.closingPathname)).toEqual([]);
-    expect(syncTabs(second.tabs, INVOICES_ROUTE, second.closingPathname)).toEqual([]);
+    expect(second.settleRoute).toBe(INVOICES_ROUTE);
   });
 
-  it('suppresses nothing when the close does not navigate', () => {
-    expect(closeTab(['a', 'b'], 'a', '/invoices/b', null).closingPathname).toBeNull();
+  it('suppresses nothing when nothing at all is in flight', () => {
+    expect(closeTab(['a', 'b'], 'a', '/invoices/b', null).settleRoute).toBeNull();
+  });
+
+  it('waits on an already-queued navigation even when the close does not move', () => {
+    // G2: the pill click has navigated, the close of a *different* tab does not —
+    // but the route sync still has an uncommitted route to catch up with, so the
+    // departure has to be suppressed until it lands.
+    expect(closeTab(['a', 'b', 'c'], 'b', '/invoices/a', '/invoices/c').settleRoute).toBe(
+      '/invoices/c',
+    );
   });
 
   it('changes nothing, by reference, for an id that is not open', () => {

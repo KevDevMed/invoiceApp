@@ -57,7 +57,12 @@ import {
   DRAFT_TAB_ID,
   forgetClosedLabels,
   NEW_TAB_BUTTON_LABEL,
+  NO_DEPARTING_TABS,
   plusTransition,
+  recordDeparture,
+  recordNavigation,
+  removeTab,
+  settleDepartures,
   syncTabs,
   tabCloseLabel,
   tabIdForPath,
@@ -148,9 +153,18 @@ function focusLandingPage(): boolean {
     focus. Leaving the attribute behind would add a permanent tab stop to the shell.
   */
   main.tabIndex = -1;
-  main.addEventListener('blur', () => main.removeAttribute('tabindex'), { once: true });
+  const drop = (): void => main.removeAttribute('tabindex');
+  main.addEventListener('blur', drop, { once: true });
   main.focus();
-  return document.activeElement === main;
+  if (document.activeElement === main) return true;
+  /*
+    Focus was refused, so no `blur` will ever come to undo the attribute — and a
+    region left permanently `tabindex="-1"` is a permanent stray tab stop in the
+    shell. The removal cannot be conditional on the focus having worked.
+  */
+  main.removeEventListener('blur', drop);
+  drop();
+  return false;
 }
 
 function moveFocusAfterClose(target: CloseFocusTarget): boolean {
@@ -206,19 +220,32 @@ export function useInvoiceTabs(): InvoiceTabsState {
   const [tabs, setTabs] = useState<readonly string[]>([]);
   const [labels, setLabels] = useState<InvoiceTabLabels>({});
   /*
-    The route a close is navigating away from, held until the router catches up.
-    Without it, closing the active tab re-opens it: the shorter list renders one
-    frame before the new location arrives, and on that frame the route still
-    names the closed tab. See `syncTabs`.
+    Every close the router has not caught up with, by tab id, plus the route that
+    releases them. Not one "pathname being left": N closes in one browser task are
+    N queued departures, and the render that needs suppressing carries the *first*
+    one's route while the batched writes hold only the last. See `DepartingTabs`.
   */
-  const [closingPathname, setClosingPathname] = useState<string | null>(null);
+  const [departing, setDeparting] = useState(NO_DEPARTING_TABS);
   /*
     The three things a close needs that rendered state cannot give it, because two
     closes can happen in one browser task — before any re-render, so before either
     `tabs` or `useLocation` has moved. See `closeTab`.
   */
   const latestTabs = useRef<readonly string[]>(tabs);
-  const queuedRoute = useRef<string | null>(null);
+  /*
+    Every route the strip has navigated to in this browser task and the router has
+    not reported yet — the event-phase mirror of `departing.routes`, because a close
+    resolves inside the same task that queued the navigation, long before any state
+    moves. Its last entry is where the router is headed, which is what decides
+    whether a tab is active.
+
+    Every path that navigates appends to it, not only `close`: a pill click that has
+    not committed yet still means the rendered `pathname` is stale, and a close
+    reading that stale route mistook the pill the user had just selected for an
+    inactive tab — removing it with no replacement navigation, then watching the
+    route sync put it straight back.
+  */
+  const queuedRoutes = useRef<readonly string[]>([]);
   const pendingFocus = useRef<CloseFocusTarget | null>(null);
   /** Label requests in flight, and ids whose request already failed. */
   const inFlight = useRef<Set<string>>(new Set());
@@ -232,12 +259,17 @@ export function useInvoiceTabs(): InvoiceTabsState {
     Done during render, not in an effect: this is React's own "adjusting state
     when a prop changes" case (the prop being the route), and an effect would
     paint one frame with the new route and the old strip — the new invoice's page
-    with no pill for it — before correcting itself. `syncTabs` returns the *same*
-    array when nothing changes, so both guards below are false on every ordinary
-    render and neither update can loop.
+    with no pill for it — before correcting itself. `settleDepartures` and
+    `syncTabs` both return their *own* argument when nothing changes, so all three
+    guards below are false on every ordinary render and no update can loop.
+
+    Releasing the departures here rather than in an effect matters: it is the same
+    render that decides the list, so a route the strip asked for can never both
+    have landed and still be suppressed.
   */
-  if (closingPathname !== null && closingPathname !== pathname) setClosingPathname(null);
-  const openTabs = syncTabs(tabs, pathname, closingPathname);
+  const settled = settleDepartures(departing, pathname);
+  if (settled !== departing) setDeparting(settled);
+  const openTabs = syncTabs(tabs, pathname, settled);
   if (openTabs !== tabs) setTabs(openTabs);
 
   // The list a close has to work from — kept level with what is rendered, and
@@ -249,10 +281,10 @@ export function useInvoiceTabs(): InvoiceTabsState {
   /*
     Once the router has committed *any* location, the render-derived `activeId` is
     authoritative again and nothing is queued. Two closes in one task both run
-    before this fires, which is exactly the window `queuedRoute` covers.
+    before this fires, which is exactly the window `queuedRoutes` covers.
   */
   useEffect(() => {
-    queuedRoute.current = null;
+    queuedRoutes.current = [];
   }, [pathname]);
 
   /*
@@ -334,36 +366,56 @@ export function useInvoiceTabs(): InvoiceTabsState {
     activeId,
     labels,
     select: (id) => {
-      void navigate(tabRoute(id));
+      const route = tabRoute(id);
+      // Registered before the navigation, so a close later in this same task
+      // classifies the tab against where the router is going, and so this route
+      // counts as one the task explains rather than an outside navigation.
+      queuedRoutes.current = [...queuedRoutes.current, route];
+      setDeparting((previous) => recordNavigation(previous, route));
+      void navigate(route);
     },
     close: (id) => {
       /*
         Resolved against the refs, not against this render: two closes in one
         browser task both run here before React re-renders, and the second one has
-        to see the first one's list *and* the first one's queued navigation. The
-        write is a functional `setState` applying the same pure transition to
-        whatever state React holds — an absolute array would let the second write
-        overwrite the first.
+        to see the first one's list *and* the first one's queued navigation.
       */
-      const queued = queuedRoute.current;
+      const queued = queuedRoutes.current.at(-1) ?? null;
       const outcome = closeTab(latestTabs.current, id, pathname, queued);
       if (outcome.tabs === latestTabs.current) return;
       latestTabs.current = outcome.tabs;
       pendingFocus.current = outcome.focus;
-      setTabs((previous) => closeTab(previous, id, pathname, queued).tabs);
+      /*
+        The whole of what this close writes to the list: drop `id` from whatever
+        React supplies. Route and focus are `outcome`'s, decided once against the
+        latest list — re-running the transition in here re-derives the active tab
+        from a `previous` it was never resolved against, which is how one of two
+        same-task closes ended up applied to the wrong id.
+      */
+      setTabs((previous) => removeTab(previous, id));
       if (outcome.route !== null) {
-        // Suppress the sync until the router reports the new route, or the tab
-        // just dropped is re-appended from the route it is still on.
-        setClosingPathname(outcome.closingPathname);
-        queuedRoute.current = outcome.route;
+        queuedRoutes.current = [...queuedRoutes.current, outcome.route];
         void navigate(outcome.route);
       }
+      /*
+        Suppress the sync for this tab until the router reports the route the strip
+        is heading for, or it is re-appended from the route it is still on. The
+        routes accounted for are where this close is leaving from plus every route
+        the task has queued — including the ones queued before it, so a pill click
+        in the same task is not later mistaken for somebody else navigating.
+      */
+      setDeparting((previous) =>
+        recordDeparture(previous, id, [pathname, ...queuedRoutes.current], outcome.settleRoute),
+      );
     },
     openDraft: () => {
       const next = plusTransition(latestTabs.current);
       latestTabs.current = next.tabs;
       setTabs(next.tabs);
-      void navigate(next.route ?? tabRoute(DRAFT_TAB_ID));
+      const route = next.route ?? tabRoute(DRAFT_TAB_ID);
+      queuedRoutes.current = [...queuedRoutes.current, route];
+      setDeparting((previous) => recordNavigation(previous, route));
+      void navigate(route);
     },
   };
 }
@@ -399,14 +451,49 @@ function TabPill({
     pill.dataset.invoiceTab = id;
     const button = pill.querySelector('button');
     if (!button) return;
-    if (isActive) {
-      button.setAttribute('aria-current', 'page');
-      // The pills scroll now (see `flex: none` in `global.css`), so the active one
-      // has to be brought into the scroller's view — otherwise opening an
-      // eleventh invoice puts its own pill off the end of the strip.
-      pill.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    } else button.removeAttribute('aria-current');
+    if (isActive) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
   }, [id, isActive, label]);
+
+  /*
+    Where this pill last parked the strip, or `null` when it does not own the
+    scroll position — see the effect below.
+  */
+  const parkedAt = useRef<number | null>(null);
+
+  /*
+    The pills scroll now (see `flex: none` in `global.css`), so the active one has
+    to be brought into the scroller's view — otherwise opening an eleventh invoice
+    puts its own pill off the end of the strip.
+
+    Its own effect, and the reason it is not simply "scroll whenever anything
+    re-renders" is measured: sharing the `aria-current` effect above meant a slow
+    `invoices:get` arriving 1.8s after the user had scrolled the strip back to the
+    oldest tabs threw the viewport to the far end, with the active tab never having
+    changed. A number arriving is not a reason to move the viewport.
+
+    But it is a reason to *correct* one. `INV-0047` is wider than the `Invoice`
+    placeholder it replaces, so a pill scrolled flush with the scroller's right
+    edge while it was still waiting for its number ends up 12px past that edge
+    once the number lands (measured, twenty tabs at 1600px: `scrollLeft` 951 where
+    963 was needed, active pill right 1565.94 against a scroller right of 1554).
+    So the rule is ownership: becoming active claims the scroll position, and after
+    that this pill may only re-align itself while the strip is *still* parked where
+    it put it. Anything else — the user's own scroll, the resize observer in
+    `InvoiceTabs` — takes ownership away, and a label then changes nothing.
+  */
+  useLayoutEffect(() => {
+    const pill = root.current;
+    const scroller = pill?.closest('.app-invoice-tabs-scroller');
+    if (!(pill instanceof HTMLElement) || !(scroller instanceof HTMLElement)) return;
+    if (!isActive) {
+      parkedAt.current = null;
+      return;
+    }
+    if (parkedAt.current !== null && scroller.scrollLeft !== parkedAt.current) return;
+    pill.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    parkedAt.current = scroller.scrollLeft;
+  }, [isActive, label]);
 
   return (
     <Token

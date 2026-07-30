@@ -935,6 +935,63 @@ async function pillGapPoint(page) {
   });
 }
 
+/**
+ * Presses several strip controls inside ONE browser task.
+ *
+ * The whole point: nothing re-renders between the clicks, so every handler sees
+ * the same stale `pathname` and the same pre-click tab list. Three bugs only
+ * exist in that window — a queued close resurrecting an earlier one, a close
+ * right after a pill click being read as inactive — and `locator.click()` cannot
+ * reach it, because Playwright yields between clicks and React commits.
+ *
+ * Steps are named by invoice number, not by id: the close control carries the
+ * number in its accessible name, and its pill's first `<button>` is the
+ * activation control (see `InvoiceTabs.tsx`'s header on Token's anatomy).
+ */
+async function stripClicksInOneTask(page, steps) {
+  await page.evaluate((actions) => {
+    for (const action of actions) {
+      const pill = [...document.querySelectorAll('.app-invoice-tabs [data-invoice-tab]')].find(
+        (candidate) =>
+          candidate.querySelector('.app-invoice-tab-close')?.getAttribute('aria-label') ===
+          `Close invoice ${action.name}`,
+      );
+      if (!pill) throw new Error(`no pill for ${action.name}`);
+      const target =
+        action.kind === 'close'
+          ? pill.querySelector('.app-invoice-tab-close')
+          : pill.querySelector('button');
+      if (!target) throw new Error(`no ${action.kind} control for ${action.name}`);
+      target.click();
+    }
+  }, steps);
+  await page.waitForTimeout(900);
+}
+
+/** Where the pills are scrolled to, and whether they overflow at all. */
+async function stripScroll(page) {
+  return page.evaluate(() => {
+    const scroller = document.querySelector('.app-invoice-tabs-scroller');
+    if (scroller === null) return null;
+    return {
+      scrollLeft: scroller.scrollLeft,
+      scrollWidth: scroller.scrollWidth,
+      clientWidth: scroller.clientWidth,
+      overflows: scroller.scrollWidth > scroller.clientWidth,
+    };
+  });
+}
+
+/** Sets the pill scroller's scroll position by hand, as a user's finger would. */
+async function scrollStripToStart(page) {
+  await page.evaluate(() => {
+    const scroller = document.querySelector('.app-invoice-tabs-scroller');
+    if (scroller === null) throw new Error('no pill scroller');
+    scroller.scrollLeft = 0;
+  });
+  await page.waitForTimeout(120);
+}
+
 /** The shell's own inline overflow: many tabs must not widen the window. */
 async function shellOverflow(page) {
   return page.evaluate(() => ({
@@ -1803,6 +1860,7 @@ async function main() {
     );
     check('the double close leaves the route on the tab that was active', await activeTabName(page), activeOfFour);
 
+
     // --- the last close: the strip is gone, focus must still land ----------
     await tabStrip(page).getByRole('button', { name: `Close invoice ${beforeDouble[2]}` }).click();
     await page.waitForTimeout(900);
@@ -1820,6 +1878,147 @@ async function main() {
         settledAfterLastClose.id === 'astryx-app-shell-main',
       `${JSON.stringify(afterLastClose)} then ${JSON.stringify(settledAfterLastClose)}`,
     );
+
+    // --- N chained *active* closes in one task ----------------------------
+    /*
+      The harder shape of the same window, and a different bug. Closing the active
+      tab navigates, so three of them queue three departures — and the first
+      render after the batch carries the final tab list together with the pathname
+      the task *started* on (measured: `useLocation` catches up over the renders
+      that follow). Suppressing one "route being left" left the earlier ones
+      unguarded, and the route sync re-appended the first closed invoice: pills
+      `[last, first]` with the address bar and the active pill both on `last`.
+    */
+    await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'networkidle' });
+    const chainHashes = [];
+    for (let index = 0; index < 4; index++) chainHashes.push(await openInvoiceFromList(page, index));
+    const chainNames = await tabNames(page);
+    check('four tabs before the chained closes', chainNames.length, 4);
+    await tabStrip(page).getByRole('button', { name: chainNames[0], exact: true }).first().click();
+    await page.waitForTimeout(800);
+    check('the first tab is the active one before the chained closes', await activeTabName(page), chainNames[0]);
+    await stripClicksInOneTask(page, [
+      { kind: 'close', name: chainNames[0] },
+      { kind: 'close', name: chainNames[1] },
+      { kind: 'close', name: chainNames[2] },
+    ]);
+    check(
+      'three chained active closes in one task leave exactly the last tab',
+      (await tabNames(page)).join('|'),
+      chainNames[3],
+    );
+    check('the chained closes leave the route on the surviving tab', new URL(page.url()).hash, chainHashes[3]);
+    check('the surviving tab is the active one after the chained closes', await activeTabName(page), chainNames[3]);
+
+    // --- a close in the same task as a pill click -------------------------
+    /*
+      Clicking a pill starts a navigation the router has not reported yet. A close
+      dispatched before it commits used to read the stale rendered route, decide
+      the tab the user had just selected was *inactive*, remove it without a
+      replacement navigation — and then the selected route committed and the sync
+      put the tab straight back. All four pills survived, on the invoice the user
+      had asked to close.
+    */
+    await page.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'networkidle' });
+    const raceHashes = [];
+    for (let index = 0; index < 4; index++) raceHashes.push(await openInvoiceFromList(page, index));
+    const raceNames = await tabNames(page);
+    await tabStrip(page).getByRole('button', { name: raceNames[0], exact: true }).first().click();
+    await page.waitForTimeout(800);
+    await stripClicksInOneTask(page, [
+      { kind: 'activate', name: raceNames[3] },
+      { kind: 'close', name: raceNames[3] },
+    ]);
+    check(
+      'a close in the same task as a pill click still closes that tab',
+      (await tabNames(page)).join('|'),
+      raceNames.slice(0, 3).join('|'),
+    );
+    checkTrue(
+      'the route does not settle on the tab that close removed',
+      new URL(page.url()).hash !== raceHashes[3],
+      `hash: ${new URL(page.url()).hash}, closed: ${raceHashes[3]}`,
+    );
+    check(
+      'the route falls to the closed tab’s neighbour, which still has a pill',
+      new URL(page.url()).hash,
+      raceHashes[2],
+    );
+    check('the active pill agrees with that route', await activeTabName(page), raceNames[2]);
+
+    // --- a late label must not move the user's viewport --------------------
+    /*
+      The pills scroll, so the active one is scrolled into view when it *becomes*
+      active. It used to be scrolled into view again on every re-render that
+      changed the pill's label too, because `label` was a dependency of the same
+      effect: with the strip overflowing, a number arriving 2s after the user had
+      scrolled back to the oldest tabs threw the viewport to the far end. The
+      active tab never changed, so nothing about the user's scroll was stale.
+
+      The slow `invoices:get` is driven at the same seam the update-phase gate
+      above uses — a wrapper on `window.api` installed before the app boots,
+      delaying only that one channel and only while the flag is set, so the eight
+      tabs opened first still get their numbers immediately.
+    */
+    const labelPage = await browser.newPage({ viewport: { width: 800, height: 960 } });
+    labelPage.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    await labelPage.addInitScript(() => {
+      const defineProperty = Object.defineProperty;
+      Object.defineProperty = function patched(target, property, descriptor) {
+        if (target === window && property === 'api' && descriptor && 'value' in descriptor) {
+          const real = descriptor.value;
+          return defineProperty(target, property, {
+            ...descriptor,
+            value: {
+              ...real,
+              invoke: async (channel, payload) => {
+                if (channel === 'invoices:get' && window.__delayInvoiceLabels === true) {
+                  await new Promise((resolve) => {
+                    setTimeout(resolve, 2000);
+                  });
+                }
+                return real.invoke(channel, payload);
+              },
+              on: (channel, listener) => real.on(channel, listener),
+            },
+          });
+        }
+        return defineProperty(target, property, descriptor);
+      };
+    });
+    await labelPage.goto(`${APP_ORIGIN}/#/invoices`, { waitUntil: 'networkidle' });
+    for (let index = 0; index < 8; index++) await openInvoiceFromList(labelPage, index);
+    await labelPage.evaluate(() => {
+      window.__delayInvoiceLabels = true;
+    });
+    await openInvoiceFromList(labelPage, 8);
+    const lateNumber = expected.numbersInOrder[8];
+    const lateActive = await activeTabName(labelPage);
+    const beforeManualScroll = await stripScroll(labelPage);
+    await scrollStripToStart(labelPage);
+    const manualScroll = await stripScroll(labelPage);
+    checkTrue(
+      'nine tabs at 800px overflow, and the strip can be scrolled back by hand',
+      beforeManualScroll !== null &&
+        beforeManualScroll.overflows &&
+        beforeManualScroll.scrollLeft > 0 &&
+        manualScroll.scrollLeft === 0,
+      `before: ${JSON.stringify(beforeManualScroll)}, manual: ${JSON.stringify(manualScroll)}`,
+    );
+    checkTrue(
+      'the newest tab is active and still waiting for its number',
+      lateActive !== lateNumber,
+      `active tab label: ${JSON.stringify(lateActive)}, number still to arrive: ${lateNumber}`,
+    );
+    await labelPage.waitForTimeout(2600);
+    const afterLabel = await stripScroll(labelPage);
+    check('the delayed number does arrive on the active tab', await activeTabName(labelPage), lateNumber);
+    check('a label arriving late does not undo the user’s manual scroll', afterLabel?.scrollLeft, 0);
+    await labelPage.close();
 
     // --- ten tabs, two widths: the + stays reachable -----------------------
     // The old version of this gate asserted only `scrollWidth === clientWidth`
