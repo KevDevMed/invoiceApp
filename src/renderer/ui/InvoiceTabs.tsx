@@ -195,6 +195,34 @@ function moveFocusAfterClose(target: CloseFocusTarget): boolean {
   return focusLandingPage();
 }
 
+/**
+ * Whether this close is allowed to move focus at all.
+ *
+ * The handoff exists because a close destroys the button that had focus and the
+ * browser drops the user on `<body>`. That is only true when the focus being
+ * destroyed was *in the strip*. A close dispatched while the user is typing in
+ * the invoices search box, or working in the assistant dock, destroys nothing
+ * they are holding — and taking focus there is the strip reaching across the app
+ * to pull a caret out of a text field mid-word (measured: `typing survives
+ * close` left in Search, focus on a pill 80ms and 680ms later).
+ *
+ * `<body>` and nothing at all count as ours: they are the states the close would
+ * otherwise leave behind, so there is no user focus to protect. The late `rAF`
+ * branch below already guards this way; the immediate one did not, which is the
+ * whole of the bug.
+ */
+function stripOwnsFocus(): boolean {
+  const active = document.activeElement;
+  if (active === null || active === document.body) return true;
+  return active.closest('.app-invoice-tabs') !== null;
+}
+
+/** Where a pill has parked the strip's scroll, and which pill parked it. */
+interface ParkedScroll {
+  readonly owner: string;
+  readonly at: number;
+}
+
 /** Everything the strip needs, and the only thing AppShell has to hold. */
 export interface InvoiceTabsState {
   readonly tabs: readonly string[];
@@ -407,7 +435,10 @@ export function useInvoiceTabs(): InvoiceTabsState {
       const outcome = closeTab(latestTabs.current, id, pathname, queued);
       if (outcome.tabs === latestTabs.current) return;
       latestTabs.current = outcome.tabs;
-      pendingFocus.current = outcome.focus;
+      // Only when the focus this close is about to destroy is the strip's own —
+      // see `stripOwnsFocus`. Left alone otherwise, so an earlier close in the
+      // same task keeps the handoff it legitimately asked for.
+      if (stripOwnsFocus()) pendingFocus.current = outcome.focus;
       /*
         The whole of what this close writes to the list: drop `id` from whatever
         React supplies. Route and focus are `outcome`'s, decided once against the
@@ -450,6 +481,7 @@ function TabPill({
   isActive,
   onSelect,
   onClose,
+  parkedRef,
 }: {
   id: string;
   label: string;
@@ -457,6 +489,8 @@ function TabPill({
   isActive: boolean;
   onSelect: () => void;
   onClose: () => void;
+  /** Shared with the strip's resize observer — see the scroll effect below. */
+  parkedRef: React.RefObject<ParkedScroll | null>;
 }): React.JSX.Element {
   const root = useRef<HTMLElement>(null);
 
@@ -479,12 +513,6 @@ function TabPill({
   }, [id, isActive, label]);
 
   /*
-    Where this pill last parked the strip, or `null` when it does not own the
-    scroll position — see the effect below.
-  */
-  const parkedAt = useRef<number | null>(null);
-
-  /*
     The pills scroll now (see `flex: none` in `global.css`), so the active one has
     to be brought into the scroller's view — otherwise opening an eleventh invoice
     puts its own pill off the end of the strip.
@@ -502,21 +530,33 @@ function TabPill({
     963 was needed, active pill right 1565.94 against a scroller right of 1554).
     So the rule is ownership: becoming active claims the scroll position, and after
     that this pill may only re-align itself while the strip is *still* parked where
-    it put it. Anything else — the user's own scroll, the resize observer in
-    `InvoiceTabs` — takes ownership away, and a label then changes nothing.
+    it put it. The *user's* own scroll takes ownership away, and a label then
+    changes nothing.
+
+    The resize observer in `InvoiceTabs` does not, which is what the first version
+    of this rule got wrong: the observer scrolled the strip after the pill had
+    parked but before its number arrived, so the pill read a `scrollLeft` it did
+    not recognise, assumed the user had moved the strip, and refused the 12px
+    correction — leaving the active pill 11.94px past the scroller's edge and its
+    close control 3.94px past. A programmatic scroll by the strip is the strip's
+    own, so the observer *hands ownership on* instead of destroying it.
+
+    The record is shared and carries `owner`, so a *different* pill becoming
+    active is unowned and always scrolls itself in.
   */
   useLayoutEffect(() => {
     const pill = root.current;
     const scroller = pill?.closest('.app-invoice-tabs-scroller');
     if (!(pill instanceof HTMLElement) || !(scroller instanceof HTMLElement)) return;
     if (!isActive) {
-      parkedAt.current = null;
+      if (parkedRef.current?.owner === id) parkedRef.current = null;
       return;
     }
-    if (parkedAt.current !== null && scroller.scrollLeft !== parkedAt.current) return;
+    const owned = parkedRef.current;
+    if (owned !== null && owned.owner === id && scroller.scrollLeft !== owned.at) return;
     pill.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    parkedAt.current = scroller.scrollLeft;
-  }, [isActive, label]);
+    parkedRef.current = { owner: id, at: scroller.scrollLeft };
+  }, [id, isActive, label, parkedRef]);
 
   return (
     <Token
@@ -555,6 +595,14 @@ export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.E
   const scroller = useRef<HTMLDivElement>(null);
 
   /*
+    Where the strip is parked and which pill parked it, shared with every `TabPill`
+    and with the observer below. One record, not one per pill, because a scroll is
+    a property of the strip: the pill that put it there and the observer that moves
+    it have to be talking about the same position.
+  */
+  const parkedRef = useRef<ParkedScroll | null>(null);
+
+  /*
     Narrowing the window shrinks the scroller, and the active pill can end up past
     its edge — the pill for the invoice on screen, unreachable. `TabPill` only
     scrolls itself into view when the *state* changes, so the size change needs its
@@ -564,9 +612,17 @@ export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.E
     const box = scroller.current;
     if (box === null) return;
     const observer = new ResizeObserver(() => {
-      box
-        .querySelector('.app-invoice-tab-active')
-        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      const active = box.querySelector('.app-invoice-tab-active');
+      if (!(active instanceof HTMLElement)) return;
+      active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      /*
+        Hand the parking on rather than silently invalidating it: this scroll is
+        the strip's own, not the user's, so the active pill must still recognise
+        the strip as parked when its number finally arrives and it has to correct
+        the width the placeholder was holding.
+      */
+      const owner = active.dataset.invoiceTab;
+      if (owner !== undefined) parkedRef.current = { owner, at: box.scrollLeft };
     });
     observer.observe(box);
     return () => {
@@ -606,6 +662,7 @@ export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.E
                 onClose={() => {
                   state.close(id);
                 }}
+                parkedRef={parkedRef}
               />
             ))}
           </div>
