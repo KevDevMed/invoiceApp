@@ -32,11 +32,17 @@ const RANK: Record<ReleaseBump, number> = { none: 0, patch: 1, minor: 2, major: 
 const SUBJECT_RE = /^([A-Za-z]+)(?:\(([^)]*)\))?(!)?:/;
 
 // Types that describe work with no user-visible change to the shipped app.
-// They contribute NOTHING, on purpose: a macOS release run packages, signs and
-// notarises two architectures, and Apple's notary queue has taken anywhere
-// from 30 minutes to over two hours on identical inputs. A README typo must
-// not spend that, and must not push a version at every installed app that
-// contains nothing for them.
+// They contribute nothing on their own, on purpose: a macOS release run
+// packages, signs and notarises two architectures, and Apple's notary queue has
+// taken anywhere from 30 minutes to over two hours on identical inputs. A
+// README typo must not spend that, and must not push a version at every
+// installed app that contains nothing for them.
+//
+// PRECEDENCE, because "nothing" is not unconditional: a breaking marker beats
+// this list. `chore!: drop node 18`, or a `docs:` commit with a real
+// `BREAKING CHANGE:` footer, resolves `major` (`minor` while the major is still
+// 0) — the type is only consulted after isBreaking says no (see bumpForCommit).
+// `[skip release]` beats everything, breaking included.
 const NON_CONTRIBUTING_TYPES = new Set(['docs', 'chore', 'ci', 'test', 'style', 'build']);
 
 // This workflow's own bump commits. Skipped entirely so a release can never
@@ -52,34 +58,46 @@ const RELEASE_COMMIT_RE = /^chore\(release\):/i;
 // some unrelated later push happened along. Scoped to the commit, the marker
 // can only ever suppress its own commit.
 //
-// WHERE THE LINE IS DRAWN, and why it has two edges rather than one.
+// WHERE THE LINE IS DRAWN. Two forms, both MECHANICAL. The rule never tries to
+// read intent out of prose:
 //
-// It counts in the subject anywhere. In the body it counts in exactly two
-// shapes, both checked on lines that survived fence and blockquote stripping
-// and after inline `code spans` are blanked out (see isSkipped):
+//   1. the marker appears anywhere in the SUBJECT line;
+//   2. a BODY line whose ENTIRE content is the marker, allowing an optional
+//      leading list bullet (`-`, `*`, `+`), surrounding whitespace and one
+//      trailing punctuation character — `[skip release]`, `- [skip release]`,
+//      `[skip release].`. Checked on lines that survived fence and blockquote
+//      stripping.
 //
-//   A. a line whose only content is the marker, allowing a leading list
-//      bullet (`-`, `*`, `+`), surrounding whitespace and trailing
-//      punctuation — `[skip release]`, `- [skip release]`, `[skip release].`;
-//   B. a single-line paragraph that mentions the marker — `Please
-//      [skip release] for this commit.` People write the opt-out as a short
-//      standalone instruction at least as often as they write it bare, and
-//      round 2 ignored every one of those.
+// Nothing else opts out — `Please [skip release] for this commit.` does NOT.
+// That is a DELIBERATE NARROWING, not an oversight: do not widen it back. Two
+// rejected alternatives, both tried and both removed:
 //
-// THE FAR EDGE: a marker inside a MULTI-LINE prose paragraph, or inside
-// backticks, never fires. That is not fastidiousness — an anywhere-match was
-// tried and it misfired on this repo's own history. Commit 529b279's body
-// both writes `` `[skip release]` `` in backticks (line 51) and writes it
-// bare inside a wrapped prose paragraph (line 70, "…[skip release] skip,
-// docs-only none)"), so BOTH exclusions are load-bearing: drop either one and
-// the commit that introduced this feature reads as opted out of its own
-// release. Verified against real history, not hypothesised.
-const SKIP_RELEASE_ANYWHERE_RE = /\[skip release\]/i;
-const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[skip release\][ \t]*[.,;:!]*[ \t]*$/i;
-
-// An inline code span: a run of backticks, its content, and a closing run.
-// Blanked out before the marker checks so a backticked mention cannot fire.
-const CODE_SPAN_RE = /`+[^`]*`+/g;
+//   REJECTED: "a single-line paragraph that mentions the marker" (round 3). Its
+//   meaning depended on LINE WRAPPING — that sentence on one line opted out,
+//   the identical sentence wrapped over two did not — and in the other
+//   direction a body merely DOCUMENTING the marker ("The literal marker
+//   [skip release] suppresses a commit.") opted itself out, so no release was
+//   cut. Every widening of a prose rule buys a false positive, and a false
+//   positive here is a release the author asked for silently never happening:
+//   the exact bug this feature exists to eliminate.
+//
+//   REJECTED: blanking inline `code spans` before the match. Only ever needed
+//   to stop a backticked mention firing the prose rule, and the hand-rolled
+//   parser got CommonMark wrong (it did not require the closing backtick run to
+//   match the opener's length, so `` `[skip release]` `` blanked partially and
+//   the marker leaked back out). Rule 2 makes it unnecessary: on a line reading
+//   `` `[skip release]` `` the backticks ARE content, so the line's entire
+//   content is not the marker and it structurally cannot fire.
+//
+// So prose mentioning the marker never opts out, wrapped or not — which is what
+// a repo whose own commit messages discuss this feature (see 529b279) needs.
+// Both accepted forms are trivial to write on purpose and impossible to hit by
+// accident. QUOTING IS ALSO NOT AN OPT-OUT: `> [skip release]` is dropped by
+// blockquote stripping before rule 2 sees it, deliberately — a quoted line is
+// the author reporting someone else's words, which is how every other rule here
+// (breaking footers included) treats one. Write it unquoted.
+const SKIP_RELEASE_SUBJECT_RE = /\[skip release\]/i;
+const SKIP_RELEASE_OWN_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[skip release\][ \t]*[.,;:!]?[ \t]*$/i;
 
 // A `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer. Both spellings are
 // spec-legal aliases. Anchoring to a line start is necessary but nowhere near
@@ -103,6 +121,10 @@ type ScannedLine = {
   text: string;
   // True for the fence delimiters themselves and everything between them.
   fenced: boolean;
+  // True for the OPENING delimiter only. Per CommonMark a code fence interrupts
+  // a paragraph, so this is where a block boundary is, blank line or not — see
+  // bodyParagraphs.
+  opensFence: boolean;
   quoted: boolean;
 };
 
@@ -155,15 +177,20 @@ function scanBody(message: string): ScannedLine[] {
         run.length >= open.length &&
         rest.trim() === '';
       if (closes) open = null;
-      scanned.push({ text: line, fenced: true, quoted: false });
+      scanned.push({ text: line, fenced: true, opensFence: false, quoted: false });
       continue;
     }
     if (run !== undefined && !(run[0] === '`' && rest.includes('`'))) {
       open = { char: run[0] as string, length: run.length };
-      scanned.push({ text: line, fenced: true, quoted: false });
+      scanned.push({ text: line, fenced: true, opensFence: true, quoted: false });
       continue;
     }
-    scanned.push({ text: line, fenced: false, quoted: BLOCKQUOTE_RE.test(line) });
+    scanned.push({
+      text: line,
+      fenced: false,
+      opensFence: false,
+      quoted: BLOCKQUOTE_RE.test(line),
+    });
   }
   return scanned;
 }
@@ -183,18 +210,36 @@ function strippedBodyLines(message: string): string[] {
 // entirely a fence or a blockquote lost that paragraph and promoted the one
 // before it to "footer" — turning hypothetical breaking text one paragraph up
 // into a real major bump.
+//
+// A BLANK LINE IS NOT THE ONLY BOUNDARY. Per CommonMark a fenced code block
+// interrupts a paragraph: an opening fence starts a new block whether or not a
+// blank line precedes it, and the first line after the fence ends starts
+// another. Splitting on blank lines alone glued a no-blank-line trailing fence
+// onto the prose above it, so the fence and that prose were ONE last paragraph;
+// stripping the fence out of it left the prose, and `BREAKING CHANGE:` written
+// as prose one paragraph up forced a false `major` — but only for authors who
+// did not happen to leave a blank line (measured: no-blank `major`, with-blank
+// `patch`, otherwise identical input).
 function bodyParagraphs(message: string): ScannedLine[][] {
   const paragraphs: ScannedLine[][] = [];
   let current: ScannedLine[] = [];
+  const flush = (): void => {
+    if (current.length > 0) paragraphs.push(current);
+    current = [];
+  };
+
+  let previousFenced = false;
   for (const line of scanBody(message)) {
     if (!line.fenced && line.text.trim().length === 0) {
-      if (current.length > 0) paragraphs.push(current);
-      current = [];
+      flush();
+      previousFenced = false;
       continue;
     }
+    if (line.opensFence || (previousFenced && !line.fenced)) flush();
     current.push(line);
+    previousFenced = line.fenced;
   }
-  if (current.length > 0) paragraphs.push(current);
+  flush();
   return paragraphs;
 }
 
@@ -226,22 +271,10 @@ function isBreaking(message: string): boolean {
 
 function isSkipped(message: string): boolean {
   const [subject = ''] = message.split('\n');
-  if (SKIP_RELEASE_ANYWHERE_RE.test(subject)) return true;
-
-  // Paragraph structure matters here, so the plain lines are regrouped rather
-  // than flattened: shape B (see the marker comment above) only fires on a
-  // paragraph that is a single line.
-  for (const paragraph of strippedBodyLines(message)
-    .join('\n')
-    .split(/\n[ \t]*\n/)) {
-    const lines = paragraph.split('\n').filter((line) => line.trim().length > 0);
-    for (const line of lines) {
-      const bare = line.replace(CODE_SPAN_RE, ' ');
-      if (SKIP_RELEASE_OWN_LINE_RE.test(bare)) return true;
-      if (lines.length === 1 && SKIP_RELEASE_ANYWHERE_RE.test(bare)) return true;
-    }
-  }
-  return false;
+  if (SKIP_RELEASE_SUBJECT_RE.test(subject)) return true;
+  // Line by line, no paragraph grouping and no inline-code parsing: rule 2 is
+  // about one line's entire content, so neither is needed.
+  return strippedBodyLines(message).some((line) => SKIP_RELEASE_OWN_LINE_RE.test(line));
 }
 
 // Every line-oriented rule below — the subject split, the paragraph split, the
@@ -318,9 +351,21 @@ function bumpForCommit(raw: string, currentMajor: number): ReleaseBump {
 //   - a pre-release is dot-separated identifiers, each non-empty, and a numeric
 //     one may not have a leading zero;
 //   - build metadata is dot-separated non-empty alphanumeric-or-hyphen runs.
-// `0.2.0-beta.1` and `1.0.0-rc.1+build.5` — what the manual workflow_dispatch
-// path actually cuts — stay accepted; they are the reason a suffix is allowed
-// at all.
+// `0.2.0-beta.1` — a pre-release, which is what the manual workflow_dispatch
+// path actually cuts — stays accepted; that is the reason a suffix is allowed at
+// all. Build metadata (`1.0.0-rc.1+build.5`) is accepted here too because the
+// published grammar allows it, NOT because the manual path can produce it: that
+// path's own preflight regex has no `+` branch and rejects build metadata
+// outright.
+//
+// THE TWO GRAMMARS DISAGREE ON MALFORMED INPUT, and that is pre-existing rather
+// than introduced by this branch. release.yml's preflight
+// `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` predates the resolver: it is
+// LOOSER on illegal suffixes (it accepts `01.2.3`, `1.2.3-alpha..1`, `1.2.3-01`,
+// `1.2.3-.`, all of which this CLI exits 2 on) and STRICTER on build metadata
+// (it rejects `+build.5`, which this CLI accepts). Deliberately left alone —
+// changing what the manual path accepts is a separate decision from validating
+// what the automatic path reads out of package.json.
 const VERSION_RE =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 

@@ -29,8 +29,12 @@
 # signs and notarises two architectures, and Apple's notary queue has taken
 # 30 to 147+ minutes on identical inputs. A commit whose type is
 # docs/chore/ci/test/style/build contributes nothing to the bump, and so does a
-# commit carrying `[skip release]` in its subject or on a line of its own in
-# its body; if EVERY commit in the range since the last tag contributes
+# commit carrying `[skip release]` in one of exactly two forms: anywhere in its
+# SUBJECT line, or on a BODY line whose entire content is the marker (an
+# optional `-`/`*`/`+` bullet, surrounding whitespace and one trailing
+# punctuation character allowed). Nothing else opts out — the marker mentioned
+# in prose, backticked, or inside a fence or blockquote does not, whatever the
+# line wrapping. If EVERY commit in the range since the last tag contributes
 # nothing, the range resolves to `none` and the run ends green with nothing
 # pushed.
 #
@@ -282,6 +286,15 @@ jobs:
           set -euo pipefail
 
           CURRENT=$(node -p "require('./package.json').version")
+          # Pre-dates the automatic path and is deliberately left as it was: it
+          # is the grammar build-mac.yml's tag stamping enforces, so the two
+          # must keep agreeing. It has NO `+` branch, so build metadata
+          # (1.0.0-rc.1+build.5) is rejected here — the manual path cannot cut
+          # one. It is also looser than scripts/resolve-release-bump.ts's CLI on
+          # illegal suffixes (`01.2.3`, `1.2.3-alpha..1`, `1.2.3-01`, `1.2.3-.`
+          # pass here and exit 2 there). That disagreement is pre-existing;
+          # tightening it changes what the manual path accepts, which is a
+          # separate call from validating what the automatic path reads.
           SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
           if [[ ! "$CURRENT" =~ $SEMVER_RE ]]; then
             echo "::error::package.json's current version '$CURRENT' is not a valid semver — fix package.json on main before cutting a release."

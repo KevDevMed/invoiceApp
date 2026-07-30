@@ -242,6 +242,39 @@ still not breaking
       expect(resolveReleaseBump('0.1.7', [quotedLast])).toBe('patch');
     });
 
+    it('treats a trailing fence as its own block with or without a blank line', () => {
+      // ROUND 4, finding 4. A code fence interrupts a paragraph (CommonMark),
+      // but the split was on blank lines alone, so the no-blank shape glued the
+      // fence onto the prose above; that combined block became the footer,
+      // stripping the fence left the BREAKING prose, and the bump was a false
+      // `major`. Measured before the fix: no-blank `major`, with-blank `patch`,
+      // on otherwise identical input.
+      const noBlank = `fix(api): keep the legacy field
+
+BREAKING CHANGE: is what a lazier version of this commit would have said.
+\`\`\`text
+still not breaking
+\`\`\``;
+      const withBlank = `fix(api): keep the legacy field
+
+BREAKING CHANGE: is what a lazier version of this commit would have said.
+
+\`\`\`text
+still not breaking
+\`\`\``;
+      expect(resolveReleaseBump('1.2.3', [noBlank])).toBe('patch');
+      expect(resolveReleaseBump('1.2.3', [withBlank])).toBe('patch');
+      // The mirror case: prose immediately AFTER a closing fence is its own
+      // block too, so a genuine footer written without a blank line still wins.
+      const footerAfterFence = `refactor(api): rename the field
+
+\`\`\`text
+example
+\`\`\`
+BREAKING CHANGE: invoice.total is now invoice.amountTotal.`;
+      expect(resolveReleaseBump('1.2.3', [footerAfterFence])).toBe('major');
+    });
+
     it('keeps an unterminated fence swallowing everything after it', () => {
       const unterminated = `fix(api): document parser
 
@@ -319,29 +352,49 @@ nothing, so a marker in prose like this one must not fire.`;
       expect(resolveReleaseBump('0.1.7', [discusses])).toBe('minor');
     });
 
-    it('fires on the shapes people actually write the marker in', () => {
-      // M2. Round 2 accepted the bare line only, so every one of these was
-      // ignored and the commit released.
+    it('fires on a body line whose entire content is the marker', () => {
+      // Rule 2, the only body form. A bullet, surrounding whitespace and one
+      // trailing punctuation character are allowed; nothing else is.
       expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n- [skip release]`])).toBe('none');
       expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n* [skip release]`])).toBe('none');
       expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n+ [skip release]`])).toBe('none');
       expect(resolveReleaseBump('0.1.7', [`${FIX}\n\n  [skip release].`])).toBe('none');
-      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\nPlease [skip release] for this commit.`])).toBe(
-        'none',
-      );
-      // A bare marker line still counts even inside a longer paragraph: shape
-      // A does not care how many lines the paragraph has.
-      expect(resolveReleaseBump('0.1.7', [`${FIX}\n\nNo need to ship this one.\n[skip release]`])).toBe(
-        'none',
-      );
+      // And it does not care where in the body the line sits, or how many
+      // other lines share its paragraph.
+      expect(
+        resolveReleaseBump('0.1.7', [`${FIX}\n\nNo need to ship this one.\n[skip release]`]),
+      ).toBe('none');
     });
 
-    it('does not fire on a marker discussed inside a multi-line prose paragraph', () => {
-      // The far edge of M2, and the reason the widening stopped where it did.
-      // Both shapes below are copied from 529b279's real body: backticked on
-      // its line 51, and bare inside a wrapped paragraph on its line 70. Widen
-      // past either and the commit that introduced this feature opts itself
-      // out of its own release.
+    it('fires on the marker anywhere in the subject', () => {
+      // Rule 1.
+      expect(resolveReleaseBump('0.1.7', ['feat: thing [skip release]'])).toBe('none');
+      expect(resolveReleaseBump('0.1.7', ['[skip release] fix: thing'])).toBe('none');
+    });
+
+    it('never fires on prose, whatever the line wrapping', () => {
+      // ROUND 4, THE DESIGN FIX. Round 3 also matched "a single-line paragraph
+      // that mentions the marker", which made the rule's meaning depend on
+      // where the author's editor wrapped the line — and made a commit that
+      // merely DOCUMENTED the marker opt itself out, so no release was cut.
+      // Both directions are now the same answer. The narrowing is deliberate:
+      // widening this back reintroduces the silent-no-release bug.
+      const oneLine = `fix: document parser
+
+The literal marker [skip release] suppresses a commit.`;
+      const wrapped = `fix: internal
+
+Please [skip release] for this commit;
+it changes internal tooling only.`;
+      const oneLineRequest = `fix: internal
+
+Please [skip release] for this commit.`;
+      expect(resolveReleaseBump('0.1.7', [oneLine])).toBe('patch');
+      expect(resolveReleaseBump('0.1.7', [wrapped])).toBe('patch');
+      expect(resolveReleaseBump('0.1.7', [oneLineRequest])).toBe('patch');
+
+      // Copied from 529b279's real body: backticked on its line 51, bare
+      // inside a wrapped paragraph on its line 70.
       const backticked = `${FEAT}
 
 Three conditions end the run green with nothing pushed: a resolved bump of
@@ -354,14 +407,25 @@ The resolve step's shell was exercised locally through all four outcomes
 YAML parsed with js-yaml.`;
       expect(resolveReleaseBump('0.1.7', [backticked])).toBe('minor');
       expect(resolveReleaseBump('0.1.7', [bareInProse])).toBe('minor');
-      // Backticked even as a one-line paragraph: the code span is blanked out
-      // before either shape is tried.
-      expect(resolveReleaseBump('0.1.7', [`${FEAT}\n\nThe marker is \`[skip release]\`.`])).toBe(
-        'minor',
-      );
     });
 
-    it('does not fire on a marker inside a fence or a blockquote', () => {
+    it('does not fire on a backticked marker, with no code-span parser', () => {
+      // H1 in round 3 was a broken hand-rolled code-span regex (it did not
+      // require the closing backtick run to match the opener, so the blanking
+      // was partial and the marker leaked out). Rule 2 removes the need for one
+      // entirely: on a line reading `` `[skip release]` `` the backticks ARE
+      // content, so the line's entire content is not the marker.
+      expect(resolveReleaseBump('0.1.7', [`${FEAT}\n\nThe marker \`[skip release]\` is docs.`])).toBe(
+        'minor',
+      );
+      expect(resolveReleaseBump('0.1.7', [`${FEAT}\n\n\`[skip release]\``])).toBe('minor');
+      expect(resolveReleaseBump('0.1.7', [`${FEAT}\n\n\`\`[skip release]\`\``])).toBe('minor');
+    });
+
+    it('does not fire on a marker inside a fence, or quoted', () => {
+      // Quoting the marker is NOT an opt-out, and that is a decision rather
+      // than an accident: a blockquote is the author reporting someone else's
+      // words, which is how every other rule here treats one.
       const fenced = `${FIX}
 
 \`\`\`
