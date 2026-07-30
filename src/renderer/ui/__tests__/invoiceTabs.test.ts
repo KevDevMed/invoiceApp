@@ -10,8 +10,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  closeFocusTarget,
+  closeTab,
   closeTabTransition,
   DRAFT_TAB_ID,
+  forgetClosedLabels,
   DRAFT_TAB_LABEL,
   INVOICES_ROUTE,
   NEW_TAB_BUTTON_LABEL,
@@ -188,6 +191,106 @@ describe('closeTabTransition', () => {
   });
 });
 
+describe('closeTab', () => {
+  /*
+    The hook cannot be mounted here, so what is asserted is the contract it now
+    obeys: every close is resolved against the *latest* list and against any
+    navigation already queued in the same browser task. Threading those two
+    values through two calls is exactly what two clicks in one task do.
+  */
+  it('keeps both closes when two inactive tabs are closed in one task', () => {
+    // F1, Tier 2's live case: active `c`, close `a` then `b` in one task.
+    const first = closeTab(['a', 'b', 'c'], 'a', '/invoices/c', null);
+    expect(first.tabs).toEqual(['b', 'c']);
+    expect(first.route).toBeNull();
+    const second = closeTab(first.tabs, 'b', '/invoices/c', first.route);
+    expect(second.tabs).toEqual(['c']);
+    expect(second.route).toBeNull();
+  });
+
+  it('reads the active tab from the queued navigation, not the stale route', () => {
+    // F1, Tier 1's case: close active `a` (queues `/invoices/b`), then close the
+    // incoming `b` before the router has moved. Judging `b` by the *old* pathname
+    // called it inactive, removed it without navigating, and left the app on
+    // `/invoices/b` with an empty strip.
+    const first = closeTab(['a', 'b'], 'a', '/invoices/a', null);
+    expect(first).toEqual({
+      tabs: ['b'],
+      route: '/invoices/b',
+      closingPathname: '/invoices/a',
+      focus: { kind: 'tab', id: 'b' },
+    });
+    const second = closeTab(first.tabs, 'b', '/invoices/a', first.route);
+    expect(second.tabs).toEqual([]);
+    expect(second.route).toBe(INVOICES_ROUTE);
+    expect(second.closingPathname).toBe('/invoices/b');
+    // ...and the route the second close leaves behind cannot resurrect the tab.
+    expect(syncTabs(second.tabs, '/invoices/b', second.closingPathname)).toEqual([]);
+    expect(syncTabs(second.tabs, INVOICES_ROUTE, second.closingPathname)).toEqual([]);
+  });
+
+  it('suppresses nothing when the close does not navigate', () => {
+    expect(closeTab(['a', 'b'], 'a', '/invoices/b', null).closingPathname).toBeNull();
+  });
+
+  it('changes nothing, by reference, for an id that is not open', () => {
+    // The hook uses this identity to decide there is no commit to focus after.
+    const tabs = ['a'];
+    expect(closeTab(tabs, 'zz', '/invoices/a', null).tabs).toBe(tabs);
+  });
+
+  it('treats the editor route as the tab it belongs to', () => {
+    expect(closeTab(['a'], 'a', '/invoices/a/edit', null).route).toBe(INVOICES_ROUTE);
+  });
+});
+
+describe('closeFocusTarget', () => {
+  it('hands focus to the surviving right neighbour, else the left', () => {
+    // F3: without this the close button's removal drops focus to <body>.
+    expect(closeFocusTarget(['a', 'b', 'c'], 'b')).toEqual({ kind: 'tab', id: 'c' });
+    expect(closeFocusTarget(['a', 'b', 'c'], 'c')).toEqual({ kind: 'tab', id: 'b' });
+  });
+
+  it('follows the same neighbour the route follows', () => {
+    for (const id of ['a', 'b', 'c']) {
+      const target = closeFocusTarget(['a', 'b', 'c'], id);
+      expect(target).toEqual({ kind: 'tab', id: successorTabId(['a', 'b', 'c'], id) });
+    }
+  });
+
+  it('lands on the page when the last tab closes and the strip unmounts', () => {
+    expect(closeFocusTarget(['a'], 'a')).toEqual({ kind: 'page' });
+  });
+
+  it('falls back to the trailing + while the strip is still on screen', () => {
+    expect(closeFocusTarget(['a', 'b'], 'zz')).toEqual({ kind: 'new' });
+    expect(closeFocusTarget([], 'zz')).toEqual({ kind: 'page' });
+  });
+});
+
+describe('forgetClosedLabels', () => {
+  it('drops a closed tab’s number so reopening it fetches again', () => {
+    // F4: the cache kept every closed tab's entry for the life of the window,
+    // and the request guard kept a failed id from ever being asked for again.
+    expect(forgetClosedLabels({ a: 'INV-0001', b: 'INV-0002' }, ['b'])).toEqual({
+      b: 'INV-0002',
+    });
+    expect(forgetClosedLabels({ a: 'INV-0001' }, [])).toEqual({});
+  });
+
+  it('returns the same object when every label is still open', () => {
+    // Reference identity, or the effect that calls it re-runs forever.
+    const labels = { a: 'INV-0001' };
+    expect(forgetClosedLabels(labels, ['a', DRAFT_TAB_ID])).toBe(labels);
+    expect(forgetClosedLabels({}, ['a'])).toEqual({});
+  });
+
+  it('leaves a reopened tab eligible for a fresh request', () => {
+    const kept = forgetClosedLabels({ a: 'INV-0001' }, []);
+    expect(unlabelledTabIds(['a'], kept)).toEqual(['a']);
+  });
+});
+
 describe('plusTransition', () => {
   it('opens a draft tab and navigates to the draft route', () => {
     expect(plusTransition(['a'])).toEqual({ tabs: ['a', 'new'], route: '/invoices/new' });
@@ -221,9 +324,19 @@ describe('labels', () => {
   it('names every close control after the invoice it closes', () => {
     expect(tabCloseLabel('inv_42', labels)).toBe('Close invoice INV-0042');
     expect(tabCloseLabel(DRAFT_TAB_ID, labels)).toBe('Close new invoice');
-    expect(tabCloseLabel('inv_99', labels)).toBe('Close invoice');
+    expect(tabCloseLabel('inv_99', labels)).toBe('Close invoice inv_99');
     // Distinct names, so a screen-reader user can tell the buttons apart.
     expect(tabCloseLabel('inv_42', labels)).not.toBe(tabCloseLabel(DRAFT_TAB_ID, labels));
+  });
+
+  it('names two unlabelled close controls apart', () => {
+    // F5: `['a','b']` with no labels used to give two buttons called
+    // "Close invoice", and a failed fetch made that permanent. The id is in the
+    // accessible name only — never in the visible label.
+    const names = ['inv_a', 'inv_b'].map((id) => tabCloseLabel(id, {}));
+    expect(new Set(names).size).toBe(2);
+    expect(tabLabel('inv_a', {})).toBe(PENDING_TAB_LABEL);
+    expect(tabLabel('inv_a', {})).not.toContain('inv_a');
   });
 
   it('does not give the + the same name as the tab it opens', () => {

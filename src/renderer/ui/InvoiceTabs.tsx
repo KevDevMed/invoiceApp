@@ -44,7 +44,7 @@
  *     has to be announced as more than a background colour.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 
 import { Icon } from '@astryxdesign/core/Icon';
@@ -53,8 +53,9 @@ import { Token } from '@astryxdesign/core/Token';
 import { Toolbar } from '@astryxdesign/core/Toolbar';
 
 import {
-  closeTabTransition,
+  closeTab,
   DRAFT_TAB_ID,
+  forgetClosedLabels,
   NEW_TAB_BUTTON_LABEL,
   plusTransition,
   syncTabs,
@@ -64,6 +65,7 @@ import {
   tabRoute,
   TAB_STRIP_LABEL,
   unlabelledTabIds,
+  type CloseFocusTarget,
   type InvoiceTabLabels,
 } from './invoiceTabs';
 
@@ -108,6 +110,70 @@ function PlusIcon(props: GlyphProps): React.JSX.Element {
   );
 }
 
+/**
+ * Focus, after the DOM has lost the button that had it.
+ *
+ * `closeFocusTarget` decides *where*; these three do the DOM half, and they are
+ * here rather than in `invoiceTabs.ts` for the reason that file's header gives.
+ * Each returns whether focus actually landed, so the caller can retry once — the
+ * `page` target can be one frame late when the close also changes route.
+ */
+function pillActivationButton(strip: HTMLElement, id: string): HTMLElement | null {
+  // `data-invoice-tab` is set on the pill by `TabPill`'s ref effect: Token
+  // forwards no rest props, so an attribute cannot be passed to it (see header).
+  const pill = [...strip.querySelectorAll<HTMLElement>('[data-invoice-tab]')].find(
+    (element) => element.dataset.invoiceTab === id,
+  );
+  return pill?.querySelector('button') ?? null;
+}
+
+/**
+ * The id of the shell's main region — the skip link's target, and the one node in
+ * the content column that survives every route change.
+ *
+ * The page's `h1` looks like the obvious target and is the wrong one: closing the
+ * last tab navigates, and the incoming page's heading is a *different* element
+ * that React swaps in a frame later, which drops focus straight back to `<body>`
+ * (measured: `H1` at 0ms, `BODY` at 30ms). The main region is already the app's
+ * declared "start of the content" landmark, and it does not move.
+ */
+const MAIN_REGION_ID = 'astryx-app-shell-main';
+
+/** The page the close landed on, for when the strip itself is gone. */
+function focusLandingPage(): boolean {
+  const main = document.getElementById(MAIN_REGION_ID) ?? document.querySelector<HTMLElement>('h1');
+  if (main === null) return false;
+  /*
+    A region is not a focus stop, so it becomes one for exactly as long as it holds
+    focus. Leaving the attribute behind would add a permanent tab stop to the shell.
+  */
+  main.tabIndex = -1;
+  main.addEventListener('blur', () => main.removeAttribute('tabindex'), { once: true });
+  main.focus();
+  return document.activeElement === main;
+}
+
+function moveFocusAfterClose(target: CloseFocusTarget): boolean {
+  const strip = document.querySelector<HTMLElement>('.app-invoice-tabs');
+  if (strip !== null && target.kind !== 'page') {
+    if (target.kind === 'tab') {
+      const button = pillActivationButton(strip, target.id);
+      if (button !== null) {
+        button.focus();
+        if (document.activeElement === button) return true;
+      }
+    }
+    // Neither neighbour survived but the strip did: the `+` is always there.
+    const plus = strip.querySelector<HTMLElement>('.app-invoice-tabs-new');
+    const plusButton = plus === null ? null : (plus.closest('button') ?? plus.querySelector('button') ?? plus);
+    if (plusButton !== null) {
+      plusButton.focus();
+      if (document.activeElement === plusButton) return true;
+    }
+  }
+  return focusLandingPage();
+}
+
 /** Everything the strip needs, and the only thing AppShell has to hold. */
 export interface InvoiceTabsState {
   readonly tabs: readonly string[];
@@ -146,7 +212,17 @@ export function useInvoiceTabs(): InvoiceTabsState {
     names the closed tab. See `syncTabs`.
   */
   const [closingPathname, setClosingPathname] = useState<string | null>(null);
-  const requested = useRef<Set<string>>(new Set());
+  /*
+    The three things a close needs that rendered state cannot give it, because two
+    closes can happen in one browser task — before any re-render, so before either
+    `tabs` or `useLocation` has moved. See `closeTab`.
+  */
+  const latestTabs = useRef<readonly string[]>(tabs);
+  const queuedRoute = useRef<string | null>(null);
+  const pendingFocus = useRef<CloseFocusTarget | null>(null);
+  /** Label requests in flight, and ids whose request already failed. */
+  const inFlight = useRef<Set<string>>(new Set());
+  const failed = useRef<Set<string>>(new Set());
   const activeId = tabIdForPath(pathname);
 
   /*
@@ -164,19 +240,90 @@ export function useInvoiceTabs(): InvoiceTabsState {
   const openTabs = syncTabs(tabs, pathname, closingPathname);
   if (openTabs !== tabs) setTabs(openTabs);
 
+  // The list a close has to work from — kept level with what is rendered, and
+  // moved forward by `close` itself for a second close in the same task.
   useEffect(() => {
+    latestTabs.current = openTabs;
+  }, [openTabs]);
+
+  /*
+    Once the router has committed *any* location, the render-derived `activeId` is
+    authoritative again and nothing is queued. Two closes in one task both run
+    before this fires, which is exactly the window `queuedRoute` covers.
+  */
+  useEffect(() => {
+    queuedRoute.current = null;
+  }, [pathname]);
+
+  /*
+    Focus, after the commit that removed the closed pill. A layout effect in the
+    *hook* rather than in the strip, because the last close unmounts the strip
+    altogether and its effects would never run.
+  */
+  useLayoutEffect(() => {
+    const target = pendingFocus.current;
+    if (target === null) return;
+    if (moveFocusAfterClose(target)) {
+      pendingFocus.current = null;
+      return;
+    }
+    /*
+      Nothing to focus yet: the page a last close navigated to can mount one
+      commit later than the strip unmounts. The request is deliberately *not*
+      cleared, so the commit that brings the new page in retries it — and a frame
+      later it is dropped either way, so a close can never leave a request behind
+      to fire at some unrelated later render. Not cancelled on cleanup: this
+      effect re-runs on the very route change being waited for.
+    */
+    requestAnimationFrame(() => {
+      const late = pendingFocus.current;
+      if (late === null) return;
+      pendingFocus.current = null;
+      if (document.activeElement === null || document.activeElement === document.body) {
+        moveFocusAfterClose(late);
+      }
+    });
+  }, [openTabs, pathname]);
+
+  useEffect(() => {
+    /*
+      Closing a tab retires everything remembered about it: the cached number, and
+      the failure mark that stops it being asked for again. Keeping either is what
+      made one failed `invoices:get` poison an invoice for the life of the window —
+      reopen the tab and it stayed labelled "Invoice" forever.
+    */
+    const kept = forgetClosedLabels(labels, openTabs);
+    for (const id of failed.current) if (!openTabs.includes(id)) failed.current.delete(id);
+    if (kept !== labels) {
+      setLabels(kept);
+      return;
+    }
+
     for (const id of unlabelledTabIds(openTabs, labels)) {
-      if (requested.current.has(id)) continue;
-      requested.current.add(id);
+      // In flight: a second render must not fire the same fetch twice.
+      // Failed: do not retry on every render — the mark is dropped above the
+      // moment the tab closes, so reopening it does retry.
+      if (inFlight.current.has(id) || failed.current.has(id)) continue;
+      inFlight.current.add(id);
       void (async () => {
         try {
           const invoice = await window.api.invoke('invoices:get', { id });
           // A missing invoice (null) keeps the placeholder rather than closing
           // the tab: the tab is the user's, and a pill vanishing under the
           // pointer is worse than one labelled "Invoice".
-          if (invoice) setLabels((previous) => ({ ...previous, [id]: invoice.number }));
+          if (!invoice) {
+            failed.current.add(id);
+            return;
+          }
+          // The tab can have closed while this was in flight; a label written for
+          // a pill that no longer exists is a cache entry nothing will ever clear.
+          if (!latestTabs.current.includes(id)) return;
+          setLabels((previous) => ({ ...previous, [id]: invoice.number }));
         } catch {
           // Same again: a failed fetch leaves the stable placeholder in place.
+          failed.current.add(id);
+        } finally {
+          inFlight.current.delete(id);
         }
       })();
     }
@@ -190,17 +337,31 @@ export function useInvoiceTabs(): InvoiceTabsState {
       void navigate(tabRoute(id));
     },
     close: (id) => {
-      const next = closeTabTransition(openTabs, id, activeId);
-      setTabs(next.tabs);
-      if (next.route !== null) {
+      /*
+        Resolved against the refs, not against this render: two closes in one
+        browser task both run here before React re-renders, and the second one has
+        to see the first one's list *and* the first one's queued navigation. The
+        write is a functional `setState` applying the same pure transition to
+        whatever state React holds — an absolute array would let the second write
+        overwrite the first.
+      */
+      const queued = queuedRoute.current;
+      const outcome = closeTab(latestTabs.current, id, pathname, queued);
+      if (outcome.tabs === latestTabs.current) return;
+      latestTabs.current = outcome.tabs;
+      pendingFocus.current = outcome.focus;
+      setTabs((previous) => closeTab(previous, id, pathname, queued).tabs);
+      if (outcome.route !== null) {
         // Suppress the sync until the router reports the new route, or the tab
         // just dropped is re-appended from the route it is still on.
-        setClosingPathname(pathname);
-        void navigate(next.route);
+        setClosingPathname(outcome.closingPathname);
+        queuedRoute.current = outcome.route;
+        void navigate(outcome.route);
       }
     },
     openDraft: () => {
-      const next = plusTransition(openTabs);
+      const next = plusTransition(latestTabs.current);
+      latestTabs.current = next.tabs;
       setTabs(next.tabs);
       void navigate(next.route ?? tabRoute(DRAFT_TAB_ID));
     },
@@ -230,12 +391,22 @@ function TabPill({
     the token's span is the invisible activation button — the icon before it is a
     plain span and the close button comes after it.
   */
-  useEffect(() => {
-    const button = root.current?.querySelector('button');
+  useLayoutEffect(() => {
+    const pill = root.current;
+    if (!pill) return;
+    // Which tab this pill is, for the focus handoff after a close — same reason
+    // as `aria-current`: nothing can be passed through Token as a prop.
+    pill.dataset.invoiceTab = id;
+    const button = pill.querySelector('button');
     if (!button) return;
-    if (isActive) button.setAttribute('aria-current', 'page');
-    else button.removeAttribute('aria-current');
-  }, [isActive, label]);
+    if (isActive) {
+      button.setAttribute('aria-current', 'page');
+      // The pills scroll now (see `flex: none` in `global.css`), so the active one
+      // has to be brought into the scroller's view — otherwise opening an
+      // eleventh invoice puts its own pill off the end of the strip.
+      pill.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    } else button.removeAttribute('aria-current');
+  }, [id, isActive, label]);
 
   return (
     <Token
@@ -271,6 +442,28 @@ function TabPill({
  * keeps a stray `+` off every page that has no invoices open.
  */
 export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.Element | null {
+  const scroller = useRef<HTMLDivElement>(null);
+
+  /*
+    Narrowing the window shrinks the scroller, and the active pill can end up past
+    its edge — the pill for the invoice on screen, unreachable. `TabPill` only
+    scrolls itself into view when the *state* changes, so the size change needs its
+    own observer.
+  */
+  useEffect(() => {
+    const box = scroller.current;
+    if (box === null) return;
+    const observer = new ResizeObserver(() => {
+      box
+        .querySelector('.app-invoice-tab-active')
+        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    });
+    observer.observe(box);
+    return () => {
+      observer.disconnect();
+    };
+  }, [state.tabs.length]);
+
   if (state.tabs.length === 0) return null;
 
   return (
@@ -289,7 +482,7 @@ export function InvoiceTabs({ state }: { state: InvoiceTabsState }): React.JSX.E
             `:has(> .app-side-nav)` note in `styles/global.css` for what a few
             stray pixels of inline overflow cost.
           */}
-          <div className="app-invoice-tabs-scroller">
+          <div className="app-invoice-tabs-scroller" ref={scroller}>
             {state.tabs.map((id) => (
               <TabPill
                 key={id}

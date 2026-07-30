@@ -841,6 +841,100 @@ async function openInvoiceFromList(page, index) {
   return new URL(page.url()).hash;
 }
 
+/**
+ * What holds focus, and where it sits.
+ *
+ * A close destroys the button that had focus, so the only assertion that means
+ * anything is on `document.activeElement` *after* the close: `BODY` is the
+ * browser's fallback and the failure this exists to catch.
+ */
+async function focusTarget(page) {
+  return page.evaluate(() => {
+    const element = document.activeElement;
+    if (!element) return { tag: null, name: null, inStrip: false };
+    return {
+      tag: element.tagName,
+      id: element.id,
+      name: (element.getAttribute('aria-label') ?? element.textContent ?? '').trim().slice(0, 60),
+      inStrip: element.closest('.app-invoice-tabs') !== null,
+    };
+  });
+}
+
+/**
+ * Whether the trailing `+` can actually be used at this width.
+ *
+ * Not "is the document wider than the window": with ten tabs open the document
+ * stayed exactly `clientWidth` while the `+` sat 400px past the right edge, clipped
+ * by the band, with no scrollbar anywhere able to bring it back. So this reads the
+ * `+`'s rect against the viewport *and* hit-tests its centre point, and checks that
+ * the overflow ended up inside the scroller where a scroll can reach it.
+ */
+async function plusReach(page) {
+  return page.evaluate(() => {
+    const strip = document.querySelector('.app-invoice-tabs');
+    const toolbar = strip?.querySelector('[role="toolbar"]');
+    const plus = strip?.querySelector('.app-invoice-tabs-new');
+    const scroller = strip?.querySelector('.app-invoice-tabs-scroller');
+    if (!strip || !toolbar || !plus || !scroller) return null;
+    const button = plus.matches('button') ? plus : (plus.querySelector('button') ?? plus);
+    const rect = button.getBoundingClientRect();
+    const toolbarRect = toolbar.getBoundingClientRect();
+    const hit = document.elementFromPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+    return {
+      left: rect.left,
+      right: rect.right,
+      toolbarRight: toolbarRect.right,
+      viewportWidth: window.innerWidth,
+      insideViewport:
+        rect.left >= 0 &&
+        rect.right <= window.innerWidth &&
+        rect.top >= 0 &&
+        rect.bottom <= window.innerHeight,
+      insideToolbar: rect.left >= toolbarRect.left - 1 && rect.right <= toolbarRect.right + 1,
+      // The real question: does a click at the `+`'s centre reach the `+`?
+      hittable: hit !== null && (hit === button || button.contains(hit) || hit.contains(button)),
+      hitClass: hit === null ? null : (hit.getAttribute('class') ?? hit.tagName),
+      scrollerClientWidth: scroller.clientWidth,
+      scrollerScrollWidth: scroller.scrollWidth,
+      scrollerRight: scroller.getBoundingClientRect().right,
+      // The active pill has to stay inside the scroller's own viewport, or the
+      // invoice the user is reading has no reachable pill.
+      activePillVisible: (() => {
+        const active = strip.querySelector('.app-invoice-tab-active');
+        if (active === null) return null;
+        const pill = active.getBoundingClientRect();
+        const box = scroller.getBoundingClientRect();
+        return pill.left >= box.left - 1 && pill.right <= box.right + 1;
+      })(),
+    };
+  });
+}
+
+/** The `-webkit-app-region` in force at one point, resolved up the tree. */
+async function regionAtPoint(page, x, y) {
+  return page.evaluate(({ x: px, y: py }) => {
+    const hit = document.elementFromPoint(px, py);
+    for (let node = hit; node !== null; node = node.parentElement) {
+      const value = getComputedStyle(node).webkitAppRegion;
+      if (value && value !== 'none') return { region: value, hit: hit?.getAttribute('class') ?? hit?.tagName };
+    }
+    return { region: 'none', hit: hit?.getAttribute('class') ?? hit?.tagName ?? null };
+  }, { x, y });
+}
+
+/** The midpoint of the gap between the first two pills, or null with one pill. */
+async function pillGapPoint(page) {
+  return page.evaluate(() => {
+    const pills = [...document.querySelectorAll('.app-invoice-tab')];
+    if (pills.length < 2) return null;
+    const first = pills[0].getBoundingClientRect();
+    const second = pills[1].getBoundingClientRect();
+    if (second.left - first.right < 2) return null;
+    return { x: (first.right + second.left) / 2, y: (first.top + first.bottom) / 2 };
+  });
+}
+
 /** The shell's own inline overflow: many tabs must not widen the window. */
 async function shellOverflow(page) {
   return page.evaluate(() => ({
@@ -1660,16 +1754,87 @@ async function main() {
       `focus order: ${JSON.stringify(walk)}`,
     );
 
-    // --- six tabs, two widths, no horizontal scrollbar --------------------
-    for (let index = 2; index < 6; index++) await openInvoiceFromList(page, index);
-    check('six invoices, six tabs', (await tabNames(page)).length, 6);
+    // --- closing a tab must not drop focus on the floor -------------------
+    // The close control *is* the focused element when it is pressed, so closing
+    // destroys it. Without a deliberate handoff the browser falls back to
+    // `<body>` and a keyboard user loses the toolbar on every close. These read
+    // `document.activeElement` after the close, which is the only proof.
+    for (let index = 2; index < 4; index++) await openInvoiceFromList(page, index);
+    const fourNames = await tabNames(page);
+    check('four invoices, four tabs', fourNames.length, 4);
+    const activeOfFour = await activeTabName(page);
+
+    await tabStrip(page).getByRole('button', { name: `Close invoice ${fourNames[0]}` }).focus();
+    check('the close control holds focus before the close', (await focusTarget(page)).name, `Close invoice ${fourNames[0]}`);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(800);
+    const afterInactiveClose = await focusTarget(page);
+    checkTrue(
+      'closing an inactive tab hands focus to the surviving right neighbour',
+      afterInactiveClose.tag !== 'BODY' &&
+        afterInactiveClose.inStrip &&
+        afterInactiveClose.name === fourNames[1],
+      JSON.stringify(afterInactiveClose),
+    );
+    check('closing an inactive tab still leaves the route alone', await activeTabName(page), activeOfFour);
+
+    // --- two closes in one browser task both stick ------------------------
+    // Both clicks dispatched inside one `evaluate`, so neither has re-rendered
+    // when the other runs: an absolute state write loses the first one.
+    const beforeDouble = await tabNames(page);
+    check('three tabs before the double close', beforeDouble.length, 3);
+    await page.evaluate((names) => {
+      const buttons = [
+        ...document.querySelectorAll('[role="toolbar"][aria-label="Open invoices"] button'),
+      ];
+      for (const name of names) {
+        const button = buttons.find(
+          (candidate) => candidate.getAttribute('aria-label') === `Close invoice ${name}`,
+        );
+        if (!button) throw new Error(`no close control for ${name}`);
+        button.click();
+      }
+    }, [beforeDouble[0], beforeDouble[1]]);
+    await page.waitForTimeout(900);
+    check(
+      'two inactive tabs closed in one task both stay closed',
+      (await tabNames(page)).join('|'),
+      beforeDouble[2],
+    );
+    check('the double close leaves the route on the tab that was active', await activeTabName(page), activeOfFour);
+
+    // --- the last close: the strip is gone, focus must still land ----------
+    await tabStrip(page).getByRole('button', { name: `Close invoice ${beforeDouble[2]}` }).click();
+    await page.waitForTimeout(900);
+    check('the last close falls back to the invoices list', new URL(page.url()).hash, '#/invoices');
+    // A second read, well after the landing page has finished loading: focusing
+    // the incoming page's h1 passed at 0ms and was back on <body> at 30ms, which
+    // is why the target is the shell's main region instead.
+    const afterLastClose = await focusTarget(page);
+    await page.waitForTimeout(700);
+    const settledAfterLastClose = await focusTarget(page);
+    checkTrue(
+      'closing the last tab moves focus onto the page it lands on, not <body>',
+      afterLastClose.tag !== 'BODY' &&
+        settledAfterLastClose.tag !== 'BODY' &&
+        settledAfterLastClose.id === 'astryx-app-shell-main',
+      `${JSON.stringify(afterLastClose)} then ${JSON.stringify(settledAfterLastClose)}`,
+    );
+
+    // --- ten tabs, two widths: the + stays reachable -----------------------
+    // The old version of this gate asserted only `scrollWidth === clientWidth`
+    // and `stripRight <= bandRight`. Both held while the `+` sat 400px outside a
+    // 1000px window, because the band clipped instead of the scroller scrolling.
+    for (let index = 0; index < 10; index++) await openInvoiceFromList(page, index);
+    check('ten invoices, ten tabs', (await tabNames(page)).length, 10);
     for (const width of [1000, 1600]) {
       await page.setViewportSize({ width, height: 960 });
       await page.waitForTimeout(400);
       const overflow = await shellOverflow(page);
       const band = await contentBand(page);
+      const plus = await plusReach(page);
       checkTrue(
-        `six tabs do not widen the shell at ${width}px (light)`,
+        `ten tabs do not widen the shell at ${width}px (light)`,
         overflow.scrollWidth === overflow.clientWidth,
         `scrollWidth: ${overflow.scrollWidth}, clientWidth: ${overflow.clientWidth}`,
       );
@@ -1678,7 +1843,42 @@ async function main() {
         band !== null && band.stripRight !== null && band.stripRight <= band.right + 1,
         `strip right: ${band?.stripRight}, band right: ${band?.right}`,
       );
+      checkTrue(
+        `the + is visible and clickable with ten tabs at ${width}px`,
+        plus !== null && plus.insideViewport && plus.insideToolbar && plus.hittable,
+        JSON.stringify(plus),
+      );
+      checkTrue(
+        `the pills, not the band, absorb the overflow at ${width}px`,
+        plus !== null && plus.scrollerRight <= band.right + 1,
+        `scroller right: ${plus?.scrollerRight}, band right: ${band?.right}, scroller ${plus?.scrollerClientWidth}/${plus?.scrollerScrollWidth}`,
+      );
     }
+    await page.setViewportSize({ width: 1000, height: 960 });
+    await page.waitForTimeout(400);
+    const narrow = await plusReach(page);
+    checkTrue(
+      'ten tabs overflow *inside* the scroller, so the pills can be scrolled to',
+      narrow !== null &&
+        narrow.scrollerScrollWidth > narrow.scrollerClientWidth &&
+        narrow.activePillVisible === true,
+      JSON.stringify(narrow),
+    );
+    await shoot(page, 'invoice-tabs-ten-1000');
+
+    // --- the gaps between pills are not dead pixels ------------------------
+    // `no-drag` on the whole scroller covered the `gap` strips between pills,
+    // which hold nothing clickable: those pixels dragged nothing and clicked
+    // nothing. Scoped to the pills and the `+`, the gaps drag the window again.
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.waitForTimeout(400);
+    const gap = await pillGapPoint(page);
+    const gapRegion = gap === null ? null : await regionAtPoint(page, gap.x, gap.y);
+    checkTrue(
+      'the gap between two pills still drags the window',
+      gapRegion !== null && gapRegion.region === 'drag',
+      `gap point: ${JSON.stringify(gap)}, region: ${JSON.stringify(gapRegion)}`,
+    );
 
     await page.setViewportSize({ width: 1440, height: 960 });
     await page.waitForTimeout(400);

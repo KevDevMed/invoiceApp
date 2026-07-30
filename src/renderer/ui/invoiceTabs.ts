@@ -167,6 +167,81 @@ export function closeTabTransition(
 }
 
 /**
+ * Where keyboard focus goes when a tab is closed.
+ *
+ * A close destroys the DOM node that had focus — the close button inside the
+ * pill — and the browser's fallback for that is `<body>`, which drops the user
+ * out of the toolbar entirely. So the strip says where to go instead:
+ *
+ * - `tab`: the surviving right neighbour, else the left one. The same rule the
+ *   *route* follows, so the pill that gains focus is the pill that gains the page.
+ * - `new`: the trailing `+`. Reachable when the closed id was not in the list yet
+ *   tabs remain — the strip is still on screen and the `+` is the one control in
+ *   it that is always present.
+ * - `page`: the strip itself is gone (the last tab closed and `InvoiceTabs`
+ *   renders null), so focus has to land on the page the close navigated to.
+ */
+export type CloseFocusTarget =
+  | { readonly kind: 'tab'; readonly id: string }
+  | { readonly kind: 'new' }
+  | { readonly kind: 'page' };
+
+/** Which control should hold focus after `id` is closed out of `tabs`. */
+export function closeFocusTarget(tabs: readonly string[], id: string): CloseFocusTarget {
+  const index = tabs.indexOf(id);
+  if (index === -1) return tabs.length === 0 ? { kind: 'page' } : { kind: 'new' };
+  const neighbour = tabs[index + 1] ?? tabs[index - 1];
+  if (neighbour !== undefined) return { kind: 'tab', id: neighbour };
+  return { kind: 'page' };
+}
+
+/** Everything one close decides, as one value. */
+export interface CloseOutcome {
+  readonly tabs: readonly string[];
+  /** `null` means "stay where you are" — only ever for a non-active close. */
+  readonly route: string | null;
+  /**
+   * The pathname to suppress syncing against until the router catches up, or
+   * `null` when this close does not navigate and so nothing has to be
+   * suppressed. See `syncTabs`.
+   */
+  readonly closingPathname: string | null;
+  readonly focus: CloseFocusTarget;
+}
+
+/**
+ * One close, resolved against the state that is actually current.
+ *
+ * The two arguments that are easy to get wrong, and the bug each one fixes:
+ *
+ * - `tabs` must be the *latest* list, not the one a render captured. Two closes
+ *   in one browser task both run before React re-renders, so the second one has
+ *   to see the first one's result or it writes an absolute list that resurrects
+ *   the tab the first one dropped.
+ * - `queuedRoute` is the destination of a navigation already queued in this same
+ *   task (again: no re-render yet, so `useLocation` still reports the old
+ *   pathname). Which tab is *active* has to be read from where the router is
+ *   going, not from where it has been, or the second close mistakes the incoming
+ *   active tab for an inactive one, removes it without navigating, and leaves the
+ *   app on a route with no pill.
+ */
+export function closeTab(
+  tabs: readonly string[],
+  id: string,
+  pathname: string,
+  queuedRoute: string | null,
+): CloseOutcome {
+  const from = queuedRoute ?? pathname;
+  const transition = closeTabTransition(tabs, id, tabIdForPath(from));
+  return {
+    tabs: transition.tabs,
+    route: transition.route,
+    closingPathname: transition.route === null ? null : from,
+    focus: closeFocusTarget(tabs, id),
+  };
+}
+
+/**
  * The trailing `+`.
  *
  * Always navigates to `/invoices/new`. When a draft tab is already open that
@@ -192,7 +267,14 @@ export function tabLabel(id: string, labels: InvoiceTabLabels): string {
 export function tabCloseLabel(id: string, labels: InvoiceTabLabels): string {
   if (id === DRAFT_TAB_ID) return 'Close new invoice';
   const number = labels[id];
-  return number === undefined ? 'Close invoice' : `Close invoice ${number}`;
+  /*
+    No number yet (or never — a fetch can fail): the name falls back to the id
+    rather than a bare "Close invoice", because two unlabelled pills with one
+    name are two buttons a screen-reader user cannot tell apart, and the one they
+    press drops a document. The id is in the accessible name only; the *visible*
+    text stays `PENDING_TAB_LABEL`, so no cuid is ever painted on screen.
+  */
+  return number === undefined ? `Close invoice ${id}` : `Close invoice ${number}`;
 }
 
 /** Which invoice ids on screen still need their number fetched. */
@@ -201,4 +283,26 @@ export function unlabelledTabIds(
   labels: InvoiceTabLabels,
 ): readonly string[] {
   return tabs.filter((id) => id !== DRAFT_TAB_ID && labels[id] === undefined);
+}
+
+/**
+ * The label cache with every closed tab's entry dropped.
+ *
+ * Two things depend on this. The cache is unbounded otherwise — a session that
+ * opens and closes fifty invoices keeps fifty numbers for pills that no longer
+ * exist. And a reopened tab must fetch again: the fetch is guarded by "has this
+ * id been asked for", so keeping the entry (or, worse, keeping a *failure* mark)
+ * for a tab the user has closed is what makes a single failed `invoices:get`
+ * poison that invoice for the life of the window.
+ *
+ * Returns the *same reference* when there is nothing to drop, so the effect that
+ * calls it cannot loop.
+ */
+export function forgetClosedLabels(
+  labels: InvoiceTabLabels,
+  tabs: readonly string[],
+): InvoiceTabLabels {
+  const open = Object.keys(labels).filter((id) => tabs.includes(id));
+  if (open.length === Object.keys(labels).length) return labels;
+  return Object.fromEntries(open.map((id) => [id, labels[id] as string]));
 }

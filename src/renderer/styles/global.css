@@ -59,18 +59,30 @@ body {
  *    (which would opt every decorative span in either band out of dragging), the
  *    pills are an explicit no-drag island.
  *
- *    Scoped to the *scroller*, not to `.app-invoice-tabs`: Toolbar renders a
- *    Section, which is a block and spans the whole band, so opting that out
- *    made the entire top edge of the window undraggable. The scroller
- *    shrink-wraps its pills, so everything past the `+` stays `drag` — which is
- *    the whole reason the band exists.
+ *    Scoped to the pills, their descendants and the `+` — not to
+ *    `.app-invoice-tabs` and not to the scroller either. Not the strip, because
+ *    Toolbar renders a Section, which is a block and spans the whole band, so
+ *    opting that out made the entire top edge of the window undraggable. Not the
+ *    scroller, because the scroller's box includes the `gap` strips *between*
+ *    pills, which hold nothing clickable: `no-drag` there produced pixels that
+ *    were neither draggable nor clickable. Everything that is not a pill stays
+ *    `drag` — which is the whole reason the band exists.
  *
  * 2. Inline scrolling. Many open tabs must not widen the shell (see the
  *    `:has(> .app-side-nav)` note below for what 3px of inline overflow cost
- *    last time). `overflow-x: auto` makes the scroller's minimum contribution in
- *    the inline axis zero, so it shrinks under pressure instead of pushing; the
- *    bar itself is hidden the same way, and for the same reason, as the
- *    sidebar's. The `+` is outside the scroller, so it never scrolls away.
+ *    last time), and must not clip the `+` either: the pills scroll, the `+`
+ *    stays put.
+ *
+ *    `overflow-x: auto` makes the scroller's own minimum contribution in the
+ *    inline axis zero — but that is not enough on its own, and the bug it hid is
+ *    worth naming. Between the Section and the scroller, Toolbar renders
+ *    `[role="toolbar"]` and a start slot, both flex boxes whose `min-width` is
+ *    `auto`: they refuse to shrink below their content, so with ten tabs open the
+ *    scroller kept its intrinsic 1056px inside a 680px band. Nothing scrolled,
+ *    because there was no overflow *in* the scroller — the band simply clipped,
+ *    and at 1000px the trailing `+` ended up 400px outside the window with no
+ *    scrollbar anywhere able to bring it back. The `min-inline-size: 0` chain
+ *    below is what makes the pressure reach the one box that can absorb it.
  *
  * Appearance is all `var()`: the four colours are declared once in
  * `theme/appTheme.ts` (the token pipeline) and referenced here, exactly like
@@ -79,9 +91,10 @@ body {
  * secondary ink at its measured contrast against the flat window rather than
  * against a tint of it.
  */
-.app-invoice-tabs-scroller,
-.app-invoice-tabs-scroller *,
-.app-invoice-tabs-new {
+.app-invoice-tab,
+.app-invoice-tab *,
+.app-invoice-tabs-new,
+.app-invoice-tabs-new * {
   -webkit-app-region: no-drag;
 }
 
@@ -99,14 +112,34 @@ body {
   padding-inline-start: var(--spacing-2);
 }
 
+/*
+  Toolbar's own two boxes — `[role="toolbar"]` and the start slot it puts the
+  strip in. Both are flex boxes with `min-width: auto`, so without this the
+  shrink stops here and never reaches the scroller. Descendant selectors rather
+  than `>` because how many wrappers Section renders is the design system's
+  business, not ours.
+*/
+.app-invoice-tabs [role='toolbar'],
+.app-invoice-tabs [role='toolbar'] > * {
+  min-inline-size: 0;
+}
+
 .app-invoice-tabs-scroller {
   display: flex;
   align-items: center;
   gap: var(--spacing-1);
+  /* Shrink under pressure, never grow: with two tabs open the `+` sits right
+     after the last pill, not at the far end of the band. */
+  flex: 0 1 auto;
   min-inline-size: 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
+}
+
+/* The `+` is pinned: it is the scroller's sibling, and it never shrinks away. */
+.app-invoice-tabs-new {
+  flex: none;
 }
 
 .app-invoice-tabs-scroller::-webkit-scrollbar {
@@ -115,6 +148,14 @@ body {
 }
 
 .app-invoice-tab {
+  /*
+    Pills keep their width and the scroller scrolls, rather than ten pills
+    squeezing to 65px each: `flex: none` is what puts the overflow *inside* the
+    scroll container, where a scroll (and `scrollIntoView` on the active pill) can
+    reach it. Shrinking instead would keep every pill on screen and make none of
+    them readable.
+  */
+  flex: none;
   background-color: transparent;
   color: var(--color-invoice-tab-ink);
   /* Long invoice numbers ellipsize inside the pill (Token's own label style)
