@@ -187,6 +187,32 @@ describe('buildPaneTimeline', () => {
     expect(timeline.overduePercent).toBe(0);
   });
 
+  it('draws no timeline for a draft, because no clock has started', () => {
+    const timeline = buildPaneTimeline(
+      makeInvoice({ status: 'draft', updatedAt: '2026-07-25T18:00:00.000Z' }),
+      TODAY,
+    );
+    // The banner used to say "not issued yet" directly above
+    // "issued 26 May · due 25 Jun · today 29 Jul" and a full progress bar.
+    expect(timeline.hasProgress).toBe(false);
+    expect(timeline.elapsedPercent).toBe(0);
+    expect(timeline.axis).toEqual(['last edited 25 Jul']);
+    expect(timeline.axis.join(' ')).not.toContain('issued');
+    expect(timeline.axis.join(' ')).not.toContain('due');
+  });
+
+  it('says the term is prospective on a draft rather than in force', () => {
+    expect(buildPaneTimeline(makeInvoice({ status: 'draft' }), TODAY).detail).toBe(
+      'Net 30 once issued',
+    );
+  });
+
+  it('keeps the timeline on every invoice that has actually been issued', () => {
+    for (const status of ['sent', 'overdue', 'paid', 'void'] as const) {
+      expect(buildPaneTimeline(makeInvoice({ status }), TODAY).hasProgress).toBe(true);
+    }
+  });
+
   it('names a void invoice as cancelled', () => {
     expect(buildPaneTimeline(makeInvoice({ status: 'void' }), TODAY).headline).toBe(
       'Void — cancelled',
@@ -240,6 +266,32 @@ describe('buildPaneFacts', () => {
     expect(client?.sub).toBe('2 open invoices');
     // i3 was paid six days after its due date; the invoice on screen is excluded.
     expect(client?.note).toBe('pays 6 days late');
+  });
+
+  it('never puts an amount *due* on a draft', () => {
+    const facts = buildPaneFacts({
+      invoice: makeInvoice({ status: 'draft', totalCents: 65_356 }),
+      clientInvoices: null,
+      today: TODAY,
+    });
+    const amount = facts.find((fact) => fact.key === 'amount');
+    // It used to read "Amount due $0.00" over "$653.56 invoiced" — one invoice
+    // claiming both that nothing is owed and that it has been invoiced.
+    expect(amount?.caption).toBe('Draft total');
+    expect(amount?.value).toBe('$653.56');
+    expect(amount?.sub).toBe('Nothing due until it is sent');
+  });
+
+  it('dates a draft as planned rather than as done', () => {
+    const facts = buildPaneFacts({
+      invoice: makeInvoice({ status: 'draft' }),
+      clientInvoices: null,
+      today: TODAY,
+    });
+    const issued = facts.find((fact) => fact.key === 'issued');
+    expect(issued?.caption).toBe('Issue date');
+    expect(issued?.value).toBe('26 May 2026');
+    expect(issued?.sub).toBe('Not sent yet · Net 30');
   });
 
   it('says so plainly when the client owes nothing', () => {

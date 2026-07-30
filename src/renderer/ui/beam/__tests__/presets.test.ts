@@ -87,9 +87,34 @@ describe('beamProps', () => {
     expect([...BEAM_PRESETS].sort()).toEqual([...EXPECTED_PRESETS].sort());
   });
 
-  it('uses every BorderBeamSize the library ships at least once', () => {
+  /*
+   * Was "uses every BorderBeamSize at least once". `pulse-outside` is now
+   * deliberately excluded, and the assertion states the exclusion rather than
+   * being loosened to tolerate it — both halves still fail loudly.
+   *
+   * Why it is excluded: it is the only size whose layers carry negative insets
+   * (a bloom at `inset: -30px`), so it enlarges its host by 30px on every side.
+   * The launcher wore it while it was a bubble floating in the window's corner,
+   * which had the room. In the breadcrumb band it did not: 30px of halo around
+   * a 28px button, minus the 16px shell gutter, hung 12px past the content box
+   * and put a horizontal scrollbar on every route in the app
+   * (`.astryx-layout-content` 1196/1184 at a 1440 window, the same 12px at
+   * every width). No other surface in this app has 30px of clearance either —
+   * see the module header for the walk through all six.
+   */
+  const UNUSED_SIZE: BorderBeamSize = 'pulse-outside';
+
+  it('uses every BorderBeamSize the library ships except the uncropped halo', () => {
     const used = new Set(BEAM_PRESETS.map((preset) => beamProps(preset, 'dark').size));
-    expect([...used].sort()).toEqual([...ALL_SIZE_KEYS].sort());
+    expect([...used].sort()).toEqual([...ALL_SIZE_KEYS].filter((size) => size !== UNUSED_SIZE).sort());
+  });
+
+  it('keeps the outward bloom off every surface, because nothing has room for it', () => {
+    // Stated separately from the coverage assertion above so the reason has its
+    // own failure: this is the regression, not a tuning preference.
+    for (const preset of BEAM_PRESETS) {
+      expect(beamProps(preset, 'dark').size).not.toBe(UNUSED_SIZE);
+    }
   });
 
   it('uses every BorderBeamColorVariant the library ships at least once', () => {

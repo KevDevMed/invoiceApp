@@ -141,6 +141,83 @@ export const TAB_STRIP_BAND_HEIGHT = 'var(--spacing-10)';
 export const BREADCRUMB_BAND_HEIGHT = 'var(--spacing-9)';
 
 /**
+ * The shell gutter: the one inline inset every band in the content column
+ * starts at.
+ *
+ * The bands used to disagree. The tab strip sat at 24px (the design system's
+ * own container padding, plus 8px this app added on top), the breadcrumb trail
+ * at 16px, and the page column wherever its centred cap put it — three left
+ * edges within 8px of each other down the top-left of the window, which reads
+ * as three near-misses rather than three decisions. Each was individually
+ * defensible and the staircase was not.
+ *
+ * 16px, because it is already two of the three: the breadcrumb bar's padding,
+ * and `Section`'s `--container-padding-inline-start` default, which is what
+ * indents the Toolbar the tab strip is built from. So the strip lands on the
+ * gutter by *removing* its extra 8px, not by adding anything.
+ *
+ * The step is exported beside the token because Astryx layout components take a
+ * spacing *step* (`paddingInline={4}`) while CSS takes the custom property; the
+ * two are one decision and `shellBandInsetsPx` is what keeps them one.
+ */
+export const SHELL_GUTTER_STEP = 4;
+export const SHELL_GUTTER = 'var(--spacing-4)';
+
+/** --spacing-4, in px. Paired with the token so the two cannot drift. */
+export const SHELL_GUTTER_PX = 16;
+
+/**
+ * Inline padding `Section` applies from the theme default, and so the inset
+ * `Toolbar` — and the tab strip built on it — already carries before this app
+ * adds anything (`Layout/container.stylex.ts`: the section padding chain
+ * terminates at `--spacing-4`).
+ *
+ * Measured from the design system rather than declared by us, which is why it
+ * is a plain number: if the theme ever moves it, the constant below is the one
+ * line that has to change, and the test that pins the three bands together is
+ * what will say so.
+ */
+export const SECTION_CONTAINER_PADDING_PX = 16;
+
+/**
+ * Extra inline-start padding `.app-invoice-tabs` adds on top of Section's own.
+ *
+ * Zero — and that is the fix. It used to be 8px, on the theory that Toolbar's
+ * edge compensation pulled the first item back by that much; it does not, since
+ * compensation only applies when the slot's first child carries
+ * `data-astryx-edge-comp` and the strip's first child is a scroller.
+ */
+export const TAB_STRIP_EXTRA_INSET_PX = SHELL_GUTTER_PX - SECTION_CONTAINER_PADDING_PX;
+
+/** Where each band in the content column puts its first element, in px from
+ *  the content region's own inline start. */
+export interface ShellBandInsetsPx {
+  readonly tabStrip: number;
+  readonly breadcrumbs: number;
+  /**
+   * The page column's *minimum* inset. `ui/Page` caps its column and centres
+   * it, so on a window wide enough for the cap to bite the column steps further
+   * in than this — deliberately, and by a whole gutter rather than by the 8px
+   * that made the old three edges look accidental.
+   */
+  readonly pageMin: number;
+}
+
+/**
+ * The three insets, so a unit test can assert they are one number.
+ *
+ * This is the whole of defect 2 expressed as code: the bands are aligned if and
+ * only if these three agree, and no screenshot is needed to find out.
+ */
+export function shellBandInsetsPx(): ShellBandInsetsPx {
+  return {
+    tabStrip: SECTION_CONTAINER_PADDING_PX + TAB_STRIP_EXTRA_INSET_PX,
+    breadcrumbs: SHELL_GUTTER_PX,
+    pageMin: SHELL_GUTTER_PX,
+  };
+}
+
+/**
  * The collapsed unified title bar: traffic lights, expand toggle, centred
  * `InvoiceApp — <page>` title, spanning both columns.
  */

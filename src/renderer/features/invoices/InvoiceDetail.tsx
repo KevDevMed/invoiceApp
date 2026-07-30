@@ -24,6 +24,7 @@ import { Button } from '@astryxdesign/core/Button';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 
+import { SHELL_GUTTER_STEP } from '../../chrome';
 import type { Invoice, InvoiceWithItems } from '../../../shared/types';
 import { todayIso } from './format';
 import { fetchClientInvoices } from './listData';
@@ -79,7 +80,7 @@ export function InvoiceDetail(): React.JSX.Element {
       <HStack
         gap={2}
         align="center"
-        paddingInline={5}
+        paddingInline={SHELL_GUTTER_STEP}
         paddingBlock={2}
         style={{ borderBlockEnd: '1px solid var(--color-border)' }}
       >

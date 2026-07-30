@@ -1,22 +1,28 @@
 /**
  * The breadcrumb bar: a 36px band directly under the tab strip.
  *
- * Trail at the inline start, live status at the inline end, a hairline along
- * the bottom. Everything it *decides* is in `./breadcrumbTrail` and
- * `./shellStatus`; this file is the arrangement and nothing else.
+ * Trail at the inline start, live status and the shell's own trailing control
+ * at the inline end, a hairline along the bottom. Everything it *decides* is in
+ * `./breadcrumbTrail` and `./shellStatus`; this file is the arrangement and
+ * nothing else.
+ *
+ * Its inline padding is `SHELL_GUTTER` — the same inset the tab strip above it
+ * starts at and the same one `ui/Page` uses as its minimum. That is the point
+ * of the constant: three bands, one left edge.
  *
  * Not a drag region. The band immediately above it is (the window has to be
  * grabbable somewhere), but a breadcrumb is a row of links, and a row of links
  * inside `-webkit-app-region: drag` is a row of links that has to opt every one
  * of its own children back out. Keeping the drag surface in the strip above
- * means this band never has to think about it.
+ * means this band never has to think about it — including the `action` slot,
+ * which is why the assistant launcher can live here at all.
  */
 
 import { Breadcrumbs, BreadcrumbItem } from '@astryxdesign/core/Breadcrumbs';
 import { HStack, StackItem } from '@astryxdesign/core/Stack';
 import { Text } from '@astryxdesign/core/Text';
 
-import { BREADCRUMB_BAND_HEIGHT } from '../chrome';
+import { BREADCRUMB_BAND_HEIGHT, SHELL_GUTTER_STEP } from '../chrome';
 import type { BreadcrumbStep } from './breadcrumbTrail';
 
 /** Accessible name of the nav landmark the trail renders as. */
@@ -25,10 +31,17 @@ export const BREADCRUMB_LABEL = 'Page location';
 export function ShellBreadcrumbs({
   trail,
   status,
+  action,
 }: {
   readonly trail: readonly BreadcrumbStep[];
   /** The `12 open · 3 overdue` line, or null when there is nothing to state. */
   readonly status: string | null;
+  /**
+   * The band's trailing control — today the assistant launcher, and the reason
+   * it is a slot rather than a hardcoded child: this bar is the shell's, and
+   * what it carries is AppShell's decision, not the bar's.
+   */
+  readonly action?: React.ReactNode;
 }): React.JSX.Element {
   return (
     <StackItem size="static">
@@ -38,7 +51,7 @@ export function ShellBreadcrumbs({
         align="center"
         justify="between"
         gap={3}
-        paddingInline={4}
+        paddingInline={SHELL_GUTTER_STEP}
       >
         <StackItem size="fill">
           {trail.length === 0 ? null : (
@@ -63,6 +76,7 @@ export function ShellBreadcrumbs({
             {status}
           </Text>
         )}
+        {action}
       </HStack>
     </StackItem>
   );

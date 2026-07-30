@@ -25,6 +25,12 @@ import {
   SECTION_ROUTES,
   sectionLabel,
   RESIZABLE_STORAGE_PREFIX,
+  SECTION_CONTAINER_PADDING_PX,
+  SHELL_GUTTER,
+  SHELL_GUTTER_PX,
+  SHELL_GUTTER_STEP,
+  shellBandInsetsPx,
+  TAB_STRIP_EXTRA_INSET_PX,
   SIDE_NAV_WIDTH,
   SIDE_NAV_WIDTH_STORAGE_ID,
   SIDE_NAV_WIDTH_STORAGE_KEY,
@@ -665,5 +671,80 @@ describe('AppShell consumes the chrome helpers', () => {
     const bandIndex = source.indexOf('height={contentBandHeight}');
     expect(bandIndex).toBeGreaterThan(-1);
     expect(source.indexOf('<ShellBreadcrumbs')).toBeGreaterThan(bandIndex);
+  });
+
+  /*
+   * The assistant launcher belongs to the shell's own chrome, not to the corner
+   * of the window. The regression this pins is the one that was shipped: the
+   * dock as a sibling of `<Outlet/>`, floating over whatever the page had put
+   * in its bottom-right — which on the invoices cockpit is `Export PDF`.
+   */
+  it('hands the assistant launcher to the breadcrumb bar, not to the page', () => {
+    const bar = source.slice(source.indexOf('<ShellBreadcrumbs'), source.lastIndexOf('<Outlet'));
+    expect(bar).toMatch(/action=\{isDockVisible\(pathname\) \? <AssistantDock \/> : undefined\}/);
+    // Nothing renders the dock anywhere else — in particular not beside the
+    // outlet, which is where it used to be.
+    expect(source.match(/<AssistantDock \/>/g)).toHaveLength(1);
+  });
+});
+
+/*
+ * The three bands' left edges, read out of the files that set them.
+ *
+ * `shellBandInsetsPx` says what the relationship is; these say the shell still
+ * expresses it. The staircase this replaced (strip 280, trail 272, heading 324
+ * at a 1440 window) was three files each doing something individually
+ * defensible, so the invariant has to be checked across all three or it is not
+ * being checked at all.
+ */
+describe('the shell gutter holds across the files that use it', () => {
+  const read = (file: string): string => readFileSync(new URL(file, import.meta.url), 'utf8');
+
+  it('is the same 16px in both of the shapes it is written in', () => {
+    expect(SHELL_GUTTER).toBe(`var(--spacing-${SHELL_GUTTER_STEP})`);
+    expect(resolvePx(SHELL_GUTTER)).toBe(SHELL_GUTTER_PX);
+  });
+
+  // The property, in one line: every band in the content column starts at the
+  // same inline inset.
+  it('puts the tab strip, the breadcrumb trail and the page column on one edge', () => {
+    const insets = shellBandInsetsPx();
+    expect(insets.tabStrip).toBe(SHELL_GUTTER_PX);
+    expect(insets.breadcrumbs).toBe(SHELL_GUTTER_PX);
+    expect(insets.pageMin).toBe(SHELL_GUTTER_PX);
+  });
+
+  it('leaves the tab strip on the container padding Toolbar already carries', () => {
+    // The bug: adding padding on top of Section's own, which is exactly how the
+    // strip ended up 8px right of the trail beneath it.
+    expect(TAB_STRIP_EXTRA_INSET_PX).toBe(0);
+    expect(SECTION_CONTAINER_PADDING_PX).toBe(SHELL_GUTTER_PX);
+    const css = read('../styles/global.css');
+    const rule = css.slice(css.indexOf('.app-invoice-tabs {'), css.indexOf('.app-invoice-tabs ['));
+    expect(rule).toMatch(/padding-inline-start:\s*0;/);
+    expect(rule).not.toMatch(/padding-inline-start:\s*var\(/);
+  });
+
+  it('pads the breadcrumb bar and the page column from the same constant', () => {
+    for (const file of ['../ui/ShellBreadcrumbs.tsx', '../ui/Page.tsx']) {
+      const source = read(file);
+      expect(source).toMatch(/SHELL_GUTTER_STEP/);
+      expect(source).toMatch(/paddingInline=\{SHELL_GUTTER_STEP\}/);
+    }
+  });
+
+  /*
+   * The page column is the one that does *not* simply sit on the gutter, and
+   * that is deliberate: `Page` caps its column and centres it, so on a wide
+   * window it steps in from the gutter by half of whatever the cap leaves over.
+   * The cap is load-bearing — the screenshot harness asserts equal gutters on
+   * Clients and Settings at 1600 — so what the shell can guarantee is the
+   * minimum, and that a step away from the gutter is a whole gutter rather than
+   * the 8px that read as a mistake.
+   */
+  it('keeps the page column capped and centred', () => {
+    const source = read('../ui/Page.tsx');
+    expect(source).toMatch(/maxWidth = 1120/);
+    expect(source).toMatch(/align="center"/);
   });
 });

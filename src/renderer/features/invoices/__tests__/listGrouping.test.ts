@@ -4,15 +4,22 @@ import type { Invoice } from '../../../../shared/types';
 import { INVOICE_STATUSES } from '../../../../shared/types';
 import {
   GROUP_ORDER,
+  LIST_COLUMN_MIN_WIDTH,
+  LIST_COLUMN_WIDTH,
+  PANE_MIN_WIDTH,
   adjacentRowId,
   buildInvoiceGroups,
+  countOpenInvoices,
   countSegments,
+  extraCurrencyLabel,
   flattenGroups,
   formatCurrencyTotals,
   formatMoneyRounded,
-  groupHeaderLabel,
+  groupHeaderParts,
   groupOf,
   isOpenState,
+  listColumnWidthAt,
+  listColumnWidthCss,
   matchesSegment,
   outstandingTotals,
   overdueTotals,
@@ -21,6 +28,7 @@ import {
   rowStateOf,
   shortDate,
   sumByCurrency,
+  summariseTotals,
 } from '../listGrouping';
 import type { ListSegment, RowState } from '../listGrouping';
 
@@ -284,10 +292,10 @@ describe('buildInvoiceGroups', () => {
     const overdue = groups.find((group) => group.key === 'overdue');
     const paid = groups.find((group) => group.key === 'paid');
     expect(overdue?.totals).toEqual([{ currency: 'USD', cents: 1_800_000 }]);
-    expect(groupHeaderLabel(overdue!)).toBe('Overdue · $18,000');
+    expect(groupHeaderParts(overdue!).label).toBe('Overdue · $18,000');
     // Money that has arrived is not a figure you are chasing.
     expect(paid?.totals).toEqual([]);
-    expect(groupHeaderLabel(paid!)).toBe('Paid');
+    expect(groupHeaderParts(paid!).label).toBe('Paid');
   });
 
   it('sorts open groups by due date and settled groups newest first', () => {
@@ -381,5 +389,153 @@ describe('outstandingTotals / overdueTotals', () => {
     expect(isOpenState('draft')).toBe(false);
     expect(isOpenState('paid')).toBe(false);
     expect(isOpenState('void')).toBe(false);
+  });
+});
+
+describe('countOpenInvoices', () => {
+  const invoices = [
+    makeInvoice({ id: 'a', status: 'sent', dueDate: '2026-06-25' }), // past due -> overdue
+    makeInvoice({ id: 'b', status: 'sent', dueDate: '2026-07-31' }), // due soon
+    makeInvoice({ id: 'c', status: 'sent', dueDate: '2026-09-01' }), // later
+    makeInvoice({ id: 'd', status: 'overdue', dueDate: '2026-01-01' }),
+    makeInvoice({ id: 'e', status: 'draft' }),
+    makeInvoice({ id: 'f', status: 'paid' }),
+    makeInvoice({ id: 'g', status: 'void' }),
+  ];
+
+  it('counts the late ones by the clock, not by the stored flag', () => {
+    // Two rows are late: the one stored `overdue`, and the `sent` one whose
+    // due date has passed. Counting the flag alone would say 1.
+    expect(countOpenInvoices(invoices, TODAY)).toEqual({ open: 4, overdue: 2 });
+  });
+
+  it('leaves drafts, paid and void out of "open" entirely', () => {
+    expect(countOpenInvoices(
+      [makeInvoice({ id: 'e', status: 'draft' }), makeInvoice({ id: 'f', status: 'paid' })],
+      TODAY,
+    )).toEqual({ open: 0, overdue: 0 });
+  });
+
+  it('is the same answer the segmented control gives', () => {
+    const counts = countSegments(invoices, TODAY);
+    const open = countOpenInvoices(invoices, TODAY);
+    expect(open.overdue).toBe(counts.overdue);
+    expect(open.open).toBe(counts.overdue + counts.sent);
+  });
+});
+
+describe('extraCurrencyLabel / summariseTotals', () => {
+  const totals = [
+    { currency: 'GBP', cents: 12_433_300 },
+    { currency: 'EUR', cents: 10_307_300 },
+    { currency: 'USD', cents: 8_381_900 },
+    { currency: 'CAD', cents: 300_000 },
+  ];
+
+  it('names how many currencies the headline is standing in front of', () => {
+    expect(extraCurrencyLabel(0)).toBeNull();
+    expect(extraCurrencyLabel(-1)).toBeNull();
+    expect(extraCurrencyLabel(1)).toBe('+1 currency');
+    expect(extraCurrencyLabel(3)).toBe('+3 currencies');
+  });
+
+  it('leads with the largest currency and counts the rest', () => {
+    const summary = summariseTotals(totals);
+    expect(summary.lead).toBe('£124,333');
+    expect(summary.more).toBe('+3 currencies');
+    expect(summary.extraCurrencies).toBe(3);
+  });
+
+  it('keeps every currency in the breakdown, never summed together', () => {
+    expect(summariseTotals(totals).full).toBe('£124,333 · €103,073 · $83,819 · CA$3,000');
+  });
+
+  it('says nothing extra when one currency is the whole story', () => {
+    const summary = summariseTotals([{ currency: 'USD', cents: 100_000 }]);
+    expect(summary.lead).toBe('$1,000');
+    expect(summary.more).toBeNull();
+    expect(summary.full).toBe('$1,000');
+  });
+
+  it('is empty for an empty set so the caller can drop the line', () => {
+    expect(summariseTotals([])).toEqual({
+      lead: '',
+      leadCurrency: null,
+      more: null,
+      full: '',
+      extraCurrencies: 0,
+    });
+  });
+
+  it('leads with the currency it is asked for, so two summaries can be compared', () => {
+    // The overdue slice is led by whatever the outstanding line led with —
+    // "£124,333 outstanding · €86,925 overdue" invites reading the second as a
+    // fraction of the first when it is not even the same money.
+    const overdue = [
+      { currency: 'EUR', cents: 8_692_500 },
+      { currency: 'GBP', cents: 2_000_000 },
+    ];
+    const summary = summariseTotals(overdue, 'GBP');
+    expect(summary.lead).toBe('£20,000');
+    expect(summary.leadCurrency).toBe('GBP');
+    // The breakdown is untouched: still every currency, still largest first.
+    expect(summary.full).toBe('€86,925 · £20,000');
+  });
+
+  it('falls back to the largest when the asked-for currency is not in the set', () => {
+    expect(summariseTotals([{ currency: 'EUR', cents: 100_000 }], 'GBP').lead).toBe('€1,000');
+  });
+});
+
+describe('groupHeaderParts', () => {
+  it('splits the caption into the figure and the count of the rest', () => {
+    const groups = buildInvoiceGroups({
+      invoices: [
+        makeInvoice({ id: 'a', status: 'draft', currency: 'USD', totalCents: 7_330_800 }),
+        makeInvoice({ id: 'b', status: 'draft', currency: 'EUR', totalCents: 4_949_900 }),
+        makeInvoice({ id: 'c', status: 'draft', currency: 'GBP', totalCents: 100_000 }),
+      ],
+      clientNames: NAMES,
+      today: TODAY,
+      segment: 'all',
+    });
+    const drafts = groups.find((group) => group.key === 'drafts');
+    expect(groupHeaderParts(drafts!)).toEqual({
+      label: 'Drafts · $73,308',
+      more: '+2 currencies',
+    });
+  });
+});
+
+describe('listColumnWidthAt / listColumnWidthCss', () => {
+  it('gives the list its ideal width once the pane is comfortable', () => {
+    expect(listColumnWidthAt(1184)).toBe(LIST_COLUMN_WIDTH);
+  });
+
+  it('takes width off the list before the pane goes under its floor', () => {
+    expect(listColumnWidthAt(LIST_COLUMN_WIDTH + PANE_MIN_WIDTH)).toBe(LIST_COLUMN_WIDTH);
+    expect(listColumnWidthAt(700)).toBe(700 - PANE_MIN_WIDTH);
+  });
+
+  it('never squeezes the list past the point where a row stops reading', () => {
+    expect(listColumnWidthAt(600)).toBe(LIST_COLUMN_MIN_WIDTH);
+    expect(listColumnWidthAt(0)).toBe(LIST_COLUMN_MIN_WIDTH);
+  });
+
+  it('fits the app’s own minimum window', () => {
+    // src/main/window.ts: minWidth 960, less the side nav at its 224px minimum
+    // and its 240px default. Both have to leave the pane its floor.
+    for (const nav of [224, 240]) {
+      const available = 960 - nav;
+      expect(listColumnWidthAt(available) + PANE_MIN_WIDTH).toBeLessThanOrEqual(available);
+    }
+  });
+
+  it('hands the stylesheet the same three numbers', () => {
+    const css = listColumnWidthCss();
+    expect(css).toContain(`${String(LIST_COLUMN_MIN_WIDTH)}px`);
+    expect(css).toContain(`${String(PANE_MIN_WIDTH)}px`);
+    expect(css).toContain(`${String(LIST_COLUMN_WIDTH)}px`);
+    expect(css.startsWith('clamp(')).toBe(true);
   });
 });

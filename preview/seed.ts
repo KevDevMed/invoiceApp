@@ -14,6 +14,14 @@
  * data — the screenshot harness cross-checks the rendered totals against a
  * direct read of the SQLite file and would flag any drift.
  *
+ * Timestamps are part of the fixture, not a side effect of when it was built.
+ * The list's second line is a relative time — `34 days late`, `edited 25 Jul`,
+ * `paid 24 Jul` — so a seed that stamped every row with the moment it ran would
+ * print the same sentence on all ten drafts and prove nothing. `stampsFor`
+ * gives each row a `created_at`, `updated_at` and `paid_at` derived from its own
+ * dates, spread across the year and clamped so nothing is edited or paid before
+ * it was issued, or after the reference date.
+ *
  * Every total is computed by `createInvoice` in `src/domain/invoices/repository.ts`,
  * which runs the same integer-cent arithmetic the desktop app runs. Nothing here
  * writes a subtotal, tax amount or total by hand — if the preview's numbers ever
@@ -36,6 +44,21 @@ const MS_PER_DAY = 86_400_000;
 
 function isoDay(reference: Date, daysAgo: number): string {
   return new Date(reference.getTime() - daysAgo * MS_PER_DAY).toISOString().slice(0, 10);
+}
+
+/**
+ * Clock times for the two stamps a row can be made of. Fixed, and fixed in UTC,
+ * because the list prints them with a `slice(0, 10)` and no timezone conversion
+ * — a stamp taken at the reference date's own wall time would drift onto the
+ * neighbouring day depending on when the preview happened to be seeded. Created
+ * in the morning and touched in the afternoon, so a record created and last
+ * changed on the same day still reads in the right order.
+ */
+const CREATED_AT_TIME = 'T09:00:00.000Z';
+const TOUCHED_AT_TIME = 'T16:30:00.000Z';
+
+function isoStamp(reference: Date, daysAgo: number, time: string): string {
+  return `${isoDay(reference, daysAgo)}${time}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,13 +227,27 @@ interface SeedItem {
   readonly unitPriceCents: number;
 }
 
-interface SeedInvoice {
+export interface SeedInvoice {
   /** Index into CLIENTS. */
   readonly client: number;
   readonly status: InvoiceStatus;
   readonly issuedDaysAgo: number;
   /** Days after the issue date. Negative net terms would be nonsense, so this is always positive. */
   readonly netDays: number;
+  /**
+   * Days after the issue date the money arrived. `paid` rows only — it is what
+   * the row's second line prints (`paid 24 Jul`), so a third of the list reads
+   * off it. Clamped at seed time: nothing is ever paid before it was issued or
+   * after the reference date. Defaults to the net terms, i.e. paid on the day.
+   */
+  readonly paidAfterDays?: number;
+  /**
+   * Days before the reference date the record last changed. `draft` rows print
+   * it as `edited 25 Jul` and `void` rows as `voided 3 Apr`; every other state
+   * prints a due date instead and leaves this alone, so its `updated_at` stays
+   * on the day it was created. Clamped so nothing is edited before it existed.
+   */
+  readonly editedDaysAgo?: number;
   readonly taxRateBps?: number;
   readonly notes?: string;
   readonly items: readonly SeedItem[];
@@ -228,6 +265,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 238,
     netDays: 30,
+    paidAfterDays: 34,
     notes: 'Q1 discovery engagement.',
     items: [
       { description: 'Discovery workshop (facilitation)', quantityMilli: 2000, unitPriceCents: 145000 },
@@ -240,6 +278,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 221,
     netDays: 45,
+    paidAfterDays: 51,
     items: [
       { description: 'Retainer — senior engineering, February', quantityMilli: 72500, unitPriceCents: 18500 },
       { description: 'Out-of-hours release support', quantityMilli: 3250, unitPriceCents: 27750 },
@@ -250,6 +289,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 196,
     netDays: 30,
+    paidAfterDays: 27,
     taxRateBps: 0,
     notes: 'VAT reverse-charged to the customer under EU intra-community supply rules.',
     items: [
@@ -263,6 +303,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 168,
     netDays: 30,
+    paidAfterDays: 38,
     items: [
       { description: 'Firmware telemetry review', quantityMilli: 18750, unitPriceCents: 21000 },
       { description: 'Bench test rig hire (days)', quantityMilli: 3500, unitPriceCents: 42500 },
@@ -274,6 +315,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 142,
     netDays: 21,
+    paidAfterDays: 19,
     items: [
       { description: 'Seasonal catalogue photography (half days)', quantityMilli: 5500, unitPriceCents: 68000 },
       { description: 'Retouching (per image)', quantityMilli: 84000, unitPriceCents: 1999 },
@@ -284,6 +326,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 117,
     netDays: 30,
+    paidAfterDays: 44,
     items: [
       { description: 'Warehouse dashboard build', quantityMilli: 61250, unitPriceCents: 18500 },
       { description: 'Data warehouse migration', quantityMilli: 22500, unitPriceCents: 21500 },
@@ -295,6 +338,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 96,
     netDays: 30,
+    paidAfterDays: 29,
     notes: 'Consolidated invoice for the spring engagement, as agreed.',
     items: [
       { description: 'Brand system consultation (days)', quantityMilli: 4250, unitPriceCents: 78000 },
@@ -307,6 +351,8 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'paid',
     issuedDaysAgo: 74,
     netDays: 45,
+    // The note is the fixture: day 58 is what the row has to say.
+    paidAfterDays: 58,
     notes: 'Paid at day 58, after the second reminder.',
     items: [
       { description: 'Retainer — senior engineering, May', quantityMilli: 68000, unitPriceCents: 18500 },
@@ -342,6 +388,8 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'draft',
     issuedDaysAgo: 11,
     netDays: 21,
+    // Still being worked on, so it is the freshest draft in the list.
+    editedDaysAgo: 0,
     notes: 'Awaiting confirmation of the final shoot day before sending.',
     items: [
       { description: 'Autumn campaign photography (half days)', quantityMilli: 3500, unitPriceCents: 68000 },
@@ -354,6 +402,7 @@ const INVOICES: readonly SeedInvoice[] = [
     status: 'draft',
     issuedDaysAgo: 4,
     netDays: 30,
+    editedDaysAgo: 1,
     items: [
       { description: 'Design system rollout, sprint 1', quantityMilli: 31250, unitPriceCents: 19500 },
       { description: 'Accessibility review', quantityMilli: 8500, unitPriceCents: 22500 },
@@ -431,6 +480,35 @@ const CLIENT_CYCLE: readonly number[] = [0, 2, 6, 1, 8, 3, 0, 9, 5, 7, 4];
 
 const NET_DAYS_CYCLE: readonly number[] = [14, 30, 45, 21, 30, 60, 30, 7];
 
+/**
+ * Days either side of the due date the money actually arrived. Negative is an
+ * early payer. Deliberately uneven: a `paid` row prints the day it settled, and
+ * a fixture where every client paid on the dot would say nothing about how the
+ * list reads when they do not.
+ */
+const PAY_DELAY_CYCLE: readonly number[] = [-4, 2, 9, -1, 17, 5, -7, 26, 1, 11];
+
+/**
+ * How recently the youngest `paid` invoices settled, in days before the
+ * reference date. Only used where the delay above would fall after the
+ * reference date — an invoice issued eleven days ago on net 30 was paid early,
+ * not in the future — and it exists so those few rows spread over the last week
+ * instead of all collapsing onto "paid today".
+ */
+const PAY_RECENCY_CYCLE: readonly number[] = [2, 5, 1, 8, 3, 6];
+
+/**
+ * Days before the reference date each generated draft was last edited, one per
+ * draft in the order they are generated. The whole point of the draft row's
+ * second line is that these differ: two within the week, then a fortnight, a
+ * month, a quarter, most of a year. Clamped against the issue date, so a draft
+ * is never edited before it was raised.
+ */
+const DRAFT_EDITED_DAYS_AGO_CYCLE: readonly number[] = [3, 33, 12, 61, 27, 118, 152, 248];
+
+/** Days after issue each generated invoice was voided, one per void invoice. */
+const VOID_AFTER_DAYS_CYCLE: readonly number[] = [9, 26, 4, 17];
+
 interface CatalogueLine {
   readonly description: string;
   /** Milli-units. Multiplied by a per-invoice factor below. */
@@ -471,6 +549,10 @@ function lcg(seed: number): () => number {
 export function generateInvoices(count: number = GENERATED_COUNT): SeedInvoice[] {
   const random = lcg(0x5eed_1234);
   const generated: SeedInvoice[] = [];
+  // Drafts and voids take their timing from a cycle read in generation order,
+  // so each one gets its own entry rather than the same entry as its neighbour.
+  let drafts = 0;
+  let voids = 0;
 
   for (let index = 0; index < count; index += 1) {
     const status = STATUS_CYCLE[index % STATUS_CYCLE.length] ?? 'draft';
@@ -497,11 +579,34 @@ export function generateInvoices(count: number = GENERATED_COUNT): SeedInvoice[]
       });
     }
 
+    // When the row last moved. Only paid, draft and void rows print it, so only
+    // those three carry it; everything else keeps the day it was raised.
+    let timing: { paidAfterDays?: number; editedDaysAgo?: number } = {};
+    if (status === 'paid') {
+      const delay = PAY_DELAY_CYCLE[index % PAY_DELAY_CYCLE.length] ?? 0;
+      const recency = PAY_RECENCY_CYCLE[index % PAY_RECENCY_CYCLE.length] ?? 0;
+      // Settled on the terms give or take the delay — unless that would fall
+      // after the reference date, in which case this client paid early.
+      timing = {
+        paidAfterDays: Math.max(0, Math.min(netDays + delay, issuedDaysAgo - recency)),
+      };
+    } else if (status === 'draft') {
+      timing = {
+        editedDaysAgo: DRAFT_EDITED_DAYS_AGO_CYCLE[drafts % DRAFT_EDITED_DAYS_AGO_CYCLE.length] ?? 0,
+      };
+      drafts += 1;
+    } else if (status === 'void') {
+      const after = VOID_AFTER_DAYS_CYCLE[voids % VOID_AFTER_DAYS_CYCLE.length] ?? 0;
+      timing = { editedDaysAgo: Math.max(0, issuedDaysAgo - after) };
+      voids += 1;
+    }
+
     generated.push({
       client,
       status,
       issuedDaysAgo,
       netDays,
+      ...timing,
       // Belgian and Dutch customers are invoiced under the reverse charge.
       ...(client === 1 || client === 9 ? { taxRateBps: 0 } : {}),
       items,
@@ -526,6 +631,48 @@ const SETTINGS: ReadonlyArray<readonly [string, string]> = [
   [SETTINGS_KEYS.defaultTaxRateBps, '825'],
   [SETTINGS_KEYS.invoiceNumberPrefix, 'INV-'],
 ];
+
+/** The three stored timestamps, resolved for one seeded invoice. */
+export interface InvoiceStamps {
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly paidAt: string | null;
+}
+
+/**
+ * When the row was raised, when it last moved, and when the money arrived.
+ *
+ * `createInvoice` stamps all three with the wall clock, which is right for a
+ * real invoice and useless for a fixture: every seeded draft would say it was
+ * edited on the day the preview was seeded, and the list's second line — the
+ * whole point of which is *when* — would read identically on ten rows. These
+ * are written over the top instead, from the spec's own dates.
+ *
+ * Coherence is enforced here rather than trusted to the tables above: a row is
+ * never edited or paid before it was issued, and never after the reference
+ * date. Callers give a wish; this clamps it.
+ */
+export function stampsFor(spec: SeedInvoice, reference: Date): InvoiceStamps {
+  const createdAt = isoStamp(reference, spec.issuedDaysAgo, CREATED_AT_TIME);
+
+  if (spec.status === 'paid') {
+    const after = Math.min(Math.max(spec.paidAfterDays ?? spec.netDays, 0), spec.issuedDaysAgo);
+    // Payment is the last thing that happened to a paid invoice, so it is also
+    // when the record last changed.
+    const paidAt = isoStamp(reference, spec.issuedDaysAgo - after, TOUCHED_AT_TIME);
+    return { createdAt, updatedAt: paidAt, paidAt };
+  }
+
+  if (spec.editedDaysAgo === undefined) {
+    return { createdAt, updatedAt: createdAt, paidAt: null };
+  }
+  const editedDaysAgo = Math.min(Math.max(spec.editedDaysAgo, 0), spec.issuedDaysAgo);
+  return {
+    createdAt,
+    updatedAt: isoStamp(reference, editedDaysAgo, TOUCHED_AT_TIME),
+    paidAt: null,
+  };
+}
 
 /** True when the preview database has no demo data yet. */
 export function isEmpty(db: Db): boolean {
@@ -586,7 +733,7 @@ export function seed(db: Db, reference: Date = new Date()): SeedResult {
     if (clientId === undefined) throw new Error(`seed: no client at index ${spec.client}`);
     const currency = CLIENT_CURRENCY[spec.client] ?? 'USD';
 
-    createInvoice(db, {
+    const created = createInvoice(db, {
       clientId,
       currency,
       status: spec.status,
@@ -597,6 +744,14 @@ export function seed(db: Db, reference: Date = new Date()): SeedResult {
       // Totals are computed inside createInvoice by the real domain code.
       items: spec.items.map((item, position) => ({ ...item, position })),
     });
+
+    // Only after the row exists: the stamps are a fixture detail, and routing
+    // them through createInvoice would mean a preview-only argument on the
+    // domain call the seed exists to exercise unmodified.
+    const stamps = stampsFor(spec, reference);
+    db.prepare<[string, string, string | null, string]>(
+      'UPDATE invoices SET created_at = ?, updated_at = ?, paid_at = ? WHERE id = ?',
+    ).run(stamps.createdAt, stamps.updatedAt, stamps.paidAt, created.id);
   }
 
   return { seeded: true, clients: CLIENTS.length, invoices: all.length };

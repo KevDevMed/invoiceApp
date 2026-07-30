@@ -9,12 +9,18 @@
  * two disagree with each other on screen, which is worse than either being
  * slightly stale.
  *
- * Deliberately not derived from a page. `features/invoices/InvoiceList` already
- * sweeps the whole matching set, but it exists only while `/invoices` is
- * mounted, and the sidebar count has to survive a trip to Settings. So the
- * shell asks for two totals of its own — `limit: 1`, so the query is a count
- * and the row it returns is thrown away — and re-asks on every route change,
- * which is the cheapest event that reliably follows a status edit.
+ * Deliberately fetched here rather than lifted off a page.
+ * `features/invoices/InvoiceList` already sweeps the whole matching set, but it
+ * exists only while `/invoices` is mounted and the sidebar count has to survive
+ * a trip to Settings. So the shell runs its own sweep and re-runs it on every
+ * route change, which is the cheapest event that reliably follows a status
+ * edit.
+ *
+ * What it does *not* do is decide what the numbers mean. "Open" and "overdue"
+ * have exactly one definition in this app — `countOpenInvoices` in
+ * `features/invoices/listGrouping` — and this module fetches rows and hands
+ * them to it, so the breadcrumb and the list's segmented control cannot print
+ * two different answers to the same question.
  *
  * Every decision below is pure so the node-only vitest suite can assert it; the
  * hook at the foot is the one part that cannot be.
@@ -22,25 +28,34 @@
 
 import { useEffect, useState } from 'react';
 
+import type { Invoice } from '../../shared/types';
+import { todayIso } from '../features/invoices/format';
+import { countOpenInvoices } from '../features/invoices/listGrouping';
+import type { OpenInvoiceCounts } from '../features/invoices/listGrouping';
+
 /** Unpaid invoice totals. `overdue` is a subset of `open`. */
-export interface InvoiceCounts {
-  readonly open: number;
-  readonly overdue: number;
-}
+export type InvoiceCounts = OpenInvoiceCounts;
 
 /**
- * Which statuses count as "open".
+ * Which stored statuses the sweep asks for.
  *
  * `sent` and `overdue`: issued, not yet settled. Not `draft` — a draft has not
  * been sent to anybody and owes nothing — and not `void`, which is a bill that
  * was withdrawn. Overdue is the late half of the same set, which is why the
  * line reads `12 open · 3 overdue` rather than `9 open · 3 overdue`: the second
  * number qualifies the first instead of sitting beside it.
+ *
+ * These select the *rows*; they do not decide the numbers. Which of those rows
+ * is late is `countOpenInvoices`' job and nothing else's — see the note on
+ * `useInvoiceCounts`.
  */
 export const OPEN_INVOICE_STATUSES = ['sent', 'overdue'] as const;
 
-/** The status the second number counts. */
+/** The stored status whose rows are late whatever the clock says. */
 export const OVERDUE_INVOICE_STATUS = 'overdue';
+
+/** Rows per sweep request. The contract caps `limit` at 500. */
+const PAGE_LIMIT = 500;
 
 /**
  * The breadcrumb bar's status line, or null when there is nothing to say.
@@ -71,8 +86,34 @@ export function invoiceCountLabel(counts: InvoiceCounts | null): string | null {
   return String(counts.open);
 }
 
+/** Every invoice with one stored status, paged out. */
+async function fetchByStatus(status: (typeof OPEN_INVOICE_STATUSES)[number]): Promise<Invoice[]> {
+  const items: Invoice[] = [];
+  let total = 0;
+  do {
+    const page = await window.api.invoke('invoices:list', {
+      status,
+      limit: PAGE_LIMIT,
+      offset: items.length,
+    });
+    if (page.items.length === 0) break;
+    items.push(...page.items);
+    total = page.total;
+  } while (items.length < total);
+  return items;
+}
+
 /**
  * The counts, refreshed on every route change.
+ *
+ * The sweep fetches the open *rows* rather than asking the backend for two
+ * `total`s, because "overdue" is a question about today's date and not about a
+ * stored flag: `countOpenInvoices` re-reads every `sent` invoice against the
+ * clock, exactly as the list's segmented control does, so the breadcrumb and
+ * the segment beneath it can no longer print two different numbers under the
+ * same word. That costs one row per unsettled invoice on a local SQLite file —
+ * the same set the cockpit already pages through — and it is the only way the
+ * two can be the same number by construction rather than by coincidence.
  *
  * Failure is silence, not an error surface: this feeds a nav badge and a status
  * line, and neither is worth a banner over. A rejected fetch — no `window.api`
@@ -89,14 +130,9 @@ export function useInvoiceCounts(pathname: string): InvoiceCounts | null {
     let isCurrent = true;
     void (async () => {
       try {
-        const totals = await Promise.all(
-          OPEN_INVOICE_STATUSES.map(async (status) =>
-            (await window.api.invoke('invoices:list', { limit: 1, status })).total,
-          ),
-        );
+        const pages = await Promise.all(OPEN_INVOICE_STATUSES.map(fetchByStatus));
         if (!isCurrent) return;
-        const overdue = totals[OPEN_INVOICE_STATUSES.indexOf(OVERDUE_INVOICE_STATUS)] ?? 0;
-        setCounts({ open: totals.reduce((sum, total) => sum + total, 0), overdue });
+        setCounts(countOpenInvoices(pages.flat(), todayIso()));
       } catch {
         // Keep whatever was last known good. See the note above.
       }

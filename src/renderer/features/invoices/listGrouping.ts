@@ -34,6 +34,47 @@ import { money } from './format';
  */
 export const LIST_COLUMN_WIDTH = 396;
 
+/**
+ * The narrowest the list column is allowed to get before the pane stops taking
+ * space off it. Two lines of ellipsised text and a right-aligned amount still
+ * read at this width; below it the amount and the client name start colliding.
+ */
+export const LIST_COLUMN_MIN_WIDTH = 248;
+
+/**
+ * The narrowest the invoice pane is allowed to get. Below this the line-item
+ * table's three fixed columns (qty, rate, amount) plus a description stop
+ * fitting and the pane would rather scroll sideways than shrink.
+ */
+export const PANE_MIN_WIDTH = 448;
+
+/**
+ * How wide the list column is when the cockpit body has `available` px.
+ *
+ * The cockpit has to fit the app's own minimum window (`src/main/window.ts`
+ * sets `minWidth: 960`, and the side nav takes 224-240 of it), so the two
+ * columns cannot both be rigid. The rule: the pane is served first down to
+ * `PANE_MIN_WIDTH`, the list gives up the difference, and neither goes below
+ * its own floor — past that the *pane* scrolls inside itself rather than the
+ * whole content region growing a horizontal scrollbar.
+ *
+ * This is the same rule the stylesheet evaluates via `listColumnWidthCss`; it
+ * lives here as a number so the node-only suite can assert it.
+ */
+export function listColumnWidthAt(available: number): number {
+  const wanted = available - PANE_MIN_WIDTH;
+  return Math.min(Math.max(wanted, LIST_COLUMN_MIN_WIDTH), LIST_COLUMN_WIDTH);
+}
+
+/**
+ * `listColumnWidthAt` as a CSS length. `100%` inside a flex item resolves
+ * against the flex container's content box, which is the cockpit body — so the
+ * clamp reacts to the window without a resize listener or a media query.
+ */
+export function listColumnWidthCss(): string {
+  return `clamp(${String(LIST_COLUMN_MIN_WIDTH)}px, calc(100% - ${String(PANE_MIN_WIDTH)}px), ${String(LIST_COLUMN_WIDTH)}px)`;
+}
+
 /** How far ahead "Due this week" reaches. */
 export const DUE_SOON_DAYS = 7;
 
@@ -276,6 +317,66 @@ export function formatCurrencyTotals(
   return rest > 0 ? `${joined} +${String(rest)}` : joined;
 }
 
+/**
+ * One headline figure, plus an honest note that it is not the whole story.
+ *
+ * Summing across currencies is still refused — there is no rate anywhere in
+ * this app — but `£124,333 · €103,073 · $83,819 +1` is a wall, and a line that
+ * exists to answer "what do I owe attention to" has to be readable at a
+ * glance. So the *largest* currency leads, the count of the others rides
+ * beside it as a label rather than as more numbers, and `full` is what a
+ * caller shows when the reader asks for the rest.
+ */
+export interface TotalsSummary {
+  /** The biggest per-currency total, formatted: `£124,333`. Empty when none. */
+  readonly lead: string;
+  /** The currency `lead` is in, so a second summary can be led by the same one. */
+  readonly leadCurrency: string | null;
+  /** `+3 currencies`, or null when the lead is the whole set. */
+  readonly more: string | null;
+  /** Every currency, joined — what the disclosure reveals. */
+  readonly full: string;
+  /** How many currencies the lead is standing in front of. */
+  readonly extraCurrencies: number;
+}
+
+/** `+3 currencies`, or null when one figure says it all. */
+export function extraCurrencyLabel(count: number): string | null {
+  if (count <= 0) return null;
+  return `+${String(count)} ${count === 1 ? 'currency' : 'currencies'}`;
+}
+
+/**
+ * `preferredCurrency` leads when the set contains it, largest first otherwise.
+ *
+ * The page header prints two summaries side by side — outstanding and its
+ * overdue slice — and two figures under one sentence have to be in the same
+ * money or the second reads as a fraction of the first when it is not even
+ * denominated in it. So the overdue summary is asked to lead with whatever
+ * currency the outstanding one led with.
+ */
+export function summariseTotals(
+  totals: readonly CurrencyTotal[],
+  preferredCurrency: string | null = null,
+): TotalsSummary {
+  const preferred =
+    preferredCurrency === null
+      ? undefined
+      : totals.find((total) => total.currency === preferredCurrency);
+  const first = preferred ?? totals[0];
+  if (first === undefined) {
+    return { lead: '', leadCurrency: null, more: null, full: '', extraCurrencies: 0 };
+  }
+  const extra = totals.length - 1;
+  return {
+    lead: formatMoneyRounded(first.cents, first.currency),
+    leadCurrency: first.currency,
+    more: extraCurrencyLabel(extra),
+    full: formatCurrencyTotals(totals, totals.length),
+    extraCurrencies: extra,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Segments
 // ---------------------------------------------------------------------------
@@ -407,10 +508,27 @@ export function buildInvoiceGroups({
   return groups;
 }
 
-/** `Overdue · $42,915`, or just `Overdue` when the group carries no sum. */
-export function groupHeaderLabel(group: ListGroup, maxEntries = 2): string {
-  const totals = formatCurrencyTotals(group.totals, maxEntries);
-  return totals === '' ? group.title : `${group.title} · ${totals}`;
+/**
+ * The sticky caption, in the two parts the view paints differently:
+ * `Overdue · £124,333` at full strength and `+3 currencies` beside it in the
+ * muted colour.
+ *
+ * The caption used to read `DRAFTS · $73,308 · €49,499 +2`, which is three
+ * numbers deep in a 248-396px column and still hides half the currencies. One
+ * figure and a count of what it stands in front of says the same thing without
+ * pretending the rest are not there; the page header's disclosure has the
+ * whole breakdown.
+ */
+export interface GroupHeaderParts {
+  readonly label: string;
+  readonly more: string | null;
+}
+
+/** `Overdue · $42,915` + `+3 currencies`, or just `Overdue` when there is no sum. */
+export function groupHeaderParts(group: ListGroup): GroupHeaderParts {
+  const summary = summariseTotals(group.totals);
+  if (summary.lead === '') return { label: group.title, more: null };
+  return { label: `${group.title} · ${summary.lead}`, more: summary.more };
 }
 
 /** Every row in reading order — what `J`/`K` walk. */
@@ -455,4 +573,42 @@ export function outstandingTotals(invoices: readonly Invoice[], today: string): 
 /** The overdue slice of `outstandingTotals`. */
 export function overdueTotals(invoices: readonly Invoice[], today: string): CurrencyTotal[] {
   return sumByCurrency(invoices.filter((invoice) => rowStateOf(invoice, today) === 'overdue'));
+}
+
+// ---------------------------------------------------------------------------
+// The one definition of "open" and "overdue"
+// ---------------------------------------------------------------------------
+
+/** Unpaid invoice totals. `overdue` is a subset of `open`. */
+export interface OpenInvoiceCounts {
+  readonly open: number;
+  readonly overdue: number;
+}
+
+/**
+ * How many invoices are open, and how many of those are late — the single
+ * definition both the shell's status line and the list's segmented control
+ * read.
+ *
+ * It is the *date-derived* one. The stored `overdue` status is a flag somebody
+ * has to remember to set; `rowStateOf` re-reads every `sent` invoice against
+ * the clock, so an invoice that went past its due date last night is late this
+ * morning without a job having run. The two used to be computed separately —
+ * the breadcrumb counted `status = 'overdue'` and said `4`, the segment
+ * counted the clock and said `17` — and two true numbers under the same word
+ * on the same screen read as a bug. There is now one function.
+ */
+export function countOpenInvoices(
+  invoices: readonly Invoice[],
+  today: string,
+): OpenInvoiceCounts {
+  let open = 0;
+  let overdue = 0;
+  for (const invoice of invoices) {
+    const state = rowStateOf(invoice, today);
+    if (!isOpenState(state)) continue;
+    open += 1;
+    if (state === 'overdue') overdue += 1;
+  }
+  return { open, overdue };
 }

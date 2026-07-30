@@ -53,6 +53,7 @@ import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 import { Token } from '@astryxdesign/core/Token';
 
+import { SHELL_GUTTER_STEP } from '../../chrome';
 import type { Client, Invoice, InvoiceWithItems } from '../../../shared/types';
 import { todayIso } from './format';
 import {
@@ -68,20 +69,21 @@ import {
 } from './filters';
 import { fetchClientInvoices } from './listData';
 import {
-  LIST_COLUMN_WIDTH,
   LIST_SEGMENTS,
   adjacentRowId,
   buildInvoiceGroups,
   countSegments,
+  extraCurrencyLabel,
   flattenGroups,
-  formatCurrencyTotals,
-  groupHeaderLabel,
+  groupHeaderParts,
+  listColumnWidthCss,
   outstandingTotals,
   overdueTotals,
   rowPosition,
+  summariseTotals,
 } from './listGrouping';
 import type { ListRow, ListSegment, RowState } from './listGrouping';
-import { InvoicePane } from './listPaneView';
+import { InvoicePane, toneColours } from './listPaneView';
 
 /**
  * Rows per `invoices:list` request. The contract caps `limit` at 500
@@ -274,6 +276,7 @@ export function InvoiceList(): React.JSX.Element {
   const [filters, setFilters] = useState<readonly PowerSearchFilter[]>([]);
   const [segment, setSegment] = useState<ListSegment>('all');
   const [isFilterBarOpen, setIsFilterBarOpen] = useState(false);
+  const [isBreakdownOpen, setIsBreakdownOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const [invoices, setInvoices] = useState<Invoice[] | null>(null);
@@ -486,8 +489,23 @@ export function InvoiceList(): React.JSX.Element {
     setPane((current) => (current === null || current.id !== updated.id ? current : { ...current, ...updated }));
   }, []);
 
-  const outstanding = useMemo(() => outstandingTotals(matching, today), [matching, today]);
-  const overdue = useMemo(() => overdueTotals(matching, today), [matching, today]);
+  const outstanding = useMemo(() => summariseTotals(outstandingTotals(matching, today)), [matching, today]);
+  // Led by whatever currency the outstanding line led with: the two figures sit
+  // in one sentence and the second is a slice of the first, so they have to be
+  // the same money to be read against each other at all.
+  const overdue = useMemo(
+    () => summariseTotals(overdueTotals(matching, today), outstanding.leadCurrency),
+    [matching, today, outstanding.leadCurrency],
+  );
+  /**
+   * How many currencies the two headline figures are standing in front of.
+   * Per-currency is the right answer — there is no exchange rate in this app
+   * and never was — but printing all of them inline made the one line that
+   * exists to answer "what do I owe attention to" unreadable. The dominant
+   * currency leads; the rest are one click away.
+   */
+  const extraCurrencies = Math.max(outstanding.extraCurrencies, overdue.extraCurrencies);
+  const breakdownLabel = extraCurrencyLabel(extraCurrencies);
   const position = rowPosition(rows, selected);
   const hasActiveFilters = filters.length > 0 || search.trim() !== '' || segment !== 'all';
 
@@ -495,7 +513,7 @@ export function InvoiceList(): React.JSX.Element {
     <VStack height="100%" gap={0}>
       <VStack
         gap={3}
-        paddingInline={5}
+        paddingInline={SHELL_GUTTER_STEP}
         paddingBlock={4}
         style={{ borderBlockEnd: '1px solid var(--color-border)' }}
       >
@@ -503,22 +521,45 @@ export function InvoiceList(): React.JSX.Element {
           <HStack gap={3} align="center" wrap="wrap">
             <Heading level={1}>Invoices</Heading>
             {invoices === null ? null : (
-              <HStack gap={1} align="center" wrap="wrap">
-                <Text type="supporting" hasTabularNumbers>
-                  {outstanding.length === 0
-                    ? 'Nothing outstanding'
-                    : `${formatCurrencyTotals(outstanding, 3)} outstanding`}
-                </Text>
-                {overdue.length === 0 ? null : (
-                  <Text
-                    type="supporting"
-                    hasTabularNumbers
-                    style={{ color: 'var(--color-error)' }}
-                  >
-                    {`· ${formatCurrencyTotals(overdue, 3)} overdue`}
+              <VStack gap={1}>
+                <HStack gap={1} align="center" wrap="wrap">
+                  <Text type="supporting" hasTabularNumbers>
+                    {outstanding.lead === ''
+                      ? 'Nothing outstanding'
+                      : `${outstanding.lead} outstanding`}
                   </Text>
-                )}
-              </HStack>
+                  {overdue.lead === '' ? null : (
+                    <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
+                      {`· ${overdue.lead} overdue`}
+                    </Text>
+                  )}
+                  {breakdownLabel === null ? null : (
+                    <Button
+                      label={isBreakdownOpen ? 'Hide currencies' : breakdownLabel}
+                      variant="ghost"
+                      size="sm"
+                      aria-expanded={isBreakdownOpen}
+                      onClick={() => {
+                        setIsBreakdownOpen((open) => !open);
+                      }}
+                    />
+                  )}
+                </HStack>
+                {isBreakdownOpen ? (
+                  <VStack gap={0.5}>
+                    {outstanding.full === '' ? null : (
+                      <Text type="supporting" hasTabularNumbers>
+                        {`Outstanding ${outstanding.full}`}
+                      </Text>
+                    )}
+                    {overdue.full === '' ? null : (
+                      <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
+                        {`Overdue ${overdue.full}`}
+                      </Text>
+                    )}
+                  </VStack>
+                ) : null}
+              </VStack>
             )}
           </HStack>
           <Button
@@ -574,10 +615,21 @@ export function InvoiceList(): React.JSX.Element {
 
       <StackItem size="fill">
         <HStack gap={0} height="100%" align="stretch">
+          {/* The list column is ideal-width, not fixed-width. `window.ts` sets a
+              960px minimum window and the side nav takes 224-240 of it, so two
+              rigid columns would give the content region a horizontal
+              scrollbar between 960 and ~1120 and hang the pane's K/J controls
+              off the right edge. The pane is served first down to its own
+              floor and the list gives up the difference —
+              `listColumnWidthAt` in ./listGrouping is the same rule as a
+              number, with the tests. */}
           <VStack
-            width={LIST_COLUMN_WIDTH}
             gap={0}
-            style={{ flex: 'none', borderInlineEnd: '1px solid var(--color-border)' }}
+            style={{
+              flex: 'none',
+              inlineSize: listColumnWidthCss(),
+              borderInlineEnd: '1px solid var(--color-border)',
+            }}
           >
             <VStack
               gap={2}
@@ -647,22 +699,28 @@ export function InvoiceList(): React.JSX.Element {
                 </VStack>
               ) : (
                 <VStack gap={0}>
-                  {groups.map((group) => (
+                  {groups.map((group) => {
+                    const header = groupHeaderParts(group);
+                    const isOverdueGroup = group.key === 'overdue';
+                    return (
                     <VStack key={group.key} gap={0}>
                       <HStack
+                        gap={1}
+                        align="center"
                         paddingInline={3}
                         paddingBlock={1}
                         style={{
                           position: 'sticky',
                           insetBlockStart: 0,
                           zIndex: 1,
-                          // The tinted background tokens are translucent, so
-                          // they are composited over the surface: a sticky
-                          // header has to be opaque or the rows read through it.
-                          background:
-                            group.key === 'overdue'
-                              ? 'linear-gradient(var(--color-background-red), var(--color-background-red)), var(--color-background-surface)'
-                              : 'var(--color-background-surface)',
+                          // Opaque in both cases — a sticky header the rows read
+                          // through is unreadable. The overdue one is the same
+                          // barely-warm mix the pane's banner uses, not the
+                          // theme's 20%-alpha red wash, which over a white
+                          // surface composites into a flat pink slab.
+                          background: isOverdueGroup
+                            ? toneColours('error').wash
+                            : 'var(--color-background-surface)',
                           borderBlockEnd: '1px solid var(--color-border)',
                         }}
                       >
@@ -674,14 +732,23 @@ export function InvoiceList(): React.JSX.Element {
                           style={{
                             textTransform: 'uppercase',
                             letterSpacing: '0.06em',
-                            color:
-                              group.key === 'overdue'
-                                ? 'var(--color-text-red)'
-                                : 'var(--color-text-secondary)',
+                            color: isOverdueGroup
+                              ? 'var(--color-text-red)'
+                              : 'var(--color-text-secondary)',
                           }}
                         >
-                          {groupHeaderLabel(group)}
+                          {header.label}
                         </Text>
+                        {header.more === null ? null : (
+                          <Text
+                            type="supporting"
+                            maxLines={1}
+                            color="secondary"
+                            style={{ textTransform: 'uppercase', letterSpacing: '0.06em' }}
+                          >
+                            {header.more}
+                          </Text>
+                        )}
                       </HStack>
                       {group.rows.map((row) => (
                         <InvoiceListRow
@@ -696,13 +763,17 @@ export function InvoiceList(): React.JSX.Element {
                         />
                       ))}
                     </VStack>
-                  ))}
+                    );
+                  })}
                 </VStack>
               )}
             </StackItem>
           </VStack>
 
-          <StackItem size="fill">
+          {/* `min-inline-size: 0` is what lets the pane actually shrink: a flex
+              item defaults to `auto`, so the line-item table's fixed columns
+              were setting a floor the whole content region had to obey. */}
+          <StackItem size="fill" style={{ minInlineSize: 0 }}>
             {paneError !== null ? (
               <VStack padding={5}>
                 <Banner status="error" title={paneError} />

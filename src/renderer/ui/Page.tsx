@@ -20,6 +20,8 @@ import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Text } from '@astryxdesign/core/Text';
 
+import { SHELL_GUTTER_STEP } from '../chrome';
+
 export interface PageProps {
   children: React.ReactNode;
   /**
@@ -37,10 +39,25 @@ export interface PageProps {
  * wider than `maxWidth` splits the leftover space into two equal gutters
  * instead of one on the right; narrower viewports still fill the width.
  * Do not nest one Page inside another.
+ *
+ * The inline padding is the shell gutter (`chrome.ts`), the same inset the tab
+ * strip and the breadcrumb trail above start at — so wherever the cap does not
+ * bite, the page's h1 begins on the same left edge as the two chrome bands. It
+ * is the column's *minimum* inset, not its position: the cap is load-bearing
+ * (a 2000px-wide table is not a page), so on a wide window the column steps in
+ * from the gutter by a further half of whatever the cap leaves over. That step
+ * is a deliberate centring, and it is never the near-miss the 24px padding used
+ * to produce.
  */
 export function Page({ children, maxWidth = 1120 }: PageProps): React.JSX.Element {
   return (
-    <VStack height="100%" isScrollable paddingInline={6} paddingBlock={5} align="center">
+    <VStack
+      height="100%"
+      isScrollable
+      paddingInline={SHELL_GUTTER_STEP}
+      paddingBlock={5}
+      align="center"
+    >
       <VStack gap={5} width="100%" maxWidth={maxWidth}>
         {children}
       </VStack>

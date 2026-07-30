@@ -19,8 +19,13 @@
  * says where you are and the heading says it again. The strip is what changed
  * that: it puts a row of sibling documents above the heading, and the collapsed
  * rail drops the nav labels entirely, so the trail is the only thing left that
- * states the path. See `./ui/breadcrumbTrail` for what it says, `./chrome` for
- * the geometry and `styles/global.css` for the drag regions and the panel.
+ * states the path. Its inline end carries the live status line and the
+ * assistant launcher: the band is the shell's own, so it is the one strip of
+ * the content column where a shell-wide control cannot land on top of a page's.
+ * See `./ui/breadcrumbTrail` for what the trail says, `./chrome` for the
+ * geometry — including `SHELL_GUTTER`, the single inline inset the strip, the
+ * trail and `./ui/Page` all begin at — and `styles/global.css` for the drag
+ * regions and the panel.
  *
  * Downstream builders replace route *elements* (see routes.tsx). They do not
  * change this file — the shell is the same on every screen. Page-level layout
@@ -867,20 +872,25 @@ export function AppShell(): React.JSX.Element {
             The trail, directly under the strip. Not part of the drag band above
             it: it is a row of links, and every one of them would otherwise have
             to opt back out of `-webkit-app-region`.
+
+            It also carries the assistant launcher, at its inline end. The dock
+            used to be a bubble fixed to the bottom-right of the window, which
+            is where the invoice pane puts `Export PDF` and where Reports runs
+            its table — so it covered the primary action of the app's busiest
+            page. Reserving a safe area for it would have meant a dead band
+            under every page including the full-bleed cockpit; putting it in a
+            band the shell already owns means no page can be under it at all.
+            This bar is not a drag region either, so the button needs no
+            `-webkit-app-region` opt-out.
           */}
-          <ShellBreadcrumbs trail={trail} status={invoiceStatusLine(counts)} />
+          <ShellBreadcrumbs
+            trail={trail}
+            status={invoiceStatusLine(counts)}
+            action={isDockVisible(pathname) ? <AssistantDock /> : undefined}
+          />
           <StackItem size="fill">
             <Outlet />
           </StackItem>
-          {/*
-            Deliberately a sibling of the content outlet and *outside* the drag
-            band above it. An element inside a drag region stops receiving
-            clicks unless it appears in the `:where(...)` opt-out list in
-            `styles/global.css`; the launcher is a fixed-position element in the
-            bottom-right corner, nowhere near the draggable top band, so it
-            never has to opt back out.
-          */}
-          {isDockVisible(pathname) ? <AssistantDock /> : null}
         </VStack>
       </AstryxAppShell>
     </AssistantProvider>

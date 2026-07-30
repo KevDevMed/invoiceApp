@@ -49,6 +49,12 @@ export interface PaneTimeline {
   readonly headline: string;
   /** The clause after the headline, when there is a real one. */
   readonly detail: string | null;
+  /**
+   * Whether there is a clock running at all. False for a draft: nothing has
+   * been issued, so no time has elapsed and the bar would be drawing a race
+   * that has not started.
+   */
+  readonly hasProgress: boolean;
   /** Share of the bar between issue and due date, 0-100. */
   readonly elapsedPercent: number;
   /** Share of the bar past the due date, 0-100. Zero unless overdue. */
@@ -148,17 +154,36 @@ function clampPercent(value: number): number {
  * "time you gave them" to "time they have taken", which is the judgement the
  * reader is actually making.
  *
- * A settled or unissued invoice has no race left to run: paid fills the bar,
- * void and draft leave it at the elapsed share of the term.
+ * A settled invoice has no race left to run: paid fills the bar, void leaves it
+ * at the elapsed share of the term.
+ *
+ * **A draft gets no timeline at all.** It has not been issued, so it has no
+ * issue date that has happened, no due date anybody is bound by, and no elapsed
+ * time — the banner used to say `Draft — not issued yet` directly above
+ * `issued 27 Mar · due 26 Apr · today 30 Jul` and a full progress bar, which is
+ * three statements about one invoice that disagree. The only date a draft can
+ * prove is when it was last edited, so that is the only one on the axis.
  */
 export function buildPaneTimeline(
-  invoice: Pick<Invoice, 'status' | 'issueDate' | 'dueDate' | 'paidAt'>,
+  invoice: Pick<Invoice, 'status' | 'issueDate' | 'dueDate' | 'paidAt' | 'updatedAt'>,
   today: string,
 ): PaneTimeline {
   const state = rowStateOf(invoice, today);
   const terms = paymentTermLabel(invoice.issueDate, invoice.dueDate);
   const span = netTermDays(invoice.issueDate, invoice.dueDate) ?? 0;
   const late = daysPastDue(invoice.dueDate, today);
+
+  if (state === 'draft') {
+    return {
+      tone: toneForState(state),
+      headline: 'Draft — not issued yet',
+      detail: terms === null ? null : `${terms} once issued`,
+      hasProgress: false,
+      elapsedPercent: 0,
+      overduePercent: 0,
+      axis: [`last edited ${shortDate(calendarDateOf(invoice.updatedAt), today)}`],
+    };
+  }
 
   let elapsedPercent = 0;
   let overduePercent = 0;
@@ -193,10 +218,8 @@ export function buildPaneTimeline(
       detail = terms;
       break;
     }
-    case 'draft':
-      headline = 'Draft — not issued yet';
-      detail = terms;
-      break;
+    // `draft` is absent on purpose: it returned above, before any of the clock
+    // arithmetic ran, and TypeScript has narrowed it out of `state` here.
     case 'paid': {
       headline =
         invoice.paidAt === null
@@ -227,6 +250,7 @@ export function buildPaneTimeline(
     tone: toneForState(state),
     headline,
     detail,
+    hasProgress: true,
     elapsedPercent,
     overduePercent,
     axis: [`issued ${shortDate(invoice.issueDate, today)}`, dueEntry, lastEntry],
@@ -255,27 +279,57 @@ export interface PaneFactsInput {
  * currency. This app has no exchange rate and never had one, so the subline
  * says the only other true figure about the same money: the face value of the
  * document, shown when it differs from what is still open.
+ *
+ * **A draft is asked a different pair of questions.** Nobody has been billed,
+ * so there is no amount *due* and no date on which it *was* issued: the pane
+ * used to lead with `Amount due $0.00` over `$653.56 invoiced` beside
+ * `Issued 27 March 2026`, which said the invoice both was and was not issued.
+ * A draft leads with what it is worth and when it is planned for instead.
  */
 export function buildPaneFacts({ invoice, clientInvoices, today }: PaneFactsInput): PaneFact[] {
+  const isDraft = rowStateOf(invoice, today) === 'draft';
   const open = openAmountCents(invoice);
-  const facts: PaneFact[] = [
-    {
-      key: 'amount',
-      caption: 'Amount due',
-      value: money(open, invoice.currency),
-      sub: open === invoice.totalCents ? null : `${money(invoice.totalCents, invoice.currency)} invoiced`,
-      note: null,
-      isEmphasised: true,
-    },
-    {
-      key: 'issued',
-      caption: 'Issued',
-      value: formatDocumentDate(invoice.issueDate),
-      sub: paymentTermLabel(invoice.issueDate, invoice.dueDate),
-      note: null,
-      isEmphasised: false,
-    },
-  ];
+  const terms = paymentTermLabel(invoice.issueDate, invoice.dueDate);
+  const facts: PaneFact[] = isDraft
+    ? [
+        {
+          key: 'amount',
+          caption: 'Draft total',
+          value: money(invoice.totalCents, invoice.currency),
+          sub: 'Nothing due until it is sent',
+          note: null,
+          isEmphasised: true,
+        },
+        {
+          key: 'issued',
+          caption: 'Issue date',
+          value: formatDocumentDate(invoice.issueDate),
+          sub: terms === null ? 'Not sent yet' : `Not sent yet · ${terms}`,
+          note: null,
+          isEmphasised: false,
+        },
+      ]
+    : [
+        {
+          key: 'amount',
+          caption: 'Amount due',
+          value: money(open, invoice.currency),
+          sub:
+            open === invoice.totalCents
+              ? null
+              : `${money(invoice.totalCents, invoice.currency)} invoiced`,
+          note: null,
+          isEmphasised: true,
+        },
+        {
+          key: 'issued',
+          caption: 'Issued',
+          value: formatDocumentDate(invoice.issueDate),
+          sub: terms,
+          note: null,
+          isEmphasised: false,
+        },
+      ];
 
   if (clientInvoices !== null) {
     const openOnes = clientInvoices.filter((row) => isOpenState(rowStateOf(row, today)));

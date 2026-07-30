@@ -178,14 +178,23 @@ body {
   */
   padding-block: var(--spacing-1);
   /*
-    Toolbar pulls its first item back by `--container-padding-inline-start` minus
-    its own block padding (edge compensation, so a ghost button sits flush inside
-    a Card). There is no container padding here — the band is the shell's, not a
-    Card's — so that lands the first pill 8px inside the band and 8px left of the
-    page heading beneath it. Adding it back is what lines the strip up with the
-    content column it belongs to.
+    No inline padding of its own — this is the shell gutter, and Toolbar already
+    carries it.
+
+    Toolbar is a Section, and Section's own box is padded from the theme's
+    container chain, which terminates at `--spacing-4`: exactly `SHELL_GUTTER`
+    in `chrome.ts`. This rule used to add `--spacing-2` on top of that, on the
+    theory that Toolbar's edge compensation pulled the first pill back by the
+    same amount. It does not — compensation only applies when the slot's first
+    child carries `data-astryx-edge-comp` (see `Layout/edgeCompensation.stylex`)
+    and the strip's first child is a scroll container — so the 8px was pure
+    addition, and it put the first pill 8px right of the breadcrumb trail
+    directly beneath it. Written out as a zero rather than deleted: `className`
+    lands on Section's *outer* box and the container padding is on its inner
+    one, so nothing here can be read as "the strip has no inset" — it has
+    exactly one, and this is the line saying the shell adds none of its own.
   */
-  padding-inline-start: var(--spacing-2);
+  padding-inline-start: 0;
 }
 
 /*
@@ -444,27 +453,30 @@ body {
 }
 
 /*
- * The floating assistant dock. Two things here have no design-system
- * equivalent, which is the only sanctioned reason for app-level CSS: fixed
- * positioning (no Astryx layout component exposes it) and sizing measured
- * against the viewport rather than a parent.
+ * The assistant dock's launcher.
  *
- * The positioning sits on this wrapper rather than on the AppBeam element:
- * `border-beam` injects `[data-beam="…"] { position: relative }` from a <style>
- * tag mounted with the component, so it lands after this file in document order
- * at equal specificity and would win.
+ * It used to be `position: fixed` in the bottom-right corner of the *viewport*,
+ * over whatever the page had put there. That corner is not free: the invoice
+ * pane anchors its action bar to it (the launcher clipped `Export PDF` to
+ * `Export P…`), Reports runs a table under it, and no other corner is any
+ * emptier — the sidebar footer holds Settings and two glyphs, the list column
+ * runs to the bottom of the window. A safe-area reservation would have to be a
+ * dead band across the foot of every page, including a full-bleed split view
+ * that has no business ending 60px above the window.
  *
- * Bottom-right is the safe corner. The macOS traffic lights are top-left (see
- * `chrome.ts`) and the sidebar's resize handle rides the sidebar's inline edge,
- * so nothing the dock can cover is interactive.
+ * So the launcher moved into the one strip of the window that is the shell's
+ * and can never hold page content: the breadcrumb band. It is in normal flow
+ * there, at the band's inline end after the status line, and the collision is
+ * gone by construction rather than by a number that has to be kept in sync with
+ * whatever the busiest page does next. See `ui/ShellBreadcrumbs.tsx`.
+ *
+ * What is left here is the one thing no Astryx prop covers: the wrapper must
+ * not be stretched by the band's flex line.
  */
 .assistant-dock-launcher {
-  position: fixed;
-  inset-block-end: var(--spacing-6);
-  inset-inline-end: var(--spacing-6);
-  /* Above page content. The panel itself needs no z-index: usePopover promotes
-     it into the browser's top layer, which sits above every stacking context. */
-  z-index: 10;
+  /* The band is 36px and this is a 28px button; a stretched flex item would
+     make the round launcher an oval. */
+  flex: none;
 }
 
 /* Circular, per the launcher's design. Button's own radius is rectangular, and
@@ -483,10 +495,12 @@ body {
  * The design system ships no width or panel-size token — the size scale is for
  * controls, not for a viewport-relative surface — so the panel's size is
  * multiplied out of the spacing scale rather than written as a bare number.
- * The block-size cap is the important half: the panel is anchored to a fixed
- * launcher and nothing above it constrains its height, so on a short window it
- * would otherwise run off the top of the screen. The ChatLayout message list
- * inside is the flex scroll region that absorbs it.
+ * The block-size cap is the important half: the panel hangs from a launcher in
+ * the breadcrumb band, near the top of the window, and nothing below it
+ * constrains its height — so on a short window it would otherwise run off the
+ * bottom of the screen. The cap leaves 144px, comfortably more than the ~76px
+ * of chrome above it. The ChatLayout message list inside is the flex scroll
+ * region that absorbs the rest.
  */
 .assistant-dock-panel {
   inline-size: min(calc(var(--spacing-12) * 8), calc(100vw - var(--spacing-10)));
