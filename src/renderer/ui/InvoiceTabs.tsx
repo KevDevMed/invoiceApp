@@ -56,22 +56,29 @@ import {
   closeTab,
   DRAFT_TAB_ID,
   forgetClosedLabels,
+  labelRequestIsCurrent,
   NEW_TAB_BUTTON_LABEL,
   NO_DEPARTING_TABS,
+  NO_LABEL_REQUESTS,
+  pendingLabelIds,
   plusTransition,
+  queueRoute,
   recordDeparture,
   recordNavigation,
   removeTab,
+  retireClosedRequests,
   settleDepartures,
+  settleLabelRequest,
+  startLabelRequest,
   syncTabs,
   tabCloseLabel,
   tabIdForPath,
   tabLabel,
   tabRoute,
   TAB_STRIP_LABEL,
-  unlabelledTabIds,
   type CloseFocusTarget,
   type InvoiceTabLabels,
+  type LabelRequests,
 } from './invoiceTabs';
 
 type GlyphProps = React.SVGProps<SVGSVGElement>;
@@ -210,9 +217,10 @@ export interface InvoiceTabsState {
  * fresh window with no tabs is the honest state.
  *
  * Labels are cached per id in the same state, so re-activating a tab (or closing
- * a neighbour) never refetches: `unlabelledTabIds` only ever returns ids with no
- * cached number, and `requested` keeps a second render from firing the same
- * fetch twice while the first is in flight.
+ * a neighbour) never refetches: `pendingLabelIds` only ever returns ids with no
+ * cached number and no request already accounted for, which is what keeps a second
+ * render from firing the same fetch twice. See `LabelRequests` for the half of
+ * that bookkeeping a close has to undo.
  */
 export function useInvoiceTabs(): InvoiceTabsState {
   const { pathname } = useLocation();
@@ -247,9 +255,9 @@ export function useInvoiceTabs(): InvoiceTabsState {
   */
   const queuedRoutes = useRef<readonly string[]>([]);
   const pendingFocus = useRef<CloseFocusTarget | null>(null);
-  /** Label requests in flight, and ids whose request already failed. */
-  const inFlight = useRef<Set<string>>(new Set());
-  const failed = useRef<Set<string>>(new Set());
+  /** Label fetches in flight and the ones that came back empty. See
+   *  `LabelRequests`: a ref, because no render depends on it. */
+  const labelRequests = useRef<LabelRequests>(NO_LABEL_REQUESTS);
   const activeId = tabIdForPath(pathname);
 
   /*
@@ -271,6 +279,14 @@ export function useInvoiceTabs(): InvoiceTabsState {
   if (settled !== departing) setDeparting(settled);
   const openTabs = syncTabs(tabs, pathname, settled);
   if (openTabs !== tabs) setTabs(openTabs);
+  /*
+    A closed tab's number goes with it, in the same render for the same reason —
+    and because dropping it in an effect instead means a cascading render whose
+    only job is to forget something. `forgetClosedLabels` returns its own argument
+    when there is nothing to drop, so this cannot loop either.
+  */
+  const openLabels = forgetClosedLabels(labels, openTabs);
+  if (openLabels !== labels) setLabels(openLabels);
 
   // The list a close has to work from — kept level with what is rendered, and
   // moved forward by `close` itself for a second close in the same task.
@@ -319,58 +335,65 @@ export function useInvoiceTabs(): InvoiceTabsState {
 
   useEffect(() => {
     /*
-      Closing a tab retires everything remembered about it: the cached number, and
-      the failure mark that stops it being asked for again. Keeping either is what
-      made one failed `invoices:get` poison an invoice for the life of the window —
-      reopen the tab and it stayed labelled "Invoice" forever.
+      Closing a tab retires everything remembered about it: the number is dropped
+      during render above, and the request bookkeeping here — the mark that stops a
+      dead fetch being retried, and the entry that lets a request still running
+      write anything at all. Keeping either is what made one failed `invoices:get`
+      poison an invoice for the life of the window: reopen the tab and it stayed
+      labelled "Invoice" forever.
     */
-    const kept = forgetClosedLabels(labels, openTabs);
-    for (const id of failed.current) if (!openTabs.includes(id)) failed.current.delete(id);
-    if (kept !== labels) {
-      setLabels(kept);
-      return;
-    }
+    labelRequests.current = retireClosedRequests(labelRequests.current, openTabs);
 
-    for (const id of unlabelledTabIds(openTabs, labels)) {
-      // In flight: a second render must not fire the same fetch twice.
-      // Failed: do not retry on every render — the mark is dropped above the
-      // moment the tab closes, so reopening it does retry.
-      if (inFlight.current.has(id) || failed.current.has(id)) continue;
-      inFlight.current.add(id);
+    // Never twice for one id: an entry in `inFlight` covers the request a second
+    // render would duplicate, and one in `failed` covers the dead fetch a render
+    // loop would refire. Both are retired the moment the tab closes, above, so
+    // reopening the tab genuinely does retry — which is the only reason a tab the
+    // user is looking at is sure to end up with its real number on it.
+    for (const id of pendingLabelIds(openTabs, openLabels, labelRequests.current)) {
+      const started = startLabelRequest(labelRequests.current, id);
+      labelRequests.current = started.requests;
       void (async () => {
+        // Whether the request came back with nothing — a missing invoice or a
+        // throw. Either way the placeholder stays and the tab is not closed: the
+        // tab is the user's, and a pill vanishing under the pointer is worse than
+        // one labelled "Invoice".
+        let number: string | null = null;
         try {
           const invoice = await window.api.invoke('invoices:get', { id });
-          // A missing invoice (null) keeps the placeholder rather than closing
-          // the tab: the tab is the user's, and a pill vanishing under the
-          // pointer is worse than one labelled "Invoice".
-          if (!invoice) {
-            failed.current.add(id);
-            return;
-          }
-          // The tab can have closed while this was in flight; a label written for
-          // a pill that no longer exists is a cache entry nothing will ever clear.
-          if (!latestTabs.current.includes(id)) return;
-          setLabels((previous) => ({ ...previous, [id]: invoice.number }));
+          number = invoice ? invoice.number : null;
         } catch {
-          // Same again: a failed fetch leaves the stable placeholder in place.
-          failed.current.add(id);
-        } finally {
-          inFlight.current.delete(id);
+          number = null;
+        }
+        /*
+          The tab can have closed — and been reopened — while this was in flight.
+          Then this request speaks for nobody: its label would cache a number for a
+          pill that no longer exists, and its failure mark would land on a tab the
+          close cleanup has already run for, so nothing would ever clear it and the
+          reopened pill would read "Invoice" for the life of the window. The reopen
+          fired its own request; that one answers.
+        */
+        if (!labelRequestIsCurrent(labelRequests.current, id, started.token)) return;
+        labelRequests.current = settleLabelRequest(labelRequests.current, id, number === null);
+        // The token is still current on the one commit between a close and the
+        // effect that retires it, so the list is checked too rather than spending
+        // a render writing a label `forgetClosedLabels` drops again.
+        if (number !== null && latestTabs.current.includes(id)) {
+          setLabels((previous) => ({ ...previous, [id]: number }));
         }
       })();
     }
-  }, [openTabs, labels]);
+  }, [openTabs, openLabels]);
 
   return {
     tabs: openTabs,
     activeId,
-    labels,
+    labels: openLabels,
     select: (id) => {
       const route = tabRoute(id);
       // Registered before the navigation, so a close later in this same task
       // classifies the tab against where the router is going, and so this route
       // counts as one the task explains rather than an outside navigation.
-      queuedRoutes.current = [...queuedRoutes.current, route];
+      queuedRoutes.current = queueRoute(queuedRoutes.current, route);
       setDeparting((previous) => recordNavigation(previous, route));
       void navigate(route);
     },
@@ -394,7 +417,7 @@ export function useInvoiceTabs(): InvoiceTabsState {
       */
       setTabs((previous) => removeTab(previous, id));
       if (outcome.route !== null) {
-        queuedRoutes.current = [...queuedRoutes.current, outcome.route];
+        queuedRoutes.current = queueRoute(queuedRoutes.current, outcome.route);
         void navigate(outcome.route);
       }
       /*
@@ -413,7 +436,7 @@ export function useInvoiceTabs(): InvoiceTabsState {
       latestTabs.current = next.tabs;
       setTabs(next.tabs);
       const route = next.route ?? tabRoute(DRAFT_TAB_ID);
-      queuedRoutes.current = [...queuedRoutes.current, route];
+      queuedRoutes.current = queueRoute(queuedRoutes.current, route);
       setDeparting((previous) => recordNavigation(previous, route));
       void navigate(route);
     },

@@ -425,6 +425,139 @@ export function unlabelledTabIds(
 }
 
 /**
+ * The label fetches the strip has going, and the ones that came back empty.
+ *
+ * The fetch loop is guarded on "has this id been asked for already", or a second
+ * render would fire the same `invoices:get` twice and a dead one would refire on
+ * every render for the life of the window. So the guard has to be retired when a
+ * tab closes — see `forgetClosedLabels` — and *that* is where a close racing an
+ * in-flight request went wrong: the close cleanup ran while the request was still
+ * pending, so there was no failure mark to retire yet, and the mark the request
+ * added when it finally failed belonged to a tab the user had since reopened.
+ * Nothing was ever going to clear it and the reopened pill read `Invoice` for
+ * good.
+ *
+ * A request therefore carries a `token`, and a completion is only allowed to
+ * write anything if `inFlight` still holds *that* token for the id. Closing the
+ * tab drops the entry, so the request that outlives its tab settles into nothing
+ * and the reopened tab's own request — a different token — is the one that
+ * answers. `nextToken` is a single monotonic counter rather than a per-id
+ * generation, because per-id bookkeeping for closed ids is state that grows with
+ * every close and is never read again.
+ */
+export interface LabelRequests {
+  /** Ids with an `invoices:get` in flight, each under the token that started it. */
+  readonly inFlight: Readonly<Record<string, number>>;
+  /**
+   * Ids whose request resolved with no invoice, or threw. Not asked for again
+   * while the tab stays open: the placeholder is stable and a per-render retry
+   * loop is not. Dropped the moment the tab closes, so reopening does retry.
+   */
+  readonly failed: readonly string[];
+  /** The token the next request takes. Only ever increments. */
+  readonly nextToken: number;
+}
+
+/** No fetch has been made yet. */
+export const NO_LABEL_REQUESTS: LabelRequests = { inFlight: {}, failed: [], nextToken: 1 };
+
+/** Which open tabs still need an `invoices:get` fired for them right now. */
+export function pendingLabelIds(
+  tabs: readonly string[],
+  labels: InvoiceTabLabels,
+  requests: LabelRequests,
+): readonly string[] {
+  return unlabelledTabIds(tabs, labels).filter(
+    (id) => requests.inFlight[id] === undefined && !requests.failed.includes(id),
+  );
+}
+
+/** One request started, and the token its completion has to still hold. */
+export function startLabelRequest(
+  requests: LabelRequests,
+  id: string,
+): { readonly requests: LabelRequests; readonly token: number } {
+  const token = requests.nextToken;
+  return {
+    requests: {
+      inFlight: { ...requests.inFlight, [id]: token },
+      failed: requests.failed,
+      nextToken: token + 1,
+    },
+    token,
+  };
+}
+
+/**
+ * Whether a settled request still speaks for the pill on screen.
+ *
+ * False once the tab has closed — including when it has been *reopened* since,
+ * because the reopen fired its own request under its own token. A stale
+ * completion must write neither a label (a cache entry for a pill that does not
+ * exist) nor a failure mark (the poison above).
+ */
+export function labelRequestIsCurrent(
+  requests: LabelRequests,
+  id: string,
+  token: number,
+): boolean {
+  return requests.inFlight[id] === token;
+}
+
+/** A current request, finished. `didFail` is "nothing came back", not "threw". */
+export function settleLabelRequest(
+  requests: LabelRequests,
+  id: string,
+  didFail: boolean,
+): LabelRequests {
+  const inFlight = Object.fromEntries(
+    Object.entries(requests.inFlight).filter(([key]) => key !== id),
+  );
+  const failed = didFail && !requests.failed.includes(id) ? [...requests.failed, id] : requests.failed;
+  return { inFlight, failed, nextToken: requests.nextToken };
+}
+
+/**
+ * Everything remembered about tabs that are no longer open, dropped.
+ *
+ * The `failed` mark goes so a reopened tab is asked for again, and the `inFlight`
+ * entry goes so the request still running under it can no longer write anything —
+ * the reopen is free to fire its own. Same reference when there is nothing to
+ * drop, so the effect that calls it cannot loop.
+ */
+export function retireClosedRequests(
+  requests: LabelRequests,
+  tabs: readonly string[],
+): LabelRequests {
+  const flightIds = Object.keys(requests.inFlight);
+  const keptFlight = flightIds.filter((id) => tabs.includes(id));
+  const keptFailed = requests.failed.filter((id) => tabs.includes(id));
+  if (keptFlight.length === flightIds.length && keptFailed.length === requests.failed.length) {
+    return requests;
+  }
+  return {
+    inFlight: Object.fromEntries(keptFlight.map((id) => [id, requests.inFlight[id] as number])),
+    failed: keptFailed,
+    nextToken: requests.nextToken,
+  };
+}
+
+/**
+ * The routes this browser task has queued, with `route` on the end.
+ *
+ * De-duplicated against the last entry, and that is the whole of the bound it
+ * needs: the list is cleared on every committed pathname, so it can only grow
+ * while the route does not change — which is exactly the repeated-same-route case
+ * (clicking the already-active pill, or pressing `+` on `/invoices/new`). The
+ * queueing semantics are untouched, because the last entry is what a close reads
+ * as "where the router is headed" and membership is what `DepartingTabs` tests
+ * against: appending a route that is already last changes neither.
+ */
+export function queueRoute(routes: readonly string[], route: string): readonly string[] {
+  return routes.at(-1) === route ? routes : [...routes, route];
+}
+
+/**
  * The label cache with every closed tab's entry dropped.
  *
  * Two things depend on this. The cache is unbounded otherwise — a session that

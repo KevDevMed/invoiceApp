@@ -17,15 +17,22 @@ import {
   forgetClosedLabels,
   DRAFT_TAB_LABEL,
   INVOICES_ROUTE,
+  labelRequestIsCurrent,
   NEW_TAB_BUTTON_LABEL,
   NO_DEPARTING_TABS,
+  NO_LABEL_REQUESTS,
   openTabForPath,
+  pendingLabelIds,
   PENDING_TAB_LABEL,
   plusTransition,
+  queueRoute,
   recordDeparture,
   recordNavigation,
   removeTab,
+  retireClosedRequests,
   settleDepartures,
+  settleLabelRequest,
+  startLabelRequest,
   successorTabId,
   syncTabs,
   tabCloseLabel,
@@ -597,6 +604,86 @@ describe('forgetClosedLabels', () => {
   it('leaves a reopened tab eligible for a fresh request', () => {
     const kept = forgetClosedLabels({ a: 'INV-0001' }, []);
     expect(unlabelledTabIds(['a'], kept)).toEqual(['a']);
+  });
+});
+
+/**
+ * The label fetch lifecycle, as data.
+ *
+ * The async half used to live entirely in the hook's effect, where a node test
+ * cannot reach it — which is why a close racing an in-flight request went
+ * unnoticed. `LabelRequests` is that bookkeeping as a value, so the race is a
+ * sequence of calls: start, close, settle, reopen.
+ */
+describe('LabelRequests', () => {
+  it('asks once per unlabelled tab and not again while the request is out', () => {
+    expect(pendingLabelIds(['a', 'b', DRAFT_TAB_ID], {}, NO_LABEL_REQUESTS)).toEqual(['a', 'b']);
+    const started = startLabelRequest(NO_LABEL_REQUESTS, 'a');
+    expect(pendingLabelIds(['a', 'b'], {}, started.requests)).toEqual(['b']);
+    // Labelled, and failed, are both accounted for too.
+    const failed = settleLabelRequest(started.requests, 'a', true);
+    expect(pendingLabelIds(['a', 'b'], {}, failed)).toEqual(['b']);
+    expect(pendingLabelIds(['a'], { a: 'INV-0001' }, NO_LABEL_REQUESTS)).toEqual([]);
+  });
+
+  it('retries a failed fetch once the tab has closed and reopened', () => {
+    const started = startLabelRequest(NO_LABEL_REQUESTS, 'a');
+    const failed = settleLabelRequest(started.requests, 'a', true);
+    const retired = retireClosedRequests(failed, []);
+    expect(pendingLabelIds(['a'], {}, retired)).toEqual(['a']);
+  });
+
+  it('lets a request that outlived its tab write nothing at all', () => {
+    /*
+      The race: open `a`, leave `invoices:get` pending, close `a` — so the close
+      cleanup runs with no failure mark to retire, because the request has not
+      failed yet — then reopen `a`, then let the first request fail. Before this
+      the completion added `a` to `failed` while `a` was open again, nothing was
+      ever going to clear it, and the pill the user was looking at read "Invoice"
+      for the life of the window.
+    */
+    const first = startLabelRequest(NO_LABEL_REQUESTS, 'a');
+    const closed = retireClosedRequests(first.requests, []);
+    const second = startLabelRequest(closed, 'a');
+    expect(labelRequestIsCurrent(second.requests, 'a', first.token)).toBe(false);
+    expect(labelRequestIsCurrent(second.requests, 'a', second.token)).toBe(true);
+    // Two live tokens for one id, so they cannot be the same token.
+    expect(second.token).not.toBe(first.token);
+    // The reopened tab is still waiting on its *own* request, not marked failed.
+    const stillOpen = settleLabelRequest(second.requests, 'a', true);
+    expect(pendingLabelIds(['a'], {}, stillOpen)).toEqual([]);
+    expect(pendingLabelIds(['a'], {}, retireClosedRequests(stillOpen, []))).toEqual(['a']);
+  });
+
+  it('returns the same object when every request is still open', () => {
+    // Reference identity, or the effect that calls it re-runs forever.
+    const started = startLabelRequest(NO_LABEL_REQUESTS, 'a');
+    expect(retireClosedRequests(started.requests, ['a', 'b'])).toBe(started.requests);
+    expect(retireClosedRequests(NO_LABEL_REQUESTS, [])).toBe(NO_LABEL_REQUESTS);
+  });
+});
+
+describe('queueRoute', () => {
+  it('does not grow on repeated navigations to the route already queued', () => {
+    /*
+      Clicking the already-active pill, or pressing `+` on `/invoices/new`, queues
+      a route while the pathname never changes — and the cleanup that empties the
+      list keys on the pathname, so it never ran. The list grew for the whole
+      session and every close copied it into its departure bookkeeping.
+    */
+    let queued: readonly string[] = [];
+    for (let click = 0; click < 50; click += 1) queued = queueRoute(queued, '/invoices/a');
+    expect(queued).toEqual(['/invoices/a']);
+  });
+
+  it('keeps the queueing the departure bookkeeping depends on', () => {
+    // The last entry is "where the router is headed", and membership is what
+    // settles a departure. Both survive: only a repeat of the last is dropped.
+    const queued = queueRoute(queueRoute(queueRoute([], '/invoices/a'), '/invoices/b'), '/invoices/a');
+    expect(queued).toEqual(['/invoices/a', '/invoices/b', '/invoices/a']);
+    expect(queued.at(-1)).toBe('/invoices/a');
+    const same = queueRoute(queued, '/invoices/a');
+    expect(same).toBe(queued);
   });
 });
 
