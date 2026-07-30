@@ -141,6 +141,26 @@ export function formatDocumentDate(iso: string): string {
   return `${String(parsed.day)} ${MONTHS[parsed.month - 1] ?? ''} ${String(parsed.year)}`;
 }
 
+/**
+ * `yyyy-mm-dd` plus a whole number of days, as another `yyyy-mm-dd`.
+ *
+ * The inverse of `netTermDays`, and the reason the editor can derive a due date
+ * from a payment term. Arithmetic in UTC for the same reason `parseIsoDate`
+ * refuses `new Date(iso)`: a calendar date has no zone, and doing the addition
+ * in local time would shift the answer by a day across a DST boundary. An
+ * unparseable input comes back unchanged — the caller is mid-edit, not broken.
+ */
+export function addCalendarDays(iso: string, days: number): string {
+  const parsed = parseIsoDate(iso);
+  if (!parsed || !Number.isFinite(days)) return iso;
+  const stamp = Date.UTC(parsed.year, parsed.month - 1, parsed.day + Math.trunc(days));
+  const shifted = new Date(stamp);
+  const year = String(shifted.getUTCFullYear()).padStart(4, '0');
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(shifted.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 /** Whole days from issueDate to dueDate, or null if either date is unparseable. */
 export function netTermDays(issueDate: string, dueDate: string): number | null {
   const from = parseIsoDate(issueDate);

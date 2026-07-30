@@ -1,9 +1,16 @@
 /**
- * Every decision the read-only invoice detail page makes, as pure functions.
+ * Shared invoice arithmetic: days, delays, open amounts, the timeline and the
+ * line-item recap, as pure functions.
  *
- * `InvoiceDetail.tsx` is a thin renderer over these builders: the vitest
+ * The renderers over these builders — the triage pane (./listPaneView, via
+ * ./listPane) and both hosts of it — hold no logic of their own: the vitest
  * project is `environment: 'node'` and cannot mount React, so anything worth
  * asserting on has to live here to be testable at all.
+ *
+ * `buildStatTiles` used to live here and built the six-tile grid the old
+ * detail page opened with. The triage pane replaced that grid with three facts
+ * it derives in ./listPane, so the builder went with the layout rather than
+ * lingering as an untethered export.
  *
  * Dates are compared as calendar dates, never as `Date` objects built from a
  * bare ISO string — `new Date('2026-01-29')` is UTC midnight and prints as the
@@ -15,7 +22,7 @@
 
 import { formatMilli } from '../../../shared/money';
 import type { Invoice, InvoiceItem } from '../../../shared/types';
-import { formatDocumentDate, netTermDays } from './document';
+import { netTermDays } from './document';
 import { money } from './format';
 
 const EM_DASH = '—';
@@ -32,14 +39,6 @@ export interface StatusView {
   readonly delayDays: number;
   /** `18 days delay`, or null when there is nothing to say. */
   readonly delayNote: string | null;
-}
-
-export interface StatTile {
-  readonly key: string;
-  readonly label: string;
-  readonly value: string;
-  /** The one tile that carries the headline number. */
-  readonly isEmphasised: boolean;
 }
 
 export interface HistoryEvent {
@@ -202,60 +201,6 @@ function statusVariant(status: Invoice['status']): StatusVariant {
     default:
       return 'neutral';
   }
-}
-
-export interface StatTilesInput {
-  readonly invoice: Pick<
-    Invoice,
-    'status' | 'currency' | 'totalCents' | 'taxCents' | 'dueDate' | 'paidAt'
-  >;
-  /**
-   * Mean delay across the client's *other* paid invoices — this invoice is not
-   * in it — or null when the client has no other paid invoice.
-   */
-  readonly averageDelayDays: number | null;
-}
-
-/** The six tiles above the fold. Every value comes off the row — nothing derived from thin air. */
-export function buildStatTiles({ invoice, averageDelayDays }: StatTilesInput): StatTile[] {
-  return [
-    {
-      key: 'total',
-      label: 'Total Amount',
-      value: money(invoice.totalCents, invoice.currency),
-      isEmphasised: true,
-    },
-    {
-      key: 'open',
-      label: 'Open Amount',
-      value: money(openAmountCents(invoice), invoice.currency),
-      isEmphasised: false,
-    },
-    {
-      key: 'vat',
-      label: 'VAT Amount',
-      value: money(invoice.taxCents, invoice.currency),
-      isEmphasised: false,
-    },
-    {
-      key: 'due',
-      label: 'Due Date',
-      value: formatDocumentDate(invoice.dueDate),
-      isEmphasised: false,
-    },
-    {
-      key: 'paid',
-      label: 'Paid On',
-      value: invoice.paidAt === null ? EM_DASH : formatDocumentDate(calendarDateOf(invoice.paidAt)),
-      isEmphasised: false,
-    },
-    {
-      key: 'delay',
-      label: 'Other invoices av delay',
-      value: formatDelayDays(averageDelayDays),
-      isEmphasised: false,
-    },
-  ];
 }
 
 /**

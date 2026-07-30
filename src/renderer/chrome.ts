@@ -91,39 +91,69 @@ export function reservesTrafficLightBand(info: DesktopInfo): boolean {
 }
 
 /**
- * Vertical band reserved above the shell's top row when the OS paints window
- * controls over the renderer. macOS puts the traffic lights at roughly
- * x 13–70, y 12–32 under `titleBarStyle: 'hiddenInset'`; --spacing-11 (44px)
- * clears the tallest of them with a few pixels to spare.
+ * Vertical band reserved for the traffic lights, as a CSS length.
+ *
+ * macOS puts them at roughly x 13–70, y 12–32 under
+ * `titleBarStyle: 'hiddenInset'`; --spacing-10 (40px) clears the tallest of
+ * them with eight pixels to spare, and 40px is the band height every other
+ * chrome row in this shell is measured against — the brand row, the tab strip
+ * and the collapsed unified title bar are all the same height, which is what
+ * makes the three of them read as one grid rather than three near-misses.
  */
-export const OVERLAY_TITLE_BAR_INSET = 'var(--spacing-11)';
+export const OVERLAY_TITLE_BAR_INSET = 'var(--spacing-10)';
 
 /** No overlay controls, no dead space — the preview must look intentional. */
 export const NO_TITLE_BAR_INSET = 'var(--spacing-0)';
 
 /**
- * Height of the reserved band, as a CSS length.
+ * Height of the band the traffic lights sit in, wherever it is drawn.
  *
- * The band spans the sidebar *and* the content column, not just the sidebar.
- * The lights are anchored to the window, not to the sidebar: collapse the
- * sidebar to its icon rail (~64px) or drag it to `SIDE_NAV_WIDTH.min` and the
- * lights stay at x 13–70, spilling past a narrow rail into the content column.
- * Reserving the band on both columns is the only rule that holds at every
- * sidebar width, including collapsed, so no nav icon, collapse button or
- * breadcrumb can ever sit under a light.
+ * Expanded, that band is the top row of the sidebar: the sidebar is never
+ * narrower than `SIDE_NAV_WIDTH.min`, so it owns the whole light zone on its
+ * own. Collapsed, the rail is 56px and the lights cannot fit in it at all, so
+ * they move to a full-width unified title bar (`UNIFIED_TITLE_BAR_HEIGHT`)
+ * spanning both columns — the standard macOS move, and the reason no piece of
+ * geometry here has to reserve a light zone inside a narrow rail any more.
  */
 export function titleBarInset(info: DesktopInfo): string {
   return reservesTrafficLightBand(info) ? OVERLAY_TITLE_BAR_INSET : NO_TITLE_BAR_INSET;
 }
 
 /**
+ * The brand row: app mark, wordmark, and the collapse toggle at its inline end.
+ *
+ * Its own band, directly under the traffic lights and the same height as them,
+ * rather than a 44px avatar row that outweighs the nav beneath it. Unlike the
+ * light band this one is *not* conditional: it carries the only collapse
+ * toggle, so on win32/linux — where there are no lights and the band above is
+ * zero — it is still the sidebar's first visible row.
+ */
+export const BRAND_BAND_HEIGHT = 'var(--spacing-10)';
+
+/**
+ * The content column's tab-strip band, and the breadcrumb bar under it.
+ *
+ * 40 + 36. The strip is the taller of the two because it holds 28px pills; the
+ * breadcrumb holds one line of supporting text and is deliberately lighter, so
+ * the eye reads strip-then-trail rather than two equal bars.
+ */
+export const TAB_STRIP_BAND_HEIGHT = 'var(--spacing-10)';
+export const BREADCRUMB_BAND_HEIGHT = 'var(--spacing-9)';
+
+/**
+ * The collapsed unified title bar: traffic lights, expand toggle, centred
+ * `InvoiceApp — <page>` title, spanning both columns.
+ */
+export const UNIFIED_TITLE_BAR_HEIGHT = 'var(--spacing-10)';
+
+/**
  * Sidebar width budget, in px (SideNav's `resizable` takes numbers).
  * `min` stays well clear of the 78px the traffic lights occupy, so an expanded
- * sidebar always owns the whole light zone; `default` sits in the 240–280
- * band the layout docs recommend for a nav rail.
+ * sidebar always owns the whole light zone; `default` is the 240px the design
+ * measures its rhythm against.
  */
 export const SIDE_NAV_WIDTH = {
-  default: 264,
+  default: 240,
   min: 224,
   max: 360,
 } as const;
@@ -221,40 +251,63 @@ export function isSectionSelected(pathname: string, path: string): boolean {
   return pathname === path || pathname.startsWith(`${path}/`);
 }
 
+/** The product name, as the window title and the sidebar wordmark spell it. */
+export const APP_NAME = 'InvoiceApp';
+
+/** Label of the section the given route belongs to, or null off the nav. */
+export function sectionLabel(pathname: string): string | null {
+  return SECTION_ROUTES.find((route) => isSectionSelected(pathname, route.path))?.label ?? null;
+}
+
 /**
- * Narrowest the collapsed icon rail may be when the OS overlays window
- * controls, in px.
+ * The collapsed title bar's centred title.
  *
- * The traffic lights occupy roughly x 13-70. The design system's own collapsed
- * width is --spacing-12 (48px), which ends *inside* that zone: the lights then
- * straddle the rail's inline-end edge and the divider runs between the yellow
- * and the green light. 88px puts the whole light cluster inside the rail with
- * room to spare, even once the panel is inset from the window edge by
- * --spacing-2 (8px): the rail then spans x 8-96 and the lights end at 70.
+ * `InvoiceApp — Invoices`, falling back to the bare product name off the nav.
+ * Pure, because the collapsed rail is the one state where the shell has to
+ * *say* where you are: the nav labels are gone and only the glyphs are left.
  */
-export const COLLAPSED_RAIL_MIN_PX = 88;
-
-/** 44 * 2 = 88px, expressed on the spacing scale rather than as a raw length. */
-export const OVERLAY_COLLAPSED_RAIL_WIDTH = 'calc(var(--spacing-11) * 2)';
-
-/** No overlay controls, no light zone to clear — the design system's own width. */
-export const DEFAULT_COLLAPSED_RAIL_WIDTH = 'var(--spacing-12)';
-
-/** --spacing-12, in px. Paired with the token above so the two cannot drift. */
-export const DEFAULT_COLLAPSED_RAIL_PX = 48;
+export function windowTitle(pathname: string): string {
+  const section = sectionLabel(pathname);
+  return section === null ? APP_NAME : `${APP_NAME} — ${section}`;
+}
 
 /**
- * Minimum width of the collapsed icon rail, as a CSS length.
+ * Width of the collapsed icon rail, as a CSS length.
+ *
+ * 56px: a 40px rail item centred in the 8px of inline padding SideNav puts on
+ * either side of its scroll region. It used to be 88px, and the extra 32px were
+ * there for one reason only — the traffic lights lived in the rail and a 48px
+ * rail cut the cluster in half. They do not any more: collapsing moves them to
+ * the unified title bar, which is what frees the rail to be as narrow as the
+ * glyphs in it.
  *
  * Applied as `min-inline-size`, not `width`: SideNav owns its collapsed width
  * and its expanded (resizable) width, and a floor is the one thing that widens
  * the rail without fighting either.
  */
-export function collapsedRailWidth(info: DesktopInfo): string {
-  return reservesTrafficLightBand(info)
-    ? OVERLAY_COLLAPSED_RAIL_WIDTH
-    : DEFAULT_COLLAPSED_RAIL_WIDTH;
-}
+export const COLLAPSED_RAIL_WIDTH = 'calc(var(--spacing-12) + var(--spacing-2))';
+
+/** --spacing-12 + --spacing-2, in px. Paired with the token so the two cannot drift. */
+export const COLLAPSED_RAIL_PX = 56;
+
+/**
+ * Height of a group caption, and so of the blank that stands in for one on the
+ * collapsed rail.
+ *
+ * Collapsing narrows; it does not rearrange. SideNavSection hides its caption
+ * outright when collapsed (absolutely positioned, zero height), which slides
+ * every row below it upwards and makes the toggle read as a reshuffle. The rail
+ * therefore renders a band of exactly this height in the caption's place — empty
+ * before the first group, a centred hairline before every later one — so each
+ * nav row keeps the Y it had while the labels were showing.
+ *
+ * 24px is the caption's own block: --spacing-1 of padding above and below
+ * SideNavSection's header, around one 20px line of --text-supporting.
+ */
+export const NAV_GROUP_CAPTION_HEIGHT = 'var(--spacing-6)';
+
+/** --spacing-6, in px. Paired with the token so the two cannot drift. */
+export const NAV_GROUP_CAPTION_PX = 24;
 
 /**
  * The sidebar's inset budget — how far the floating panel sits from each window
@@ -296,31 +349,19 @@ export interface SideNavPanelGeometry {
  * inline style. `minInlineSize` is the one width property this may set — see
  * `collapsedRailWidth` for why a floor, rather than a width, is the right lever.
  */
-export function sideNavPanelGeometry(info: DesktopInfo): SideNavPanelGeometry {
+export function sideNavPanelGeometry(): SideNavPanelGeometry {
   return {
     marginBlock: PANEL_INSET,
     marginInline: PANEL_INSET,
     blockSize: `calc(100% - ${PANEL_INSET_TOTAL})`,
-    minInlineSize: collapsedRailWidth(info),
+    minInlineSize: COLLAPSED_RAIL_WIDTH,
   };
 }
 
 /**
- * Inline-end edge of the collapsed rail, in px, measured from the window edge.
- *
- * The rail no longer starts at x=0 — it starts at `PANEL_INSET_PX`. That inset
- * eats into the clearance the rail's width was chosen to provide, so the two
- * have to be checked together against the traffic lights rather than apart.
- */
-export function collapsedRailInlineEndPx(info: DesktopInfo): number {
-  const width = reservesTrafficLightBand(info) ? COLLAPSED_RAIL_MIN_PX : DEFAULT_COLLAPSED_RAIL_PX;
-  return PANEL_INSET_PX + width;
-}
-
-/**
  * Rightmost pixel the macOS traffic lights reach under `hiddenInset`. The
- * cluster spans roughly x 13-70; the collapsed rail has to end past this or the
- * green light straddles the panel's edge.
+ * cluster spans roughly x 13-70; nothing interactive may start before this in
+ * any band that begins at the window's own inline start.
  */
 export const TRAFFIC_LIGHT_ZONE_END_PX = 70;
 
@@ -355,57 +396,88 @@ export interface TrafficLightClusterPx {
   readonly endPx: number;
 }
 
-/** Where the placeholder cluster lands, so the reference can be checked in a test. */
+/** Where the expanded sidebar's placeholder cluster lands, so the reference can
+ *  be checked in a test. */
 export function placeholderClusterPx(): TrafficLightClusterPx {
   const startPx = PANEL_INSET_PX + PANEL_BORDER_PX + SIDE_NAV_HEADER_PADDING_INLINE_PX;
+  return { startPx, endPx: startPx + trafficLightClusterWidthPx() };
+}
+
+/** Three 12px dots with two 8px gaps: 52px, wherever the cluster is drawn. */
+function trafficLightClusterWidthPx(): number {
   const dots = TRAFFIC_LIGHT_DOT_COUNT * TRAFFIC_LIGHT_DOT_SIZE_PX;
   const gaps = (TRAFFIC_LIGHT_DOT_COUNT - 1) * TRAFFIC_LIGHT_DOT_GAP_PX;
-  return { startPx, endPx: startPx + dots + gaps };
+  return dots + gaps;
 }
 
 /**
- * Height of the sidebar's title band — the band holding the traffic lights (real
- * or placeholder) and, while expanded, the three ghost icon buttons.
+ * Inline padding of the collapsed unified title bar.
  *
- * Where there is a light cluster this is the same 44px band `titleBarInset`
- * reserves, so the expanded buttons sit beside the lights rather than below
- * them. On win32/linux `titleBarInset` is zero — the OS draws its own title bar
- * and there are no lights to clear — but the row still has to be tall enough to
- * *show the buttons*, so it falls back to a real control height instead of
- * collapsing to nothing and hiding the only collapse toggle.
+ * The bar starts at the window's own edge — it spans both columns — so this
+ * padding alone decides where the placeholder cluster begins. 12px lands it one
+ * pixel left of the 13px macOS itself uses.
  */
-export const SIDE_NAV_CONTROL_ROW_MIN_HEIGHT = 'var(--spacing-9)';
+export const UNIFIED_TITLE_BAR_PADDING_INLINE = 'var(--spacing-3)';
+export const UNIFIED_TITLE_BAR_PADDING_INLINE_PX = 12;
 
-/** --spacing-9, in px. Comfortably clears a `size="sm"` icon button. */
-export const SIDE_NAV_CONTROL_ROW_MIN_PX = 36;
+/**
+ * Width of the slot the unified title bar keeps free for the traffic lights.
+ *
+ * Reserved rather than measured, because on macOS there is nothing to measure:
+ * the OS paints the cluster over the renderer and the bar's first *element* is
+ * the expand toggle. A fixed leading slot is what puts that toggle in the same
+ * place in both builds — and past `TRAFFIC_LIGHT_ZONE_END_PX` in the one where
+ * a real green light is sitting there.
+ *
+ * 12px of bar padding + 60px of slot = 72px, two clear of the 70 the lights end
+ * at, and roomy enough for the 52px the placeholders occupy inside it.
+ */
+export const TRAFFIC_LIGHT_RESERVE_WIDTH = 'calc(var(--spacing-12) + var(--spacing-3))';
+export const TRAFFIC_LIGHT_RESERVE_PX = 60;
 
-export function sideNavControlRowHeight(info: DesktopInfo): string {
-  return reservesTrafficLightBand(info)
-    ? OVERLAY_TITLE_BAR_INSET
-    : SIDE_NAV_CONTROL_ROW_MIN_HEIGHT;
+/** Where the unified title bar's placeholder cluster lands. */
+export function unifiedTitleBarClusterPx(): TrafficLightClusterPx {
+  const startPx = UNIFIED_TITLE_BAR_PADDING_INLINE_PX;
+  return { startPx, endPx: startPx + trafficLightClusterWidthPx() };
+}
+
+/** Inline start of everything after the reserved slot in the unified title bar. */
+export function unifiedTitleBarContentStartPx(): number {
+  return UNIFIED_TITLE_BAR_PADDING_INLINE_PX + TRAFFIC_LIGHT_RESERVE_PX;
 }
 
 /**
- * Height of the *content* column's band — the one that used to be reserved
- * space and nothing else, and now holds the open-invoice tab strip.
+ * Height of the sidebar's traffic-light band.
  *
- * Same shape of decision as `sideNavControlRowHeight`, and it exists for the
- * same reason: `titleBarInset` is 44px where there is a light cluster to clear
- * and 0px on win32/linux, where the OS paints a real title bar — and a strip
- * inside a zero-height band is a strip nobody can see or click.
+ * Nothing else is in it — that is the point. The band is the window's drag
+ * surface and the lights' home, and putting a right-aligned cluster of ghost
+ * buttons beside them (which is what this used to do) aligned those buttons to
+ * nothing. They now live in the sidebar footer, and the collapse toggle in the
+ * brand row below.
  *
- * So the fallback is conditional on the band having something in it. With tabs
- * open it is a real control height; with none it stays flat 0, which is what
- * keeps a win32 build free of dead space above the page and keeps the band on
- * Settings exactly the empty drag surface it is today.
- *
- * The fallback is the same 44px, not the sidebar's 36px, because the strip is a
- * `size="sm"` Toolbar: a 28px element plus the 8px of block padding Toolbar puts
- * above and below it. A 36px band would clip the pills it exists to show.
+ * Zero while collapsed: the lights are not in the sidebar then, they are in the
+ * unified title bar above both columns, and a rail that still reserved 40px for
+ * them would open with a dead gap over its first glyph. Zero on win32/linux for
+ * the older reason — the OS paints a real title bar there and there is no
+ * cluster to clear. Neither case can hide a control any more, because this band
+ * no longer holds one.
  */
-export const CONTENT_TITLE_BAR_MIN_HEIGHT = OVERLAY_TITLE_BAR_INSET;
+export function sideNavControlRowHeight(info: DesktopInfo, isCollapsed: boolean): string {
+  if (isCollapsed) return NO_TITLE_BAR_INSET;
+  return titleBarInset(info);
+}
 
-export function contentTitleBarHeight(info: DesktopInfo, hasContent: boolean): string {
-  if (reservesTrafficLightBand(info)) return OVERLAY_TITLE_BAR_INSET;
-  return hasContent ? CONTENT_TITLE_BAR_MIN_HEIGHT : NO_TITLE_BAR_INSET;
+/**
+ * Height of the *content* column's first band — the open-invoice tab strip.
+ *
+ * It is kept at its full height even with no tabs open wherever there is a
+ * light cluster, because the band is also the content column's half of the
+ * window's drag surface: `hiddenInset` leaves no title bar to grab, and the
+ * sidebar's own band only covers the first 240px of the window. Where the OS
+ * paints a real title bar there is nothing to reserve, so an empty strip
+ * collapses to nothing rather than leaving dead space above every page.
+ */
+export function tabStripBandHeight(info: DesktopInfo, hasTabs: boolean): string {
+  if (reservesTrafficLightBand(info)) return TAB_STRIP_BAND_HEIGHT;
+  return hasTabs ? TAB_STRIP_BAND_HEIGHT : NO_TITLE_BAR_INSET;
 }

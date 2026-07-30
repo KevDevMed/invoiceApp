@@ -7,7 +7,6 @@ import {
   buildHistoryEvents,
   buildLineSummary,
   buildNotesSections,
-  buildStatTiles,
   buildStatusView,
   calendarDateOf,
   daysBetween,
@@ -284,63 +283,6 @@ describe('buildStatusView', () => {
     expect(buildStatusView(makeInvoice({ status: 'void' }), '2026-02-18', false).variant).toBe(
       'orange',
     );
-  });
-});
-
-describe('buildStatTiles', () => {
-  it('maps every tile off the row', () => {
-    const tiles = buildStatTiles({
-      invoice: makeInvoice({ status: 'sent', paidAt: null }),
-      averageDelayDays: 12,
-    });
-    expect(tiles.map((tile) => tile.label)).toEqual([
-      'Total Amount',
-      'Open Amount',
-      'VAT Amount',
-      'Due Date',
-      'Paid On',
-      'Other invoices av delay',
-    ]);
-    expect(tiles.map((tile) => tile.value)).toEqual([
-      '$1,230.00',
-      '$1,230.00',
-      '$230.00',
-      '31 January 2026',
-      '—',
-      '12 days late',
-    ]);
-    expect(tiles.filter((tile) => tile.isEmphasised).map((tile) => tile.key)).toEqual(['total']);
-  });
-
-  it('zeroes the open amount and dates the payment once paid', () => {
-    const tiles = buildStatTiles({
-      invoice: makeInvoice({ status: 'paid', paidAt: '2026-02-03T22:30:00.000Z' }),
-      averageDelayDays: null,
-    });
-    const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
-    expect(byKey.open).toBe('$0.00');
-    expect(byKey.paid).toBe('3 February 2026');
-    expect(byKey.delay).toBe('—');
-  });
-
-  it('shows nothing outstanding on a void invoice', () => {
-    const tiles = buildStatTiles({
-      invoice: makeInvoice({ status: 'void' }),
-      averageDelayDays: null,
-    });
-    const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
-    // The total still reads as the face value of the cancelled document.
-    expect(byKey.total).toBe('$1,230.00');
-    expect(byKey.open).toBe('$0.00');
-  });
-
-  it('shows nothing outstanding on a draft', () => {
-    const tiles = buildStatTiles({
-      invoice: makeInvoice({ status: 'draft' }),
-      averageDelayDays: null,
-    });
-    const byKey = Object.fromEntries(tiles.map((tile) => [tile.key, tile.value]));
-    expect(byKey.open).toBe('$0.00');
   });
 });
 

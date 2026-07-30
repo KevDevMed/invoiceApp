@@ -25,25 +25,93 @@ body {
 
 /*
  * Window drag surfaces. `titleBarStyle: 'hiddenInset'` removes the macOS title
- * bar, so the app has to supply something to grab the window by: the reserved
- * band at the top of the sidebar and of the content column. `-webkit-app-region`
- * is an Electron/Chromium property with no design-system equivalent, which is
- * the only reason these rules exist here.
+ * bar, so the app has to supply something to grab the window by: the traffic
+ * light band and the brand row at the top of the sidebar, the tab strip at the
+ * top of the content column, and — while the sidebar is collapsed — the unified
+ * title bar spanning both. `-webkit-app-region` is an Electron/Chromium property
+ * with no design-system equivalent, which is the only reason these rules exist
+ * here.
+ *
+ * `.app-unified-title-bar` is a second name for the same behaviour rather than
+ * another `.app-drag-region`, because that class is also how
+ * `preview/screenshots.mjs` finds the content column's band: it takes the first
+ * one outside the sidebar, and a full-width bar above both columns would answer
+ * that query instead.
  *
  * Everything interactive inside a drag region must opt back out — a control in
  * a drag region stops receiving clicks entirely. The :where() list has zero
  * specificity, so component styles are unaffected. The resize handle is a
  * sibling that floats over the sidebar's reserved band, so it is named too.
  */
-.app-drag-region {
+.app-drag-region,
+.app-unified-title-bar {
   -webkit-app-region: drag;
 }
 
 .app-drag-region
   :where(a, button, input, select, textarea, [role='button'], [role='link'], [role='radio'],
     [role='radiogroup'], [role='tab'], [tabindex]),
+.app-unified-title-bar
+  :where(a, button, input, select, textarea, [role='button'], [role='link'], [role='radio'],
+    [role='radiogroup'], [role='tab'], [tabindex]),
 [data-testid='astryx-sidenav-resize-handle'] {
   -webkit-app-region: no-drag;
+}
+
+/*
+ * The unified title bar's own surface: the one band that belongs to the window
+ * rather than to either column, so it is the one band that says so by being a
+ * shade lighter than the flat body colour with a hairline under it. Both values
+ * are semantic tokens, so the lift holds in light mode (where `surface` is
+ * white on a grey body) as well as dark.
+ */
+.app-unified-title-bar {
+  background-color: var(--color-background-surface);
+  border-block-end: var(--border-width) solid var(--color-border);
+}
+
+/*
+ * The breadcrumb bar, directly under the tab strip. Only the hairline is here —
+ * the band's height, padding and contents are `ui/ShellBreadcrumbs`'s, and the
+ * type comes from Breadcrumbs' own `supporting` variant. A rule rather than a
+ * `Divider` because a divider is an element in the flow and this is the edge of
+ * a band that already has one.
+ */
+.app-breadcrumb-bar {
+  border-block-end: var(--border-width) solid var(--color-border);
+}
+
+/*
+ * The hairline that stands in for a group caption on the collapsed rail.
+ *
+ * Collapsing narrows, it does not rearrange: the caption's 24px band stays (see
+ * `NAV_GROUP_CAPTION_HEIGHT` in `chrome.ts`) and this is what sits in it — 16px
+ * of `--color-border`, centred, saying "a new group starts here" without saying
+ * which. A class rather than a Divider for the same reason as the traffic-light
+ * discs below: the design system has no primitive for a fixed-width rule, and
+ * Divider spans its container.
+ */
+.app-nav-group-rule {
+  inline-size: var(--spacing-4);
+  block-size: var(--border-width);
+  background-color: var(--color-border);
+  flex: none;
+}
+
+/*
+ * Rail items on the collapsed sidebar: 40 wide, 32 tall, glyph centred.
+ *
+ * SideNavItem's own collapsed width is `--size-element-md` — a 32px square,
+ * which leaves the glyph's hit area narrower than the 40px the design draws and
+ * off-centre in a 56px rail once SideNav's 8px of inline padding is counted.
+ * The height is untouched: it is already the 32px pitch every expanded row
+ * uses, and keeping it is what lets a row hold its exact Y across the toggle.
+ *
+ * Scoped by a modifier class the shell adds, because SideNav reflects no
+ * collapsed state onto the DOM for a selector to key off.
+ */
+.app-side-nav-collapsed .astryx-side-nav-item {
+  inline-size: var(--spacing-10);
 }
 
 /*
@@ -101,6 +169,14 @@ body {
 .app-invoice-tabs {
   /* The strip is laid out by Toolbar; this only lets it shrink. */
   min-inline-size: 0;
+  /*
+    Toolbar puts --spacing-2 of block padding above and below its row at every
+    size, which wraps a 28px pill in a 44px box — four pixels taller than the
+    40px band the strip lives in, so the pills would be clipped by the band they
+    are the whole point of. Halving it fits the strip inside with two pixels of
+    air either side, and keeps the pill the tallest thing in the band.
+  */
+  padding-block: var(--spacing-1);
   /*
     Toolbar pulls its first item back by `--container-padding-inline-start` minus
     its own block padding (edge compensation, so a ghost button sits flush inside
@@ -163,11 +239,37 @@ body {
   max-inline-size: 14rem;
   block-size: var(--spacing-7);
   border-radius: var(--radius-element);
+  /* The active pill carries a hairline and the inactive ones do not, so the
+     border has to come out of the 28px rather than be added to it — otherwise
+     the selected tab is two pixels taller than its neighbours. */
+  box-sizing: border-box;
 }
 
 .app-invoice-tab-active {
   background-color: var(--color-invoice-tab-surface-active);
   color: var(--color-invoice-tab-ink-active);
+  border: var(--border-width) solid var(--color-invoice-tab-border-active);
+}
+
+/*
+ * The active pill's close control, at rest.
+ *
+ * The design draws the active tab with no close affordance at all — fill,
+ * hairline, label, nothing else — and the inactive ones with a trailing glyph.
+ * Taken literally that removes the only way to close the document you are
+ * looking at, so the control stays in the DOM, keeps its box (no reflow when it
+ * appears) and keeps its place in the focus order; it is only invisible until
+ * the pointer is on the pill or the button itself is keyboard-focused. `opacity`
+ * rather than `visibility` for exactly that reason: `visibility: hidden` takes
+ * an element out of the focus order and out of the accessibility tree.
+ */
+.app-invoice-tab-active .app-invoice-tab-close {
+  opacity: 0;
+}
+
+.app-invoice-tab-active:hover .app-invoice-tab-close,
+.app-invoice-tab-active .app-invoice-tab-close:focus-visible {
+  opacity: 1;
 }
 
 /*

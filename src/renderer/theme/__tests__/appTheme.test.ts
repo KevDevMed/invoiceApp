@@ -216,6 +216,16 @@ describe('text contrast (WCAG AA, 4.5:1 for normal text)', () => {
       expect(String(tabColors['--color-invoice-tab-ink-active'])).toBe('var(--color-text-primary)');
     });
 
+    it('outlines the active pill with the edge token that reads in both modes', () => {
+      // Not `--color-border`: in light mode that is #ebebeb, lighter than this
+      // theme's body colour, so the hairline would be invisible on exactly the
+      // surface the pill sits on. Same reason `PANEL_EDGE` uses the emphasised
+      // token — see the panel-edge assertions above.
+      expect(String(tabColors['--color-invoice-tab-border-active'])).toBe(
+        'var(--color-border-emphasized)',
+      );
+    });
+
     const percent = Number(
       /(\d+)%/.exec(String(tabColors['--color-invoice-tab-surface-active']))?.[1],
     );
@@ -480,6 +490,7 @@ describe('the panel carries the gradient and the window does not', () => {
       '--color-invoice-tab-ink-active': 'var(--color-text-primary)',
       '--color-invoice-tab-surface-active':
         'color-mix(in srgb, var(--color-text-primary) 10%, transparent)',
+      '--color-invoice-tab-border-active': 'var(--color-border-emphasized)',
     });
   });
 
@@ -519,10 +530,29 @@ describe('nav items and ghost icon buttons', () => {
   it('gives nav items a rounded pill and a mode-agnostic selected tint', () => {
     expect(rule('side-nav-item', 'base')).toEqual({
       borderRadius: 'var(--radius-element)',
+      // The other half of the section-caption rule below. Not decoration: the
+      // item root is a descendant of the section root, so without these two the
+      // uppercase and the tracking meant for the caption reach every label.
+      textTransform: 'none',
+      letterSpacing: 'normal',
     });
     expect(rule('side-nav-item', 'selected')).toEqual({
       backgroundColor: 'color-mix(in srgb, var(--color-text-primary) 8%, transparent)',
     });
+  });
+
+  it('uppercases and tracks out the group captions, and only those', () => {
+    // Set on the section because the caption's own StyleX rule outranks
+    // anything written for it; neither property is one that rule declares, so
+    // both inherit down to it. The pair is only correct together — the reset on
+    // `side-nav-item` above is what stops it reaching the rows.
+    expect(rule('side-nav-section', 'base')).toEqual({
+      textTransform: 'uppercase',
+      letterSpacing: '0.06em',
+    });
+    const item = rule('side-nav-item', 'base');
+    expect(item.textTransform).toBe('none');
+    expect(item.letterSpacing).toBe('normal');
   });
 
   it('makes ghost buttons unfilled at rest with a surface only on hover', () => {
