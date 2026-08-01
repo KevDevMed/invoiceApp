@@ -43,6 +43,7 @@ import {
   HF_TOKEN_SETTING_KEY,
   HfLookupRequest,
   SmokeTestRequest,
+  SystemInfoRequest,
   opOf,
 } from '../llm/extra-channels';
 import { discoverModels, type DiscoveryResult } from '../llm/discovery';
@@ -337,7 +338,11 @@ async function handleCatalogOp(payload: unknown): Promise<CatalogResponse> {
       return { entries: catalogEntries() } satisfies CatalogOpResponse as CatalogResponse;
 
     case 'systemInfo': {
-      const profile = await getSupportService().systemInfo();
+      // `refresh` re-probes the hardware itself, not just the verdict cache —
+      // it is the difference between `Re-check` re-measuring the machine and
+      // recomputing the same answers from the reading it already had.
+      const request = SystemInfoRequest.parse(payload);
+      const profile = await getSupportService().systemInfo(request.refresh ?? false);
       return {
         entries: [],
         systemInfo: { ...profile, summary: describeHardware(profile) },

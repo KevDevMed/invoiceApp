@@ -199,8 +199,13 @@ export async function fetchCatalog(): Promise<CatalogResponse['entries']> {
   return (await invokeOp({ op: 'catalog' })).entries;
 }
 
-export async function fetchSystemInfo(): Promise<SystemInfoView> {
-  const response = await invokeOp({ op: 'systemInfo' });
+/**
+ * The detected machine. `refresh` asks main to probe the hardware again rather
+ * than hand back the reading it cached for the life of the process — which is
+ * what `Re-check` promises and, until now, could not ask for.
+ */
+export async function fetchSystemInfo(refresh = false): Promise<SystemInfoView> {
+  const response = await invokeOp({ op: 'systemInfo', refresh });
   if (!response.systemInfo) throw new Error('Main returned no system information.');
   return response.systemInfo;
 }
@@ -231,6 +236,7 @@ export interface DiscoverArgs {
   readonly maxRepos?: number;
   readonly maxVariantsPerRepo?: number;
   readonly maxChecks?: number;
+  /** Bypass main's per-variant verdict cache for every check the sweep runs. */
   readonly refresh?: boolean;
 }
 

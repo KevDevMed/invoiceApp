@@ -68,7 +68,19 @@ export const CatalogRequestSchema = z.intersection(
 // Per-op request schemas
 // ---------------------------------------------------------------------------
 
-export const SystemInfoRequest = z.object({ op: z.literal('systemInfo') });
+/**
+ * `refresh` is what makes `Re-check` honest.
+ *
+ * `SupportService.systemInfo` has always been able to probe again, but without a
+ * field for it the renderer could only ask for the cached reading — so `Re-check`
+ * recomputed every verdict against the *same* machine profile it had just told
+ * the user it was re-measuring. Optional and defaulting to false, so the plain
+ * `{ op: 'systemInfo' }` every existing caller sends still means "the cached one".
+ */
+export const SystemInfoRequest = z.object({
+  op: z.literal('systemInfo'),
+  refresh: z.boolean().optional(),
+});
 
 export const CheckSupportRequest = z.object({
   op: z.literal('checkSupport'),
