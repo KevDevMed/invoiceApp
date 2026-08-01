@@ -188,61 +188,39 @@ describe('matchesSegment / countSegments', () => {
 });
 
 describe('segmentShowing', () => {
-  it('leaves a tab that already shows the state exactly where it is', () => {
-    // Pressing `Chase all N` from All or Overdue must not yank the reader onto
-    // a different tab for no reason.
-    expect(segmentShowing('overdue', 'all')).toBe('all');
-    expect(segmentShowing('overdue', 'overdue')).toBe('overdue');
-  });
-
-  it('moves off a tab that cannot show the state', () => {
-    // `Chase all N` used to leave the segment alone. On Sent, Drafts or Paid
-    // the row set went empty, the selection was narrowed to the visible rows
-    // and therefore to none, and the button silently did nothing.
-    for (const segment of ['sent', 'drafts', 'paid'] as const) {
-      expect(segmentShowing('overdue', segment), segment).not.toBe(segment);
-      expect(matchesSegment('overdue', segmentShowing('overdue', segment)), segment).toBe(true);
-    }
-  });
-
-  it('lands somewhere that shows the state, from every segment and every state', () => {
-    for (const state of ROW_STATES) {
-      for (const { key } of LIST_SEGMENTS) {
-        const landed = segmentShowing(state, key);
-        expect(matchesSegment(state, landed), `${state} from ${key}`).toBe(true);
-      }
-    }
+  it('sends an overdue action to Overdue, including from All', () => {
+    // `All` is the one starting segment that was never covered, and the one
+    // the previous repair got wrong: it spared any tab that already showed the
+    // state, and `all` shows everything, so Chase from `All` left `All`
+    // pressed and `Overdue` reporting `aria-pressed="false"`. One button, two
+    // behaviours. The destination is unconditional.
+    expect(segmentShowing('overdue')).toBe('overdue');
   });
 
   it('lands on the tab the state is ABOUT, not the first one that tolerates it', () => {
-    // The regression: `LIST_SEGMENTS.find(matchesSegment)` reached the
+    // The earlier regression: `LIST_SEGMENTS.find(matchesSegment)` reached the
     // universal `all` before it ever reached `overdue`, so Chase from Sent,
-    // Drafts or Paid selected the right 17 rows under the wrong tab — `All`
-    // pressed, `Overdue` still reporting `aria-pressed="false"`.
-    for (const segment of ['sent', 'drafts', 'paid'] as const) {
-      expect(segmentShowing('overdue', segment), segment).toBe('overdue');
+    // Drafts or Paid selected the right 17 rows under the wrong tab.
+    expect(segmentShowing('draft')).toBe('drafts');
+    expect(segmentShowing('paid')).toBe('paid');
+    expect(segmentShowing('due-soon')).toBe('sent');
+    expect(segmentShowing('later')).toBe('sent');
+  });
+
+  it('lands on a tab that really shows the state, for every state', () => {
+    for (const state of ROW_STATES) {
+      expect(matchesSegment(state, segmentShowing(state)), state).toBe(true);
     }
-    expect(segmentShowing('draft', 'paid')).toBe('drafts');
-    expect(segmentShowing('paid', 'drafts')).toBe('paid');
-    expect(segmentShowing('due-soon', 'paid')).toBe('sent');
-    expect(segmentShowing('later', 'overdue')).toBe('sent');
   });
 
   it('sends `void` to All, which is the only tab that shows it', () => {
     // `void` has no tab of its own by design. `all` is the answer, not a
     // fallback — and it is the only segment that matches, so the invariant
     // above cannot distinguish the two readings.
+    expect(segmentShowing('void')).toBe('all');
     for (const { key } of LIST_SEGMENTS) {
-      expect(segmentShowing('void', key), key).toBe('all');
-    }
-  });
-
-  it('never moves a reader off a tab that already shows the state', () => {
-    for (const state of ROW_STATES) {
-      for (const { key } of LIST_SEGMENTS) {
-        if (!matchesSegment(state, key)) continue;
-        expect(segmentShowing(state, key), `${state} from ${key}`).toBe(key);
-      }
+      if (key === 'all') continue;
+      expect(matchesSegment('void', key), key).toBe(false);
     }
   });
 });

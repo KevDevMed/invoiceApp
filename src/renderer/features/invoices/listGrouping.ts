@@ -294,24 +294,26 @@ const SEGMENT_ABOUT: Record<RowState, ListSegment> = {
 };
 
 /**
- * The tab an action targeting `state` has to land on, given where the reader is.
+ * The tab an action targeting `state` has to land on. The answer does not
+ * depend on where the reader started, which is the whole point.
  *
  * `Chase all N` selects the overdue invoices and applies the Overdue chip, but
  * it used to leave the segment alone. On `Sent`, `Drafts` or `Paid` — none of
  * which admit an overdue row — the row set went empty, the selection was
  * narrowed to what is visible and therefore to nothing, and the button did
- * nothing at all with no error and no change on screen. A segment that already
- * shows the state is left exactly as it is, so pressing Chase from `All` does
- * not yank the reader onto a narrower tab for no reason.
+ * nothing at all with no error and no change on screen.
  *
- * The move itself is by *identity*, never by predicate search: `LIST_SEGMENTS`
- * leads with the universal `all`, so `find(matchesSegment)` reached `all` first
- * and Chase from `Sent` landed on `All` — the right 17 rows and the right chip
- * under a tab that was not the one the action is about, with `Overdue` still
- * reporting `aria-pressed="false"`.
+ * The first repair kept a segment that already showed the state, and `all`
+ * shows everything, so Chase from `All` left `All` pressed and `Overdue`
+ * reporting `aria-pressed="false"` — one button with two behaviours depending
+ * on the tab it was pressed from. The destination is now unconditional.
+ *
+ * The move is by *identity*, never by predicate search: `LIST_SEGMENTS` leads
+ * with the universal `all`, so `find(matchesSegment)` reached `all` first and
+ * Chase from `Sent` landed on `All` — the right 17 rows and the right chip
+ * under a tab that was not the one the action is about.
  */
-export function segmentShowing(state: RowState, segment: ListSegment): ListSegment {
-  if (matchesSegment(state, segment)) return segment;
+export function segmentShowing(state: RowState): ListSegment {
   return SEGMENT_ABOUT[state];
 }
 

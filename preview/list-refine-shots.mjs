@@ -642,7 +642,10 @@ await page.getByRole('button', { name: 'Clear all' }).click();
 // set went empty, `retainVisible` dropped every selected id, and the button
 // silently did nothing.
 const tab = (name) => page.getByRole('button', { name: new RegExp(`^${name} \\d+$`) });
-for (const segment of ['Paid', 'Drafts', 'Sent']) {
+// `All` is in the list on purpose: it shows overdue rows already, so the first
+// repair left it alone and Chase from `All` kept `All` pressed with `Overdue`
+// still at `aria-pressed="false"` — the same button behaving two ways.
+for (const segment of ['Paid', 'Drafts', 'Sent', 'All']) {
   await tab(segment).click();
   await page.waitForTimeout(200);
   check(`on ${segment} before Chase`, await tab(segment).getAttribute('aria-pressed'), 'true');
@@ -668,23 +671,12 @@ for (const segment of ['Paid', 'Drafts', 'Sent']) {
   console.log(`Chase from ${segment}: ${selectedNow} selected`);
   assert(`Chase from ${segment} really selects them`, selectedNow > 0, String(selectedNow));
   check(`and the bulk bar is up after Chase from ${segment}`, await page.getByRole('region', { name: 'Bulk actions' }).count(), 1);
+  check(`All is not pressed after Chase from ${segment}`, await tab('All').getAttribute('aria-pressed'), 'false');
   if (segment === 'Sent') await shot(page, '09-chase-all-from-sent');
+  if (segment === 'All') await shot(page, '09-chase-all');
   await page.getByRole('button', { name: 'Clear all' }).click();
   await page.getByRole('button', { name: /^Clear$/ }).click();
 }
-// And from All, where the tab already shows overdue rows: the tab must not move.
-await tab('All').click();
-await page.waitForTimeout(200);
-await chase.click();
-await chipBar.waitFor({ timeout: 5000 });
-check('Chase from All leaves the tab alone', await tab('All').getAttribute('aria-pressed'), 'true');
-const checked = await page.locator('input[type="checkbox"]:checked').count();
-console.log(`rows selected by Chase all: ${checked}`);
-assert('Chase all selects the overdue rows', checked > 0, String(checked));
-assert('and a bulk bar appears rather than a sent claim', (await page.getByRole('region', { name: 'Bulk actions' }).count()) === 1);
-await shot(page, '09-chase-all');
-await page.getByRole('button', { name: 'Clear all' }).click();
-await page.getByRole('button', { name: /^Clear$/ }).click();
 
 await shot(page, '10-final');
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

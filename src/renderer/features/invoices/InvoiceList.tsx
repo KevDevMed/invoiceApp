@@ -701,17 +701,20 @@ export function InvoiceList(): React.JSX.Element {
    * button does the part that is real: it puts the reader in front of exactly
    * the invoices to chase, selected and ready for a bulk action.
    *
-   * It moves the tab too. The chip alone was not enough: on `Sent`, `Drafts` or
-   * `Paid` the segment excludes every overdue row, so the list went empty, the
-   * selection was narrowed to the visible rows and therefore to none, and the
-   * button silently did nothing. `segmentShowing` leaves `All` and `Overdue`
-   * alone and only moves a tab that cannot show the rows.
+   * It moves the tab too, to Overdue, from every starting segment. The chip
+   * alone was not enough: on `Sent`, `Drafts` or `Paid` the segment excludes
+   * every overdue row, so the list went empty, the selection was narrowed to
+   * the visible rows and therefore to none, and the button silently did
+   * nothing. Sparing a tab that already shows overdue rows was not enough
+   * either: `All` shows everything, so Chase from `All` kept `All` pressed and
+   * left `Overdue` at `aria-pressed="false"` — one button behaving two ways
+   * depending on where it was pressed from. It lands on Overdue always.
    */
   const chaseOverdue = useCallback(() => {
     const overdueIds = matching
       .filter((invoice) => rowStateOf(invoice, today) === 'overdue')
       .map((invoice) => invoice.id);
-    setSegment((current) => segmentShowing('overdue', current));
+    setSegment(segmentShowing('overdue'));
     setChips((current) => addChip(current, buildChip('status-overdue')));
     setRawSelected(new Set(overdueIds));
     setOpenMenu(null);
