@@ -89,6 +89,7 @@ import {
   hubMetadata,
   installedRowSubtitle,
   installedSummary,
+  isMachineMeasured,
   machineChipSummary,
   machineWord,
   modelDisplayName,
@@ -289,7 +290,10 @@ export function ModelsPage(): React.JSX.Element {
  * reader goes when the summary is not enough.
  */
 function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.Element {
-  const detected = models.system !== null;
+  // Measured, not merely detected. A profile with no memory figure is one the
+  // hero and the browse banner both call unmeasurable, and a green tick next to
+  // "We could not measure this Mac" reads as a contradiction on one screen.
+  const detected = isMachineMeasured(models.system);
 
   /**
    * Everything currently on screen, which is what has to be re-checked.
@@ -340,7 +344,12 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
               ? 'Checking models against this machine'
               : detected
                 ? 'Hardware detected'
-                : 'Hardware detection failed'
+                : models.system !== null
+                  ? // Detection did come back; it is the memory figure that is
+                    // missing, and saying "detection failed" beside a chip
+                    // printing the CPU model would be its own contradiction.
+                    'Memory could not be measured'
+                  : 'Hardware detection failed'
         }
       />
       <Text type="supporting" hasTabularNumbers>
@@ -424,14 +433,10 @@ function RecommendationHero({
     const empty = heroEmptyCopy(
       {
         catalogCount: models.catalog.length,
-        // Detection can succeed and still fail to read the memory figure, and
-        // memory is the only number a verdict is computed from — so a profile
-        // with `totalRamBytes: null` is not a machine we can judge against.
-        // Treating it as detected made the all-grey hero say "nothing has been
-        // checked yet", which points at Re-check as the remedy when re-checking
-        // will produce exactly the same grey. The browse banner and the
-        // diagnostics readout already draw this line; the hero now does too.
-        isMachineDetected: models.system !== null && models.system.totalRamBytes !== null,
+        // Treating an unmeasured machine as detected made the all-grey hero say
+        // "nothing has been checked yet", which points at Re-check as the
+        // remedy when re-checking will produce exactly the same grey.
+        isMachineDetected: isMachineMeasured(models.system),
         tooBig: checks.tooBig,
         checkFailed: checks.checkFailed,
         unchecked: checks.unchecked,
@@ -773,7 +778,7 @@ function BrowseDisclosure({
             </HStack>
           </HStack>
 
-          {models.system && models.system.totalRamBytes === null ? (
+          {models.system !== null && !isMachineMeasured(models.system) ? (
             <Banner
               status="warning"
               title="Memory could not be measured"

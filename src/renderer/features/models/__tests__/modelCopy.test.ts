@@ -18,6 +18,7 @@ import {
   heroSentence,
   installedRowSubtitle,
   installedSummary,
+  isMachineMeasured,
   machineChipSummary,
   machineWord,
   modelDisplayName,
@@ -176,6 +177,38 @@ describe('machineChipSummary', () => {
   });
 });
 
+describe('isMachineMeasured', () => {
+  it('separates measured from merely detected', () => {
+    expect(isMachineMeasured(system())).toBe(true);
+    expect(isMachineMeasured(system({ totalRamBytes: null }))).toBe(false);
+    expect(isMachineMeasured(null)).toBe(false);
+  });
+
+  it('is the one judgement the hero, the banner and the chip all make', () => {
+    // The chip used to go green on a detected profile whatever its memory
+    // figure, while the hero beside it said the Mac could not be measured. Both
+    // read this predicate now, so the contradiction cannot come back.
+    const unmeasured = system({ totalRamBytes: null });
+
+    expect(isMachineMeasured(unmeasured)).toBe(false);
+    expect(
+      heroEmptyCopy(
+        {
+          catalogCount: 4,
+          isMachineDetected: isMachineMeasured(unmeasured),
+          tooBig: 0,
+          checkFailed: 0,
+          unchecked: 4,
+        },
+        unmeasured.platform,
+      ).reason,
+    ).toBe('machine-unknown');
+    // The chip's own summary keeps saying what it does know — the CPU model —
+    // without the memory figure it does not have.
+    expect(machineChipSummary(unmeasured)).toBe('M3 Pro');
+  });
+});
+
 describe('fitSentence', () => {
   it('gives every verdict a sentence with no jargon in it', () => {
     expect(fitSentence('GREEN', 'darwin')).toBe('Runs comfortably');
@@ -297,6 +330,38 @@ describe('supportFacts', () => {
       support({ breakdown: breakdown({ totalVramBytes: 0, usableVramBytes: 0 }) }),
     );
     expect(facts.find((fact) => fact.label === 'VRAM')?.value).toBe('none detected');
+  });
+
+  it('shows no numbers for a check against a machine that was never measured', () => {
+    // GREY with `error: null` on a profile with no memory figure: the check ran
+    // and had nothing to weigh the model against, so every capacity field is a
+    // placeholder zero. Rendering it printed `0.00 GiB usable` as a measurement.
+    const unmeasured = support({
+      breakdown: breakdown({
+        verdict: 'GREY',
+        totalSystemMemoryBytes: 0,
+        usableTotalMemoryBytes: 0,
+        totalVramBytes: 0,
+        usableVramBytes: 0,
+        reserveBytes: 0,
+      }),
+    });
+
+    expect(unmeasured.error).toBeNull();
+    expect(supportFacts(unmeasured)).toEqual([]);
+  });
+
+  it('still renders the facts for a known machine reporting zero system memory', () => {
+    // The regression guard for the unified-memory fix: `totalSystemMemoryBytes:
+    // 0` alongside real usable and VRAM figures is a measured Apple Silicon Mac,
+    // not an unknown one. It keeps its facts, minus the "of X" clause.
+    const unified = support({
+      breakdown: breakdown({ totalSystemMemoryBytes: 0, usableTotalMemoryBytes: 16 * GIB }),
+    });
+    const byLabel = Object.fromEntries(supportFacts(unified).map((f) => [f.label, f.value]));
+
+    expect(byLabel['Usable memory']).toBe('16.00 GiB usable, 2.00 GiB held back');
+    expect(byLabel['Total needed']).toBe('6.00 GiB');
   });
 
   it('has nothing to show when no check has come back', () => {

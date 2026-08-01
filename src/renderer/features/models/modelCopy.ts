@@ -105,6 +105,20 @@ export function approxGigabytes(bytes: number | null): string | null {
   return `about ${Math.max(1, Math.round(bytes / BYTES_PER_GIB))} GB`;
 }
 
+/**
+ * Whether this machine was actually measured, which is not the same as detected.
+ *
+ * Detection can succeed and still fail to read the memory figure, and memory is
+ * the only number a verdict is computed from — so a profile with
+ * `totalRamBytes: null` is a machine nothing can be judged against. The hero,
+ * the browse banner and the machine chip all have to answer this the same way;
+ * three inlined copies of the test let the chip render a green `Hardware
+ * detected` beside a hero saying the Mac could not be measured.
+ */
+export function isMachineMeasured(system: SystemInfoView | null): boolean {
+  return system !== null && system.totalRamBytes !== null;
+}
+
 /** `Mac` reads better than `machine` when we know it is one. */
 export function machineWord(platform: string | null | undefined): string {
   return platform === 'darwin' ? 'Mac' : 'machine';
@@ -238,6 +252,24 @@ export function supportFacts(support: VariantSupportView | null): SupportFact[] 
   // prevent. `supportFailureSentence` says what actually happened instead.
   if (support.error !== null) return [];
   const { breakdown } = support;
+  // The same placeholder zeros arrive without an error when the machine behind
+  // the check was never measured: a GREY verdict on a profile with no memory
+  // figure carries a breakdown of nothing at all. Zero capacity is not a
+  // measurement, so the disclosure refuses rather than printing `0.00 GiB
+  // usable` as a fact.
+  //
+  // This is not the unified-memory case. There, `totalSystemMemoryBytes` is 0
+  // by design while `usableTotalMemoryBytes` and the VRAM pool carry the real
+  // figures — a known machine reported oddly, whose facts still render with the
+  // "of X" clause dropped. Only a machine with no measured capacity anywhere is
+  // unknown.
+  if (
+    breakdown.totalSystemMemoryBytes <= 0 &&
+    breakdown.usableTotalMemoryBytes <= 0 &&
+    breakdown.totalVramBytes <= 0
+  ) {
+    return [];
+  }
   const architecture = support.architecture ?? breakdown.kvCache?.architecture ?? null;
   const maxContext = support.maxContextLength ?? breakdown.kvCache?.maxContextLength ?? null;
 
