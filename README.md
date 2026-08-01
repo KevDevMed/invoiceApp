@@ -4,9 +4,11 @@ Offline-first invoicing desktop app. Electron main process + React 19 renderer
 styled with the [Astryx](https://www.npmjs.com/package/@astryxdesign/core) design
 system, SQLite persistence via better-sqlite3, and a zod-validated IPC contract.
 
-This repository currently contains **the foundation only**: the app shell, the
-database schema, and the frozen IPC contract. Invoicing logic, PDF export and
-the local LLM assistant are built on top of it.
+On top of that foundation — the app shell, the database schema and the frozen
+IPC contract — the invoice, client and report features, PDF export, the local
+LLM assistant and the in-app updater are implemented. `src/main/pdf` and every
+`llm:*` channel are desktop-only; the browser preview refuses them with a typed
+`DESKTOP_ONLY` error rather than faking data.
 
 ## Requirements
 
@@ -53,9 +55,13 @@ src/
     ipc/registry.ts  the only place ipcMain.handle is called
   preload/      contextBridge surface (CommonJS, sandboxed)
   db/           connection, migration runner, migrations/*.sql
+  domain/       repositories and queries, process-agnostic (take an explicit Db)
   shared/       IPC contract, domain types, money arithmetic
   renderer/     React app (hash router, Astryx components)
 ```
+
+`src/domain` is what the Electron app and the browser preview have in common —
+neither owns it, and nothing in it may import from `src/main`.
 
 ## Architecture rules
 
@@ -105,8 +111,11 @@ DDL. New migrations are new numbered files; shipped ones are never edited.
 
 ## Adding a page
 
-Replace the route element in `src/renderer/routes.tsx`. `AppShell.tsx` and its
-`NAV_ITEMS` stay as they are — every screen shares one shell.
+`src/renderer/routes.tsx` is frozen. Every route already points at a feature
+barrel, so build the page by replacing the body of
+`src/renderer/features/<feature>/index.tsx`, keeping its exported component name;
+nested routes go inside that barrel. `AppShell.tsx` and its `NAV_ITEMS` stay as
+they are — every screen shares one shell.
 
 ## Astryx notes
 
@@ -127,8 +136,10 @@ directly or call `registerIcons()`.
 ## macOS builds and releases
 
 electron-builder cannot produce a mac target from Linux, so release builds run
-on GitHub Actions: `.github/workflows/build-mac.yml` on a `macos-latest`
-runner. It is triggered by pushing a `v*` tag or manually via
+on GitHub Actions: `.github/workflows/build-mac.yml`, one native runner per
+architecture (`macos-15` for arm64, `macos-15-intel` for x64 — each arch must
+build natively because `node-llama-cpp`'s backends are `cpu`-gated optional
+dependencies). It is started by `release.yml`, or manually via
 `workflow_dispatch` with the `release` input, and publishes two stable-named
 assets to the GitHub Release:
 
@@ -139,18 +150,25 @@ https://github.com/KevDevMed/invoiceApp/releases/latest/download/InvoiceApp-mac-
 
 ### Cutting a release
 
-One click, no local git: Actions → **Cut release** → Run workflow, and type the
-new version — `patch`, `minor`, `major`, or an explicit `0.1.6` (no leading
-`v`). The workflow bumps `package.json` on main, tags `v0.1.6`, and starts
-`build-mac.yml`, which builds, signs and publishes the release. A bad version —
-malformed, not above the current one, or an already-used tag — is refused
-before anything is pushed. The last step prints the URL of the build run;
-expect the release to appear there (notarisation can take a couple of hours).
+**Merging to `main` cuts the release by itself.** `.github/workflows/release.yml`
+runs on push to main, derives the bump from the conventional-commit subjects
+landed since the last `v*` tag (`scripts/resolve-release-bump.ts`), bumps
+`package.json`, tags, and starts `build-mac.yml`. A range of only
+`docs`/`chore`/`ci`/`test`/`style`/`build` commits resolves to `none` and the run
+ends green with nothing pushed; `[skip release]` in a commit's subject, or alone
+on one of its body lines, excuses that commit the same way. The rules are
+unit-tested in `scripts/__tests__/` — see `CLAUDE.md` for the full table.
 
-The published build is ad-hoc signed but not notarised (no Apple Developer ID),
-so Gatekeeper interrupts the first launch — the user approves it via System
-Settings > Privacy & Security > Open Anyway. The preview's `/download` page
-walks users through it.
+Actions → **Cut release** → Run workflow is still there for an explicit version,
+a pre-release, or 1.0.0. A bad version — malformed, not above the current one,
+or an already-used tag — is refused before anything is pushed.
+
+The published build is signed with a Developer ID certificate, hardened, and
+notarised and stapled by Apple, so it launches without a Gatekeeper prompt.
+Notarisation is the slow part: Apple's queue has taken anywhere from 30 minutes
+to over two hours on identical inputs. Builds from a fork, which has no
+`MAC_CERT_P12` secret, fall back to ad-hoc signing automatically — those do
+prompt, and the preview's `/download` page walks users through approving them.
 
 ## Browser preview
 
