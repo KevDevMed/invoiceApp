@@ -82,8 +82,21 @@ export type ColumnFilterPredicate =
  * ellipsis options (`Contains…`, `Between…`, `Custom range…`, `By currency…`)
  * imply an input the mock never draws; this is that input, named. `none` means
  * the option commits on click.
+ *
+ * `text-list` is one field like `text`, but the value is a comma-separated set
+ * rather than one string. It is its own kind because the two differ on both
+ * ends: it is rejected when no comma token survives trimming (`", "` would
+ * otherwise commit a chip that matches every invoice), and its chip identity is
+ * the *normalised token set*, so `Halcyon, Northwind` and `northwind,Halcyon`
+ * are one chip rather than two.
  */
-export type ColumnFilterInput = 'none' | 'text' | 'money-range' | 'date-range' | 'currency';
+export type ColumnFilterInput =
+  | 'none'
+  | 'text'
+  | 'text-list'
+  | 'money-range'
+  | 'date-range'
+  | 'currency';
 
 export interface ListFilterOption {
   /** The design's own words, ellipsis included — the menu prints this verbatim. */
@@ -148,7 +161,7 @@ export const COLUMNS: readonly ListColumnDef[] = [
     sortable: true,
     filterOptions: [
       { label: 'Contains…', predicate: 'client-contains', input: 'text' },
-      { label: 'Is any of…', predicate: 'client-any-of', input: 'text' },
+      { label: 'Is any of…', predicate: 'client-any-of', input: 'text-list' },
       { label: 'Has open balance', predicate: 'client-has-open-balance', input: 'none' },
     ],
   },

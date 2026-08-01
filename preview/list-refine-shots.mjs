@@ -46,8 +46,12 @@ page.on('pageerror', (error) => {
 
 await page.goto(`${ORIGIN}/app#/invoices`, { waitUntil: 'networkidle' });
 await page.getByRole('heading', { name: 'Invoices', level: 1 }).waitFor({ timeout: 20_000 });
-await page.getByRole('table', { name: 'Invoice columns' }).waitFor({ timeout: 20_000 });
+await page.getByRole('group', { name: 'Invoice columns' }).waitFor({ timeout: 20_000 });
 await shot(page, '01-list');
+
+// The header strip no longer claims to be a table it is not the body of.
+check('no synthetic table anywhere in the list', await page.getByRole('table').count(), 0);
+check('and no orphaned aria-sort', await page.locator('[aria-sort]').count(), 0);
 
 // --- subtitle -------------------------------------------------------------
 const subtitle = (await page.locator('h1:has-text("Invoices") + *').first().innerText()).trim();
@@ -56,9 +60,13 @@ assert('subtitle leads with the chasing count', /^\d+ invoices? needs? chasing t
 assert('subtitle never claims USD equivalence', !subtitle.includes('equiv'), subtitle);
 
 // --- tiles ----------------------------------------------------------------
-const tileTemplate = await page
-  .getByRole('button', { name: 'Filter by Outstanding' })
-  .evaluate((el) => getComputedStyle(el.parentElement).gridTemplateColumns);
+/** The card a tile's filter button sits inside. The button is not the card. */
+const tileCard = (label) =>
+  page.getByRole('button', { name: `Filter by ${label}` }).locator('xpath=..');
+
+const tileTemplate = await tileCard('Outstanding').evaluate(
+  (el) => getComputedStyle(el.parentElement).gridTemplateColumns,
+);
 console.log(`tile grid: ${tileTemplate}`);
 assert('tile grid has four unequal tracks', tileTemplate.split(' ').length === 4, tileTemplate);
 const [t1, t2, t3, t4] = tileTemplate.split(' ').map(parseFloat);
@@ -69,7 +77,31 @@ const chase = page.getByRole('button', { name: /^Chase all \d+$/ });
 assert('Overdue tile carries Chase all N', (await chase.count()) === 1);
 console.log(`chase button: ${await chase.innerText()}`);
 
-const overdueTile = page.getByRole('button', { name: 'Filter by Overdue' });
+// No interactive control is nested inside another one. `Chase all N` and the
+// currency pager are siblings of the tile's filter button, not descendants of
+// it, and no tile is a `role="button"` container any more.
+const nestedControls = await page.evaluate(() => {
+  const isControl = (el) =>
+    el.tagName === 'BUTTON' ||
+    el.tagName === 'A' ||
+    el.tagName === 'INPUT' ||
+    ['button', 'link', 'checkbox', 'menuitem', 'menuitemradio'].includes(
+      el.getAttribute('role') ?? '',
+    );
+  return [...document.querySelectorAll('*')]
+    .filter(isControl)
+    .filter((el) => el.parentElement?.closest('button, [role="button"]') != null)
+    .map((el) => `${el.tagName}[${el.getAttribute('aria-label') ?? el.textContent?.trim() ?? ''}]`)
+    .slice(0, 8);
+});
+check('no interactive control nested inside another', nestedControls, []);
+check(
+  'Chase all N is a sibling of the filter button, not a child',
+  await chase.evaluate((el) => el.parentElement.closest('button') === null),
+  true,
+);
+
+const overdueTile = tileCard('Overdue');
 const overdueLines = (await overdueTile.innerText()).split('\n').map((line) => line.trim());
 console.log(`overdue tile:\n${overdueLines.map((line) => `    ${line}`).join('\n')}`);
 const overdueSubline = overdueLines.find((line) => /invoices? · /.test(line)) ?? '';
@@ -78,7 +110,7 @@ assert('overdue subline carries three facts', overdueSubline.split(' · ').lengt
 assert('overdue subline claims no reminders', !/reminder/i.test(overdueSubline), overdueSubline);
 
 for (const label of ['Due in 7 days', 'Drafts']) {
-  const text = (await page.getByRole('button', { name: `Filter by ${label}` }).innerText()).trim();
+  const text = (await tileCard(label).innerText()).trim();
   console.log(`${label} tile:\n${text.split('\n').map((line) => `    ${line}`).join('\n')}`);
 }
 
@@ -116,7 +148,19 @@ check('and the first window is back', (await codes()).join(' '), page1.join(' ')
 
 // --- every column menu ----------------------------------------------------
 const HEADERS = ['CLIENT', 'INVOICE', 'STATUS & DUE', 'ISSUED', 'TOTAL'];
-const header = (label) => page.getByRole('button', { name: `${label}, sort and filter` });
+// The sort state rides in each header button's accessible name now that the
+// synthetic table (and its `aria-sort`) is gone, so the locator matches either
+// half of it.
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const header = (label) =>
+  page.getByRole('button', { name: new RegExp(`^${escapeRe(label)}, (sorted .+|not sorted)$`) });
+/** A header's announced sort state: `sorted Largest first` / `not sorted`. */
+const headerState = async (label) => {
+  const name = await header(label).evaluate(
+    (el) => el.getAttribute('aria-label') ?? el.textContent?.trim() ?? '',
+  );
+  return name.startsWith(`${label}, `) ? name.slice(label.length + 2) : name;
+};
 
 for (const label of HEADERS) {
   await header(label).click();
@@ -160,13 +204,17 @@ const pill = async () => (await pillBox.innerText()).replace(/\s+/g, ' ').trim()
 check('exactly one sort read-out on the page', await pillBox.count(), 1);
 console.log(`pill at rest: ${await pill()}`);
 check('pill starts on the default order', await pill(), 'Sorted: Due date');
-check('STATUS & DUE reports aria-sort', await page.getByRole('columnheader').filter({ hasText: 'STATUS & DUE' }).getAttribute('aria-sort'), 'ascending');
+check('STATUS & DUE announces its order', await headerState('STATUS & DUE'), 'sorted Most overdue first');
+check('an inactive header says so', await headerState('TOTAL'), 'not sorted');
 
 await header('TOTAL').click();
 await page.getByRole('menuitemradio', { name: 'Largest first' }).click();
 check('pill follows the header sort', await pill(), 'Sorted: Total');
-check('TOTAL reports aria-sort descending', await page.getByRole('columnheader').filter({ hasText: 'TOTAL' }).getAttribute('aria-sort'), 'descending');
-check('only one column is sorted', await page.locator('[role="columnheader"][aria-sort="descending"], [role="columnheader"][aria-sort="ascending"]').count(), 1);
+check('TOTAL announces the order it set', await headerState('TOTAL'), 'sorted Largest first');
+check('and STATUS & DUE stops claiming one', await headerState('STATUS & DUE'), 'not sorted');
+const sortedHeaders = [];
+for (const label of HEADERS) if ((await headerState(label)).startsWith('sorted ')) sortedHeaders.push(label);
+check('exactly one header is announced as sorted', sortedHeaders, ['TOTAL']);
 const footer = (await page.getByText(/^Showing .* sorted by /).first().innerText()).trim();
 console.log(`footer: ${footer}`);
 check('the caption names the real order', footer.includes('sorted by total, largest first'), true);
@@ -181,6 +229,50 @@ await shot(page, '04-sorted-total-desc');
 await header('STATUS & DUE').click();
 await page.getByRole('menuitemradio', { name: 'Most overdue first' }).click();
 check('back to the due-date order', await pill(), 'Sorted: Due date');
+
+// --- "Most overdue first" really leads with the most overdue invoice --------
+// The Tier 2 defect: a draft sorted above a 319-day-late invoice because drafts
+// counted as unsettled and then ordered by their raw placeholder due date. The
+// assertion is the *identity* of the top row, not that the list sorted at all.
+const statusCells = async (n) =>
+  page.locator('[role="link"]').evaluateAll(
+    (rows, count) =>
+      rows
+        .slice(0, count)
+        .map((row) => ((row.getAttribute('aria-label') ?? '').split(', ')[2] ?? '')),
+    n,
+  );
+const topFive = await statusCells(5);
+console.log(`Most overdue first top five status cells:\n    ${topFive.join(' | ')}`);
+const lateness = (cell) => {
+  const m = /^Overdue (\d+) days?$/.exec(cell);
+  return m === null ? null : Number(m[1]);
+};
+assert('the top row is an overdue invoice, not a draft', lateness(topFive[0]) !== null, topFive[0]);
+assert('no draft appears above an overdue row', !topFive.slice(0, topFive.filter((c) => lateness(c) !== null).length).some((c) => /Draft/.test(c)), topFive.join(' | '));
+const allStatuses = await statusCells(200);
+const overdueDays = allStatuses.map(lateness).filter((days) => days !== null);
+const maxLate = Math.max(...overdueDays);
+console.log(`most overdue in the set: ${maxLate} days; top row: ${topFive[0]}`);
+check('the first row IS the most overdue invoice in the list', lateness(topFive[0]), maxLate);
+assert(
+  'lateness reads down the page, never up',
+  overdueDays.every((days, i) => i === 0 || overdueDays[i - 1] >= days),
+  overdueDays.slice(0, 8).join(' '),
+);
+const firstDraft = allStatuses.findIndex((cell) => /Draft/.test(cell));
+if (firstDraft !== -1) {
+  assert(
+    'every draft sits below every overdue row',
+    allStatuses.slice(firstDraft).every((cell) => lateness(cell) === null),
+    `first draft at ${firstDraft}`,
+  );
+}
+// The caption has to describe the order that just happened.
+const overdueFooter = (await page.getByText(/^Showing .* sorted by /).first().innerText()).trim();
+console.log(`footer: ${overdueFooter}`);
+assert('the caption names the order it actually produced', overdueFooter.includes('most overdue first') && overdueFooter.includes('drafts and settled last'), overdueFooter);
+await shot(page, '11-most-overdue-first');
 
 // --- keyboard operation of a menu ----------------------------------------
 await header('ISSUED').focus();
@@ -198,7 +290,43 @@ await shot(page, '05-menu-keyboard');
 await page.keyboard.press('ArrowDown');
 await page.keyboard.press('Enter');
 check('a keyboard sort lands', await pill(), 'Sorted: Issued');
-check('and the arrow says ascending', await page.getByRole('columnheader').filter({ hasText: 'ISSUED' }).getAttribute('aria-sort'), 'ascending');
+check('and the name says which order', await headerState('ISSUED'), 'sorted Oldest first');
+
+// --- an open menu owns the keyboard --------------------------------------
+// `J`/`K` used to move row focus behind an open menu and `/` used to jump to
+// the search box while the menu stayed on screen.
+await header('CLIENT').click();
+await page.getByRole('menu', { name: 'CLIENT sort and filter' }).waitFor({ timeout: 5000 });
+const insideMenu = () => page.evaluate(() => document.activeElement?.closest('[role="menu"]') !== null);
+check('focus starts inside the menu', await insideMenu(), true);
+for (const key of ['j', 'J', 'k', 'K']) {
+  await page.keyboard.press(key);
+  check(`${key} does not move row focus out of the menu`, await insideMenu(), true);
+  check(`and the menu is still open after ${key}`, await page.getByRole('menu').count(), 1);
+}
+await page.keyboard.press('/');
+check('/ does not jump to the search box', await insideMenu(), true);
+check('and the menu survives /', await page.getByRole('menu').count(), 1);
+check(
+  'the search box did not take focus',
+  await page.evaluate(() => document.activeElement?.getAttribute('placeholder') ?? ''),
+  '',
+);
+await shot(page, '12-menu-owns-keyboard');
+await page.keyboard.press('Escape');
+await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+// And the shortcuts come straight back once it is closed.
+await page.locator('[role="link"]').first().focus();
+await page.keyboard.press('j');
+check('J works again with no menu open', await page.evaluate(() => document.activeElement?.getAttribute('role') ?? ''), 'link');
+await page.keyboard.press('/');
+check(
+  '/ focuses the search box again',
+  await page.evaluate(() => document.activeElement?.getAttribute('placeholder') ?? ''),
+  'Client, number, amount',
+);
+await page.keyboard.press('Escape');
+await page.getByRole('heading', { name: 'Invoices', level: 1 }).click();
 
 // --- a plain filter -> one chip ------------------------------------------
 const chipBar = page.getByRole('group', { name: 'Active column filters' });
@@ -260,22 +388,127 @@ check('two chips before Clear all', await chipBar.getByRole('button', { name: /^
 await page.getByRole('button', { name: 'Clear all' }).click();
 check('Clear all empties the bar', await chipBar.count(), 0);
 
+// --- an impossible date is refused ---------------------------------------
+// `2026-02-31` used to pass a shape-only check, commit, and then be compared
+// lexically against the issue date.
+await header('ISSUED').click();
+await page.getByRole('menuitem', { name: 'Custom range…' }).click();
+const dateFrom = page.getByRole('textbox', { name: 'From' });
+await dateFrom.waitFor({ timeout: 5000 });
+await dateFrom.fill('2026-02-31');
+await page.getByRole('textbox', { name: 'To' }).fill('2026-03-31');
+check('Apply stays refused on a day that does not exist', await page.getByRole('button', { name: 'Apply' }).isDisabled(), true);
+const dateError = (await page.getByRole('menu').innerText()).includes('real dates');
+assert('and the field says why', dateError, (await page.getByRole('menu').innerText()).replace(/\s+/g, ' '));
+await shot(page, '13-impossible-date-refused');
+await dateFrom.fill('2026-02-28');
+check('Apply goes live on a real date', await page.getByRole('button', { name: 'Apply' }).isDisabled(), false);
+await page.getByRole('button', { name: 'Cancel' }).click();
+await page.keyboard.press('Escape');
+await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+
+// --- "Is any of…" rejects an empty token list and dedupes on the set -------
+await header('CLIENT').click();
+await page.getByRole('menuitem', { name: 'Is any of…' }).click();
+const anyOf = page.getByRole('textbox', { name: 'Values, comma separated' });
+await anyOf.waitFor({ timeout: 5000 });
+await anyOf.fill(', ');
+check('", " is refused rather than matching everything', await page.getByRole('button', { name: 'Apply' }).isDisabled(), true);
+await anyOf.fill('Halcyon, Northwind');
+check('a real token list is accepted', await page.getByRole('button', { name: 'Apply' }).isDisabled(), false);
+await page.getByRole('button', { name: 'Apply' }).click();
+await chipBar.waitFor({ timeout: 5000 });
+check('one chip after the first token list', await chipBar.getByRole('button', { name: /^Remove/ }).count(), 1);
+console.log(`any-of chip: ${(await chipBar.innerText()).replace(/\s+/g, ' ').trim()}`);
+// The same set, typed in a different order and case: one predicate, one chip.
+await header('CLIENT').click();
+await page.getByRole('menuitem', { name: 'Is any of…' }).click();
+await page.getByRole('textbox', { name: 'Values, comma separated' }).fill('northwind,Halcyon');
+await page.getByRole('button', { name: 'Apply' }).click();
+await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+check('an equivalent token list does not add a second chip', await chipBar.getByRole('button', { name: /^Remove/ }).count(), 1);
+// A genuinely different set is a second chip.
+await header('CLIENT').click();
+await page.getByRole('menuitem', { name: 'Is any of…' }).click();
+await page.getByRole('textbox', { name: 'Values, comma separated' }).fill('Halcyon');
+await page.getByRole('button', { name: 'Apply' }).click();
+await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+check('a different token set is a second chip', await chipBar.getByRole('button', { name: /^Remove/ }).count(), 2);
+await shot(page, '14-any-of-dedupe');
+await page.getByRole('button', { name: 'Clear all' }).click();
+check('cleared', await chipBar.count(), 0);
+
+// --- a menu does not outlive its header ----------------------------------
+const searchBox = page.getByRole('textbox', { name: 'Search invoices' });
+await header('TOTAL').click();
+check('menu open before the rows vanish', await page.getByRole('menu').count(), 1);
+await searchBox.fill('zzzz-no-such-invoice-zzzz');
+await page.getByRole('heading', { name: 'Nothing here' }).waitFor({ timeout: 10_000 });
+check('the header strip is gone with the rows', await page.getByRole('group', { name: 'Invoice columns' }).count(), 0);
+check('and the menu went with it', await page.getByRole('menu').count(), 0);
+await searchBox.fill('');
+await page.getByRole('group', { name: 'Invoice columns' }).waitFor({ timeout: 10_000 });
+await page.waitForTimeout(300);
+check('restoring the rows does not re-open it', await page.getByRole('menu').count(), 0);
+check('no header claims to be expanded', await page.locator('[aria-expanded="true"][aria-haspopup="menu"]').count(), 0);
+
+// The same rule at a narrower tier: ISSUED drops out below 880px.
+await header('ISSUED').click();
+check('ISSUED menu open at 1440px', await page.getByRole('menu').count(), 1);
+await page.setViewportSize({ width: 800, height: 1000 });
+await page.waitForTimeout(300);
+check('the responsive tier dropped ISSUED', await header('ISSUED').count(), 0);
+check('so its menu closed too', await page.getByRole('menu').count(), 0);
+await page.setViewportSize({ width: 1440, height: 1000 });
+await page.waitForTimeout(300);
+check('ISSUED is back', await header('ISSUED').count(), 1);
+check('and its menu did not come back with it', await page.getByRole('menu').count(), 0);
+await shot(page, '15-menu-not-resurrected');
+
 // --- tiles as filter shortcuts -------------------------------------------
 await page.getByRole('button', { name: 'Filter by Drafts' }).click();
 await chipBar.waitFor({ timeout: 5000 });
 check('a tile click produces a menu-reachable chip', (await chipBar.innerText()).replace(/\s+/g, ' ').trim(), 'FILTERS STATUS: Drafts Clear all');
 await page.getByRole('button', { name: 'Clear all' }).click();
 
-// Chase all N: applies the overdue filter and selects those rows.
+// Chase all N: applies the overdue filter and selects those rows — from any
+// segment. It used to keep the current tab, so on Sent, Drafts or Paid the row
+// set went empty, `retainVisible` dropped every selected id, and the button
+// silently did nothing.
+const tab = (name) => page.getByRole('button', { name: new RegExp(`^${name} \\d+$`) });
+for (const segment of ['Paid', 'Drafts', 'Sent']) {
+  await tab(segment).click();
+  await page.waitForTimeout(200);
+  check(`on ${segment} before Chase`, await tab(segment).getAttribute('aria-pressed'), 'true');
+  await chase.click();
+  await chipBar.waitFor({ timeout: 5000 });
+  check(`Chase from ${segment} applies the overdue chip`, (await chipBar.innerText()).includes('STATUS: Overdue only'), true);
+  const rowsNow = await page.locator('[role="link"]').count();
+  const labelsNow = await page.locator('[role="link"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('aria-label') ?? ''));
+  console.log(`Chase from ${segment}: ${rowsNow} rows visible`);
+  assert(`Chase from ${segment} leaves rows on screen`, rowsNow > 0, String(rowsNow));
+  assert(`and every one of them is overdue`, labelsNow.every((label) => /Overdue|Marked overdue/.test(label)), labelsNow.slice(0, 2).join(' | '));
+  const selectedNow = await page.locator('input[type="checkbox"]:checked').count();
+  console.log(`Chase from ${segment}: ${selectedNow} selected`);
+  assert(`Chase from ${segment} really selects them`, selectedNow > 0, String(selectedNow));
+  check(`and the bulk bar is up after Chase from ${segment}`, await page.getByRole('region', { name: 'Bulk actions' }).count(), 1);
+  if (segment === 'Sent') await shot(page, '09-chase-all-from-sent');
+  await page.getByRole('button', { name: 'Clear all' }).click();
+  await page.getByRole('button', { name: /^Clear$/ }).click();
+}
+// And from All, where the tab already shows overdue rows: the tab must not move.
+await tab('All').click();
+await page.waitForTimeout(200);
 await chase.click();
 await chipBar.waitFor({ timeout: 5000 });
-check('Chase all applies the overdue chip', (await chipBar.innerText()).includes('STATUS: Overdue only'), true);
+check('Chase from All leaves the tab alone', await tab('All').getAttribute('aria-pressed'), 'true');
 const checked = await page.locator('input[type="checkbox"]:checked').count();
 console.log(`rows selected by Chase all: ${checked}`);
 assert('Chase all selects the overdue rows', checked > 0, String(checked));
 assert('and a bulk bar appears rather than a sent claim', (await page.getByRole('region', { name: 'Bulk actions' }).count()) === 1);
 await shot(page, '09-chase-all');
 await page.getByRole('button', { name: 'Clear all' }).click();
+await page.getByRole('button', { name: /^Clear$/ }).click();
 
 await shot(page, '10-final');
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

@@ -16,7 +16,12 @@
  *
  * Segments are ordered by count descending, because the opacity ramp
  * (`max(0.5, 1 - i*0.07)`) fades down the list and only reads as a ranking if
- * the thing it fades is the thing the widths show.
+ * the thing it fades is the thing the widths show. Ties break on the currency
+ * code alphabetically — the only remaining currency-neutral key. Breaking them
+ * on `cents` would rank ¥7,120,000 above £120,000 by comparing raw minor units
+ * across currencies, which is the exact comparison the two rules above exist to
+ * refuse; it would leak into the segment order, the opacity ramp *and* the
+ * pager order while every visible number stayed honest.
  *
  * Pure module — no React. The vitest project is `environment: 'node'`.
  */
@@ -87,7 +92,7 @@ export function buildCurrencyBreakdown(invoices: readonly Invoice[]): CurrencyBr
   const total = invoices.length;
   const segments = [...byCurrency]
     .map(([currency, entry]) => ({ currency, cents: entry.cents, count: entry.count }))
-    .sort((a, b) => b.count - a.count || b.cents - a.cents || a.currency.localeCompare(b.currency))
+    .sort((a, b) => b.count - a.count || a.currency.localeCompare(b.currency))
     .map((entry, index) => ({
       currency: entry.currency,
       cents: entry.cents,

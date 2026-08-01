@@ -444,17 +444,19 @@ describe('sortRows — STATUS & DUE sinks settled invoices', () => {
     expect(ids.indexOf('void-2024')).toBeGreaterThan(ids.indexOf('later'));
   });
 
-  it('keeps drafts in the unsettled block — unsent work is still in play', () => {
+  it('puts drafts below every open invoice and above every settled one', () => {
+    // A draft was never sent, so nothing about it is late and its due date is a
+    // placeholder. It is still unsent work, so it outranks collected money.
     const ids = order(by('status', 'asc'));
+    expect(ids.indexOf('draft')).toBeGreaterThan(ids.indexOf('later'));
     expect(ids.indexOf('draft')).toBeLessThan(ids.indexOf('paid-2024'));
   });
 
-  it('still runs due date ascending inside the unsettled block', () => {
-    expect(order(by('status', 'asc')).slice(0, 5)).toEqual([
+  it('still runs due date ascending inside the open block', () => {
+    expect(order(by('status', 'asc')).slice(0, 4)).toEqual([
       'overdue',
       'overdue-2',
       'due-soon',
-      'draft',
       'later',
     ]);
   });
@@ -467,11 +469,12 @@ describe('sortRows — STATUS & DUE sinks settled invoices', () => {
     ]);
   });
 
-  it('sinks settled rows on the column’s other direction too', () => {
-    // "Furthest due first" is still a queue of work; a settled invoice has no
-    // place in one, whichever end of it you read from.
+  it('blocks drafts and settled rows on the column’s other direction too', () => {
+    // "Furthest due first" is still a queue of work; neither an unsent draft
+    // nor a settled invoice has a place in one, whichever end you read from.
     const ids = order(by('status', 'desc'));
-    expect(ids.slice(0, 5)).toEqual(['later', 'draft', 'due-soon', 'overdue-2', 'overdue']);
+    expect(ids.slice(0, 4)).toEqual(['later', 'due-soon', 'overdue-2', 'overdue']);
+    expect(ids[4]).toBe('draft');
     expect(ids.slice(5)).toEqual(['paid-2025', 'void-2024', 'paid-2024']);
   });
 
@@ -503,28 +506,116 @@ describe('sortRows — STATUS & DUE sinks settled invoices', () => {
   });
 });
 
+describe('sortRows — "Most overdue first" really puts the most overdue first', () => {
+  /**
+   * The Tier 2 defect, reproduced from the shape it was observed in: a draft
+   * carrying an old placeholder due date, sitting between real overdue rows.
+   * The browser read
+   *
+   *   Draft · not sent | Overdue 319 days | Overdue 298 days | Draft · not sent
+   *
+   * because a draft counted as unsettled and then ordered by that raw due date.
+   * The assertion that survives this is the *identity of the top row*, not a
+   * pairwise comparator property — the comparator was internally consistent and
+   * still wrong.
+   */
+  const seedShaped = buildListRows({
+    invoices: [
+      // INV-0004: a draft whose placeholder due date predates everything.
+      makeInvoice({ id: 'draft-early', number: 'INV-0004', status: 'draft', dueDate: '2025-08-01' }),
+      // INV-0003: 319 days late as of TODAY.
+      makeInvoice({ id: 'late-319', number: 'INV-0003', status: 'sent', dueDate: '2025-09-13' }),
+      makeInvoice({ id: 'late-298', number: 'INV-0002', status: 'sent', dueDate: '2025-10-04' }),
+      makeInvoice({ id: 'draft-mid', number: 'INV-0005', status: 'draft', dueDate: '2025-11-01' }),
+      makeInvoice({ id: 'late-263', number: 'INV-0006', status: 'sent', dueDate: '2025-11-08' }),
+    ],
+    clientNames: NAMES,
+    today: TODAY,
+  });
+
+  const asc = (): ReturnType<typeof sortRows> => sortRows(seedShaped, by('status', 'asc'));
+
+  it('leads with the most overdue invoice, not with a draft', () => {
+    const top = asc()[0];
+    expect(top?.id).toBe('late-319');
+    expect(top?.statusLabel).toBe('Overdue 319 days');
+  });
+
+  it('reads down in descending lateness with no draft interleaved', () => {
+    expect(asc().map((row) => row.statusLabel)).toEqual([
+      'Overdue 319 days',
+      'Overdue 298 days',
+      'Overdue 263 days',
+      'Draft · not sent',
+      'Draft · not sent',
+    ]);
+  });
+
+  it('never lets a draft outrank an overdue row at any due date', () => {
+    // A draft dated before the dawn of time is still not late.
+    const rows = buildListRows({
+      invoices: [
+        makeInvoice({ id: 'ancient-draft', number: 'INV-0001', status: 'draft', dueDate: '2000-01-01' }),
+        makeInvoice({ id: 'barely-late', number: 'INV-0002', status: 'sent', dueDate: '2026-07-28' }),
+      ],
+      clientNames: NAMES,
+      today: TODAY,
+    });
+    expect(sortRows(rows, by('status', 'asc'))[0]?.id).toBe('barely-late');
+  });
+
+  it('falls back to the soonest-due open row when nothing is overdue', () => {
+    // The label still has to name the top row honestly: with no overdue rows,
+    // "most overdue" is the nearest thing to overdue there is.
+    const rows = buildListRows({
+      invoices: [
+        makeInvoice({ id: 'draft', number: 'INV-0001', status: 'draft', dueDate: '2026-07-30' }),
+        makeInvoice({ id: 'later', number: 'INV-0002', status: 'sent', dueDate: '2026-12-01' }),
+        makeInvoice({ id: 'soon', number: 'INV-0003', status: 'sent', dueDate: '2026-08-02' }),
+      ],
+      clientNames: NAMES,
+      today: TODAY,
+    });
+    expect(sortRows(rows, by('status', 'asc')).map((row) => row.id)).toEqual([
+      'soon',
+      'later',
+      'draft',
+    ]);
+  });
+
+  it('leads "Furthest due first" with the furthest-out open row, not a draft', () => {
+    const top = sortRows(seedShaped, by('status', 'desc'))[0];
+    expect(top?.id).toBe('late-263');
+    expect(top?.state).not.toBe('draft');
+  });
+});
+
 describe('footerSummary', () => {
   it('reads as the design has it', () => {
     expect(footerSummary(66, 1, 10, DEFAULT_SORT)).toBe(
-      'Showing 1-10 of 66 · sorted by due date · open first',
+      'Showing 1-10 of 66 · sorted by due date, most overdue first · drafts and settled last',
     );
   });
 
   it('clamps a page past the end rather than printing an impossible range', () => {
     expect(footerSummary(66, 99, 10, DEFAULT_SORT)).toBe(
-      'Showing 61-66 of 66 · sorted by due date · open first',
+      'Showing 61-66 of 66 · sorted by due date, most overdue first · drafts and settled last',
     );
   });
 
   it('says so when nothing matches', () => {
     expect(footerSummary(0, 1, 25, DEFAULT_SORT)).toBe(
-      'Showing 0 of 0 · sorted by due date · open first',
+      'Showing 0 of 0 · sorted by due date, most overdue first · drafts and settled last',
     );
   });
 
   it('names each order in words', () => {
-    expect(sortSentence(by('status', 'asc'))).toBe('due date · open first');
-    expect(sortSentence(by('status', 'desc'))).toBe('due date, furthest first · open first');
+    expect(sortSentence(by('status', 'asc'))).toBe(
+      'due date, most overdue first · drafts and settled last',
+    );
+    expect(sortSentence(by('status', 'desc'))).toBe(
+      'due date, furthest first · drafts and settled last',
+    );
     expect(sortSentence(by('client', 'asc'))).toBe('client A–Z');
     expect(sortSentence(by('client', 'desc'))).toBe('client Z–A');
     expect(sortSentence(by('invoice', 'asc'))).toBe('invoice number A–Z');
@@ -535,16 +626,38 @@ describe('footerSummary', () => {
     );
   });
 
-  it('keeps the settled-last clause on both STATUS & DUE orders, and only there', () => {
-    // The caption is the only thing that explains why a 2024 paid invoice sits
-    // below a 2026 one; an order that does not sink them must not claim to.
+  it('keeps the block clause on both STATUS & DUE orders, and only there', () => {
+    // The caption is the only thing that explains why a draft sits below a
+    // due-in-90-days invoice and a 2024 paid one below both; an order that does
+    // not block them must not claim to.
     for (const column of SORTABLE_COLUMNS) {
       for (const direction of ['asc', 'desc'] as const) {
-        expect(sortSentence(by(column, direction)).includes('open first')).toBe(
+        expect(sortSentence(by(column, direction)).includes('drafts and settled last')).toBe(
           column === 'status',
         );
       }
     }
+  });
+
+  it('describes the order STATUS & DUE ascending actually produces', () => {
+    // The caption and the rows are checked against each other, not each against
+    // a string: a caption that says "most overdue first" over a list led by a
+    // draft is the defect this pair exists to catch.
+    const rows = buildListRows({
+      invoices: [
+        makeInvoice({ id: 'draft', number: 'INV-0001', status: 'draft', dueDate: '2024-01-01' }),
+        makeInvoice({ id: 'paid', number: 'INV-0002', status: 'paid', dueDate: '2024-02-01' }),
+        makeInvoice({ id: 'late', number: 'INV-0003', status: 'sent', dueDate: '2026-01-01' }),
+      ],
+      clientNames: NAMES,
+      today: TODAY,
+    });
+    const sentence = sortSentence(by('status', 'asc'));
+    const ordered = sortRows(rows, by('status', 'asc'));
+    expect(sentence).toContain('most overdue first');
+    expect(ordered[0]?.state).toBe('overdue');
+    expect(sentence).toContain('drafts and settled last');
+    expect(ordered.map((row) => row.id)).toEqual(['late', 'draft', 'paid']);
   });
 
   it('has a sentence for every sortable column in the column table', () => {

@@ -72,6 +72,7 @@ import {
   applyChips,
   applyClientFilters,
   buildInvoiceSearchConfig,
+  isUnfilteredRequest,
   openClientIdsOf,
   toListRequest,
 } from './filters';
@@ -84,6 +85,7 @@ import {
   isOpenState,
   matchesSegment,
   rowStateOf,
+  segmentShowing,
 } from './listGrouping';
 import type { ListSegment } from './listGrouping';
 import { columnDef, listLayoutAt } from './listColumns';
@@ -102,10 +104,12 @@ import {
   chevronRotation,
   chipKey,
   chipLabel,
+  headerAccessibleName,
   inputFieldLabels,
   isSortChoiceActive,
   menuAnchor,
   removeChip,
+  retainOpenMenu,
   sortLabelsFor,
   sortPillLabel,
   toggleMenu,
@@ -410,6 +414,13 @@ export function InvoiceList(): React.JSX.Element {
   const [rawSelected, setRawSelected] = useState<ReadonlySet<string>>(new Set());
 
   const [invoices, setInvoices] = useState<Invoice[] | null>(null);
+  /**
+   * Every invoice in the workspace, ignoring the search term and the filter
+   * tokens. `Has open balance` is a fact about a client rather than about a row,
+   * so it is the one predicate that cannot be answered from the narrowed set —
+   * see `isUnfilteredRequest`. Nothing else reads this.
+   */
+  const [allInvoices, setAllInvoices] = useState<Invoice[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -436,25 +447,41 @@ export function InvoiceList(): React.JSX.Element {
       const request = (offset: number): ReturnType<typeof toListRequest> =>
         toListRequest(active, { search: term, limit: PAGE_LIMIT, offset });
 
-      const [firstPage, clientResult] = await Promise.all([
-        window.api.invoke('invoices:list', request(0)),
-        // The list response carries clientId only — join names client-side.
-        window.api.invoke('clients:list', { limit: 500, offset: 0 }),
-      ]);
-      if (isStale()) return;
-
       // `total` is the size of the set the backend filter matched. Keep asking
       // for the next window until we hold all of it; an empty page ends the
       // loop too, so a shrinking list cannot spin here.
-      const collected = [...firstPage.items];
-      while (collected.length < firstPage.total) {
-        const next = await window.api.invoke('invoices:list', request(collected.length));
-        if (isStale()) return;
-        if (next.items.length === 0) break;
-        collected.push(...next.items);
-      }
+      const drain = async (
+        build: (offset: number) => ReturnType<typeof toListRequest>,
+      ): Promise<Invoice[] | null> => {
+        const firstPage = await window.api.invoke('invoices:list', build(0));
+        if (isStale()) return null;
+        const collected = [...firstPage.items];
+        while (collected.length < firstPage.total) {
+          const next = await window.api.invoke('invoices:list', build(collected.length));
+          if (isStale()) return null;
+          if (next.items.length === 0) break;
+          collected.push(...next.items);
+        }
+        return collected;
+      };
+
+      // The list response carries clientId only — join names client-side.
+      const clientResult = await window.api.invoke('clients:list', { limit: 500, offset: 0 });
+      if (isStale()) return;
+
+      const collected = await drain(request);
+      if (collected === null) return;
+
+      // The unfiltered set behind `Has open balance`. Skipped entirely when the
+      // request already narrows nothing, which is the common case — then the set
+      // just loaded *is* every invoice.
+      const everything = isUnfilteredRequest(request(0))
+        ? collected
+        : await drain((offset) => ({ limit: PAGE_LIMIT, offset }));
+      if (everything === null) return;
 
       setInvoices(collected);
+      setAllInvoices(everything);
       setClients(clientResult.items);
     } catch (cause) {
       if (isStale()) return;
@@ -497,16 +524,18 @@ export function InvoiceList(): React.JSX.Element {
 
   /**
    * `Has open balance` is a fact about a *client*, not about the row it is
-   * tested against, so it is resolved once over the set the chips are about to
-   * narrow rather than per invoice.
+   * tested against, so it is resolved once rather than per invoice — and over
+   * `allInvoices`, never over the narrowed set. On the `Paid` tab, or under an
+   * issue-date chip, the very invoice that gives a client an open balance is
+   * the one that is not on screen.
    */
   const chipContext: ChipContext = useMemo(
     () => ({
       today,
       clientNames,
-      openClientIds: openClientIdsOf(tokenMatched, today),
+      openClientIds: openClientIdsOf(allInvoices, today),
     }),
-    [today, clientNames, tokenMatched],
+    [today, clientNames, allInvoices],
   );
 
   /** The whole matching set, before the status tab narrows it. */
@@ -583,8 +612,14 @@ export function InvoiceList(): React.JSX.Element {
 
   // `J`/`K` move the cursor, `/` focuses the search. Scoped to this page
   // because the listener lives and dies with it, and inert whenever a text
-  // field or a modifier has the keystroke.
+  // field, a modifier, or an open column menu has the keystroke.
   useEffect(() => {
+    // An open menu owns the keyboard. Excluding text fields alone was not
+    // enough: with a menu open, `J`/`K` moved row focus *behind* it and `/`
+    // jumped to the search box while the menu stayed on screen, both of which
+    // leave focus and the visible surface pointing at different things. The
+    // menu has its own ArrowUp/ArrowDown and Escape.
+    if (openMenu !== null) return;
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target;
@@ -609,7 +644,7 @@ export function InvoiceList(): React.JSX.Element {
     return () => {
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [move]);
+  }, [move, openMenu]);
 
   const changeFilters = useCallback((next: readonly PowerSearchFilter[]) => {
     setFilters([...next]);
@@ -629,6 +664,23 @@ export function InvoiceList(): React.JSX.Element {
     };
   }, [openMenu]);
 
+  /**
+   * The columns the header strip actually drew. Empty while loading and empty
+   * when nothing matched, because both of those branches render no strip at all.
+   */
+  const headerColumns = useMemo(
+    () => (invoices !== null && rows.length > 0 ? layout.columns : []),
+    [invoices, rows.length, layout.columns],
+  );
+
+  // A menu cannot outlive the header that owns it. Without this the state and
+  // the document listener above both survive an empty result set or a narrower
+  // tier dropping the active column, and the menu re-opens by itself the moment
+  // the column comes back.
+  useEffect(() => {
+    setOpenMenu((current) => retainOpenMenu(current, headerColumns));
+  }, [headerColumns]);
+
   const applyChip = useCallback((predicate: ColumnFilterPredicate, value?: string) => {
     setChips((current) => addChip(current, buildChip(predicate, value)));
     setOpenMenu(null);
@@ -646,11 +698,18 @@ export function InvoiceList(): React.JSX.Element {
    * client — the same reason the bulk bar has no "Send reminder" — so the
    * button does the part that is real: it puts the reader in front of exactly
    * the invoices to chase, selected and ready for a bulk action.
+   *
+   * It moves the tab too. The chip alone was not enough: on `Sent`, `Drafts` or
+   * `Paid` the segment excludes every overdue row, so the list went empty, the
+   * selection was narrowed to the visible rows and therefore to none, and the
+   * button silently did nothing. `segmentShowing` leaves `All` and `Overdue`
+   * alone and only moves a tab that cannot show the rows.
    */
   const chaseOverdue = useCallback(() => {
     const overdueIds = matching
       .filter((invoice) => rowStateOf(invoice, today) === 'overdue')
       .map((invoice) => invoice.id);
+    setSegment((current) => segmentShowing('overdue', current));
     setChips((current) => addChip(current, buildChip('status-overdue')));
     setRawSelected(new Set(overdueIds));
     setOpenMenu(null);
@@ -667,13 +726,16 @@ export function InvoiceList(): React.JSX.Element {
     [pageRows],
   );
 
-  /** A status change has to land in the list's own copy of the row. */
+  /**
+   * A status change has to land in both of the list's copies of the row — the
+   * narrowed one it renders and the unfiltered one `Has open balance` reads, or
+   * marking an invoice paid would leave its client "open" until the next load.
+   */
   const applyInvoiceChange = useCallback((updated: Invoice) => {
-    setInvoices((current) =>
-      current === null
-        ? current
-        : current.map((invoice) => (invoice.id === updated.id ? { ...invoice, ...updated } : invoice)),
-    );
+    const merge = (invoice: Invoice): Invoice =>
+      invoice.id === updated.id ? { ...invoice, ...updated } : invoice;
+    setInvoices((current) => (current === null ? current : current.map(merge)));
+    setAllInvoices((current) => current.map(merge));
   }, []);
 
   const markSelectedPaid = useCallback(async () => {
@@ -1035,12 +1097,20 @@ const BAR_MIN_SEGMENT = '10px';
  * exactly as the design has it — one tinted surface among four reads as an
  * alarm, four read as decoration.
  *
- * Every tile is a filter shortcut: clicking it applies the filter it describes,
- * producing the same chip the matching column-menu option would. It is a
- * `role="button"` rather than a `<button>` because the Overdue tile contains
- * the `Chase all N` button and the Outstanding tile contains two pager buttons,
- * and nesting a button inside a button is invalid HTML — the same reasoning the
- * row already uses for `role="link"`.
+ * Every tile is a filter shortcut: clicking the label-and-figure region applies
+ * the filter it describes, producing the same chip the matching column-menu
+ * option would.
+ *
+ * That region is the control; the *card* is not. The card used to be a
+ * `role="button"` containing the Overdue tile's `Chase all N` and the
+ * Outstanding tile's two pager buttons. Avoiding a nested native `<button>` did
+ * not avoid nested interactive semantics — a control inside a control is
+ * flattened or exposed inconsistently depending on the assistive technology, so
+ * the reader either cannot reach `Chase all` or cannot tell what it belongs to.
+ * The card is now plain layout, the filter region is a real `<button>`, and the
+ * Chase button and the pager are its siblings inside the card rather than its
+ * descendants. The top-right slot is positioned rather than laid out in a row
+ * so the figure keeps the card's full width.
  *
  * A tile with more than one currency behind it says how many rather than
  * converting: this app has no exchange rate.
@@ -1083,60 +1153,77 @@ function MoneyTiles({
             gap={showsBreakdown ? 1.5 : 1}
             paddingInline={4}
             paddingBlock={3}
-            role="button"
-            tabIndex={0}
-            aria-label={`Filter by ${tile.label}`}
-            onClick={() => {
-              onApply(tile.predicate);
-            }}
-            onKeyDown={(event: React.KeyboardEvent) => {
-              if (event.key !== 'Enter' && event.key !== ' ') return;
-              if (event.target !== event.currentTarget) return;
-              event.preventDefault();
-              onApply(tile.predicate);
-            }}
             style={{
               border: `1px solid ${tone === null ? 'var(--color-border)' : tone.border}`,
               borderRadius: 'var(--radius-container)',
               background: tone === null ? 'var(--color-background-muted)' : tone.wash,
-              cursor: 'pointer',
+              // The top-right slot hangs off this box.
+              position: 'relative',
             }}
           >
-            <HStack justify="between" align="center" gap={2}>
-              <Text
-                type="supporting"
-                weight={tone === null ? 'medium' : 'semibold'}
-                style={tone === null ? undefined : { color: tone.text }}
-              >
-                {tile.label}
-              </Text>
+            {/* The one control the tile's own click is: label and figure, the
+                card's full width, so the reader presses what they read. */}
+            <Button
+              label={`Filter by ${tile.label}`}
+              variant="ghost"
+              width="100%"
+              onClick={() => {
+                onApply(tile.predicate);
+              }}
+              style={{
+                justifyContent: 'flex-start',
+                textAlign: 'start',
+                paddingInline: 0,
+                paddingBlock: 0,
+                blockSize: 'auto',
+                background: 'transparent',
+                borderColor: 'transparent',
+              }}
+            >
+              <VStack gap={1} align="start" width="100%">
+                <Text
+                  type="supporting"
+                  weight={tone === null ? 'medium' : 'semibold'}
+                  style={tone === null ? undefined : { color: tone.text }}
+                >
+                  {tile.label}
+                </Text>
+                <Text
+                  as="span"
+                  size={isLead ? '2xl' : 'xl'}
+                  weight="semibold"
+                  hasTabularNumbers
+                  style={tone === null ? undefined : { color: tone.text }}
+                >
+                  {tile.figure}
+                </Text>
+              </VStack>
+            </Button>
+
+            {/* A sibling of that control, never a descendant of it. */}
+            <VStack
+              gap={0}
+              align="end"
+              style={{
+                position: 'absolute',
+                insetBlockStart: 'var(--spacing-3)',
+                insetInlineEnd: 'var(--spacing-4)',
+              }}
+            >
               {tile.key === 'overdue' ? (
                 <Button
                   label={`Chase all ${String(tile.count)}`}
                   variant="secondary"
                   size="sm"
                   isDisabled={tile.count === 0}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onChase();
-                  }}
+                  onClick={onChase}
                 />
               ) : (
                 <Text type="code" size="xsm" color="secondary" hasTabularNumbers>
                   {tile.headerCount}
                 </Text>
               )}
-            </HStack>
-
-            <Text
-              as="span"
-              size={isLead ? '2xl' : 'xl'}
-              weight="semibold"
-              hasTabularNumbers
-              style={tone === null ? undefined : { color: tone.text }}
-            >
-              {tile.figure}
-            </Text>
+            </VStack>
 
             {showsBreakdown ? (
               <CurrencyBar
@@ -1168,8 +1255,8 @@ function MoneyTiles({
  * The bar's widths are shares of the invoice *count*, not of value: a count is
  * the only quantity comparable across currencies without a rate (see
  * ./currencyBreakdown). The pager prints each currency's own total beside its
- * code, and both buttons stop propagation so paging never fires the tile's own
- * click-to-filter.
+ * code. It sits beside the tile's filter button rather than inside it, so
+ * paging cannot fire click-to-filter and there is nothing to stop propagating.
  */
 function CurrencyBar({
   breakdown,
@@ -1211,9 +1298,6 @@ function CurrencyBar({
         align="center"
         role="group"
         aria-label="Outstanding by currency"
-        onClick={(event: React.MouseEvent) => {
-          event.stopPropagation();
-        }}
       >
         <Button
           label="Previous currencies"
@@ -1222,8 +1306,7 @@ function CurrencyBar({
           isIconOnly
           icon={<PagerChevronIcon isBack />}
           isDisabled={!page.canPrevious}
-          onClick={(event) => {
-            event.stopPropagation();
+          onClick={() => {
             onIndex(stepCurrencyPage(breakdown.segments, index, -1));
           }}
         />
@@ -1250,8 +1333,7 @@ function CurrencyBar({
           isIconOnly
           icon={<PagerChevronIcon isBack={false} />}
           isDisabled={!page.canNext}
-          onClick={(event) => {
-            event.stopPropagation();
+          onClick={() => {
             onIndex(stepCurrencyPage(breakdown.segments, index, 1));
           }}
         />
@@ -1446,13 +1528,19 @@ const RADIO_DOT = '4px';
  * The header strip: one sort + filter menu per column.
  *
  * The ARIA is this file's own — the mock has none. Each header is a real
- * `<button>` with `aria-haspopup="menu"` and `aria-expanded`, and the cell
- * around it is a `columnheader` carrying `aria-sort`, which is only valid
- * inside a row inside a table. So the strip is a one-row `table`; the data rows
- * below stay `role="link"` (the row is the click target, and it contains a
- * checkbox and a menu button, so it cannot be a cell tree without losing that).
- * A partial table is the honest description of a header strip that really is
- * one row of column headers.
+ * `<button>` with `aria-haspopup="menu"` and `aria-expanded`, and that is the
+ * whole of it: no `role="table"`, no `row`, no `columnheader`, no `aria-sort`.
+ *
+ * Those were here, and they described something that did not exist. The strip
+ * was a one-row `table` while the data rows below were `role="link"` siblings
+ * *outside* it, so assistive technology met a table of column headers with no
+ * rows and then an unassociated pile of links; the `aria-sort` on those headers
+ * was syntactically valid and structurally meaningless. Making the rows real
+ * cells is not available — the row is the click target and carries a checkbox
+ * and a menu button, none of which survives a cell tree — so the scaffolding is
+ * gone rather than half-built, and the sort state is announced where it is
+ * operated: in each header button's own accessible name (`headerAccessibleName`
+ * in ./columnMenu). `group` is what this strip actually is.
  */
 function ColumnHeader({
   columns,
@@ -1480,7 +1568,7 @@ function ColumnHeader({
   return (
     <VStack
       gap={0}
-      role="table"
+      role="group"
       aria-label="Invoice columns"
       paddingInline={6}
       paddingBlock={2}
@@ -1492,12 +1580,12 @@ function ColumnHeader({
         zIndex: 5,
       }}
     >
-      <VStack gap={0} role="row" style={gridStyle(template)}>
+      <VStack gap={0} style={gridStyle(template)}>
         {columns.map((column) => {
           const definition = columnDef(column);
           if (column === 'select') {
             return (
-              <VStack key={column} gap={0} role="columnheader">
+              <VStack key={column} gap={0}>
                 <CheckboxInput
                   label="Select every invoice on this page"
                   isLabelHidden
@@ -1509,8 +1597,9 @@ function ColumnHeader({
             );
           }
           if (!definition.sortable) {
+            // The ⋯ gutter: a track with nothing in it, announced as nothing.
             return (
-              <VStack key={column} gap={0} role="columnheader" aria-label="Row actions">
+              <VStack key={column} gap={0}>
                 {null}
               </VStack>
             );
@@ -1571,8 +1660,6 @@ function ColumnHeaderCell({
   return (
     <VStack
       gap={0}
-      role="columnheader"
-      aria-sort={isActive ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
       style={{
         position: 'relative',
         minInlineSize: 0,
@@ -1581,7 +1668,9 @@ function ColumnHeaderCell({
     >
       <Button
         ref={buttonRef}
-        label={`${definition.label}, sort and filter`}
+        // The sort state rides in the accessible name because there is no table
+        // for `aria-sort` to belong to — see the strip's own comment.
+        label={headerAccessibleName(definition, sort)}
         variant="ghost"
         size="sm"
         aria-haspopup="menu"

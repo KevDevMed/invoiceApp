@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Invoice } from '../../../../shared/types';
 import { INVOICE_STATUSES } from '../../../../shared/types';
 import {
+  LIST_SEGMENTS,
   adjacentRowId,
   countOpenInvoices,
   countSegments,
@@ -15,6 +16,7 @@ import {
   overdueTotals,
   rowPosition,
   rowStateOf,
+  segmentShowing,
   shortDate,
   sumByCurrency,
   summariseTotals,
@@ -182,6 +184,34 @@ describe('matchesSegment / countSegments', () => {
       TODAY,
     );
     expect(counts).toEqual({ all: 5, overdue: 1, sent: 2, drafts: 1, paid: 1 });
+  });
+});
+
+describe('segmentShowing', () => {
+  it('leaves a tab that already shows the state exactly where it is', () => {
+    // Pressing `Chase all N` from All or Overdue must not yank the reader onto
+    // a different tab for no reason.
+    expect(segmentShowing('overdue', 'all')).toBe('all');
+    expect(segmentShowing('overdue', 'overdue')).toBe('overdue');
+  });
+
+  it('moves off a tab that cannot show the state', () => {
+    // `Chase all N` used to leave the segment alone. On Sent, Drafts or Paid
+    // the row set went empty, the selection was narrowed to the visible rows
+    // and therefore to none, and the button silently did nothing.
+    for (const segment of ['sent', 'drafts', 'paid'] as const) {
+      expect(segmentShowing('overdue', segment), segment).not.toBe(segment);
+      expect(matchesSegment('overdue', segmentShowing('overdue', segment)), segment).toBe(true);
+    }
+  });
+
+  it('lands somewhere that shows the state, from every segment and every state', () => {
+    for (const state of ROW_STATES) {
+      for (const { key } of LIST_SEGMENTS) {
+        const landed = segmentShowing(state, key);
+        expect(matchesSegment(state, landed), `${state} from ${key}`).toBe(true);
+      }
+    }
   });
 });
 

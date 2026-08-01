@@ -275,6 +275,23 @@ export function matchesSegment(state: RowState, segment: ListSegment): boolean {
 }
 
 /**
+ * The tab an action targeting `state` has to land on, given where the reader is.
+ *
+ * `Chase all N` selects the overdue invoices and applies the Overdue chip, but
+ * it used to leave the segment alone. On `Sent`, `Drafts` or `Paid` — none of
+ * which admit an overdue row — the row set went empty, the selection was
+ * narrowed to what is visible and therefore to nothing, and the button did
+ * nothing at all with no error and no change on screen. A segment that already
+ * shows the state is left exactly as it is, so pressing Chase from `All` does
+ * not yank the reader onto a narrower tab for no reason.
+ */
+export function segmentShowing(state: RowState, segment: ListSegment): ListSegment {
+  if (matchesSegment(state, segment)) return segment;
+  const target = LIST_SEGMENTS.find((item) => matchesSegment(state, item.key));
+  return target?.key ?? 'all';
+}
+
+/**
  * The counts printed inside the segmented control. Computed over the set the
  * search and the filter tokens already narrowed, so the numbers describe what
  * clicking a segment would actually show.

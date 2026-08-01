@@ -242,6 +242,30 @@ export function toListRequest(
   return request;
 }
 
+/**
+ * Whether a request narrows nothing — the whole invoice table, just paged.
+ *
+ * `Has open balance` is a fact about a *client*, so the set it is derived from
+ * has to be every invoice that client has, not the ones currently on screen.
+ * `toListRequest` narrows server-side by `search`, `status`, `clientId` and
+ * `issuedBetween`, so the loaded set can be missing the very invoice that gives
+ * a client an open balance — an issue-date token, or a `status=paid` filter,
+ * and the predicate quietly answers "no open balance" about a client with three
+ * of them.
+ *
+ * The view therefore loads a second, unfiltered set for that one predicate —
+ * but only when it would differ from the one already loaded, which is what this
+ * answers. `limit`/`offset` are paging, not narrowing, so they are not read.
+ */
+export function isUnfilteredRequest(request: InvoiceListRequest): boolean {
+  return (
+    request.search === undefined &&
+    request.status === undefined &&
+    request.clientId === undefined &&
+    request.issuedBetween === undefined
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Filter → client-side predicate
 // ---------------------------------------------------------------------------
@@ -339,7 +363,13 @@ export function formatRangeValue(from: string, to: string): string {
   return `${from.trim()} ${RANGE_SEPARATOR} ${to.trim()}`;
 }
 
-/** Clients with at least one invoice still owed. Feeds `client-has-open-balance`. */
+/**
+ * Clients with at least one invoice still owed. Feeds `client-has-open-balance`.
+ *
+ * Must be handed the *unfiltered* invoice set — see `isUnfilteredRequest`. Pass
+ * it a narrowed one and the predicate answers a question about the screen while
+ * claiming to answer one about the client.
+ */
 export function openClientIdsOf(
   invoices: readonly Invoice[],
   today: string,
@@ -389,6 +419,10 @@ export function matchesChip(invoice: Invoice, chip: FilterChip, context: ChipCon
         .split(',')
         .map((part) => part.trim())
         .filter((part) => part !== '');
+      // Unreachable since `text-list` validation refuses an input with no usable
+      // token: `", "` used to arrive here as an empty `wanted` and match every
+      // invoice. Kept as the same half-built-chip guard every other predicate
+      // has, not as a path.
       return wanted.length === 0 || wanted.some((part) => containsFold(clientName, part));
     }
     case 'client-has-open-balance':

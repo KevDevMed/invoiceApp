@@ -144,17 +144,35 @@ describe('buildCurrencyBreakdown', () => {
     expect(breakdown.segments[1]?.amount).toBe('5,000');
   });
 
-  it('breaks a count tie on money, then on the code, so the order is stable', () => {
+  it('breaks a count tie on the code alone, never on raw cents', () => {
+    // Regression: the tie-break used to be `b.cents - a.cents`, which compares
+    // raw minor units *across currencies* — the one comparison this module's
+    // header refuses — and then decided segment order, the opacity ramp and the
+    // pager order from it. `AAA` holds a hundredth of what the others hold in
+    // its own units and must still lead on the code.
     const breakdown = buildCurrencyBreakdown([
       ...bucket('AAA', 2, 100),
       ...bucket('BBB', 2, 900),
       ...bucket('CCC', 2, 900),
     ]);
     expect(breakdown.segments.map((segment) => segment.currency)).toEqual([
+      'AAA',
       'BBB',
       'CCC',
-      'AAA',
     ]);
+  });
+
+  it('ignores a huge minor-unit total when the counts tie', () => {
+    // ¥7,120,000 against £120,000: sixty times the raw cents, same count. The
+    // order must not notice.
+    const breakdown = buildCurrencyBreakdown([
+      ...bucket('JPY', 3, 712_000_000),
+      ...bucket('GBP', 3, 12_000_000),
+    ]);
+    expect(breakdown.segments.map((segment) => segment.currency)).toEqual(['GBP', 'JPY']);
+    // The opacity ramp is positional, so it inherits the same fix: GBP leads.
+    expect(breakdown.segments[0]?.opacity).toBe(segmentOpacity(0));
+    expect(breakdown.segments[1]?.opacity).toBe(segmentOpacity(1));
   });
 });
 

@@ -10,18 +10,22 @@ import {
   chipLabel,
   chipTag,
   hasChips,
+  headerAccessibleName,
   inputFieldLabels,
+  isCalendarDate,
   isSortActive,
   isSortChoiceActive,
   menuAnchor,
+  normaliseTokenList,
   removeChip,
+  retainOpenMenu,
   sortLabelsFor,
   sortPillLabel,
   toggleMenu,
   validateFilterInput,
 } from '../columnMenu';
-import { COLUMNS, SORTABLE_COLUMNS, columnDef } from '../listColumns';
-import type { SortColumnKey } from '../listColumns';
+import { COLUMNS, SORTABLE_COLUMNS, columnDef, listLayoutAt } from '../listColumns';
+import type { ListColumnKey, SortColumnKey } from '../listColumns';
 import type { SortState } from '../listRows';
 
 function by(column: SortColumnKey, direction: 'asc' | 'desc'): SortState {
@@ -258,6 +262,7 @@ describe('inputFieldLabels', () => {
 
   it('draws one field for text and currency, two for a range', () => {
     expect(inputFieldLabels('text')).toHaveLength(1);
+    expect(inputFieldLabels('text-list')).toHaveLength(1);
     expect(inputFieldLabels('currency')).toHaveLength(1);
     expect(inputFieldLabels('money-range')).toEqual(['From', 'To']);
     expect(inputFieldLabels('date-range')).toEqual(['From', 'To']);
@@ -351,11 +356,223 @@ describe('validateFilterInput', () => {
       { from: '2026-01-01', to: 'nope' },
       { from: '5', to: 'y' },
     ];
-    for (const input of ['text', 'currency', 'money-range', 'date-range'] as const) {
+    for (const input of ['text', 'text-list', 'currency', 'money-range', 'date-range'] as const) {
       for (const draft of drafts) {
         const result = validateFilterInput(input, draft);
         if (!result.isValid) expect(result.value).toBe('');
       }
     }
+  });
+});
+
+describe('validateFilterInput — "Is any of…" needs a usable token', () => {
+  it('refuses input whose token list comes out empty', () => {
+    // `", "` is not an empty string, so it used to pass the plain `text` check
+    // and commit a chip whose `wanted` list is empty — which matches every
+    // invoice. A chip that claims to restrict must restrict.
+    for (const raw of ['', ' ', ',', ', ', ',,,', '  ,  ,  ']) {
+      const result = validateFilterInput('text-list', { from: raw, to: '' });
+      expect(result.isValid, JSON.stringify(raw)).toBe(false);
+      expect(result.value, JSON.stringify(raw)).toBe('');
+    }
+  });
+
+  it('names why', () => {
+    expect(validateFilterInput('text-list', { from: ', ', to: '' }).error).toBe(
+      'Enter at least one value',
+    );
+  });
+
+  it('accepts one token, and canonicalises the separators around it', () => {
+    expect(validateFilterInput('text-list', { from: ' , Halcyon ,, ', to: '' })).toEqual({
+      isValid: true,
+      error: null,
+      value: 'Halcyon',
+    });
+  });
+
+  it('keeps the reader’s own casing and order in the committed value', () => {
+    // Identity is normalised separately (`chipKey`); the chip still prints what
+    // was typed.
+    expect(validateFilterInput('text-list', { from: 'Northwind, Halcyon', to: '' }).value).toBe(
+      'Northwind, Halcyon',
+    );
+  });
+});
+
+describe('isCalendarDate', () => {
+  it('accepts dates that exist', () => {
+    for (const value of ['2026-01-01', '2026-02-28', '2024-02-29', '2026-12-31']) {
+      expect(isCalendarDate(value), value).toBe(true);
+    }
+  });
+
+  it('refuses a date that is only shaped like one', () => {
+    // `2026-02-31` used to pass a shape-only regex, commit, and then be
+    // compared *lexically* against `issueDate` — a range bounded by a day that
+    // never happened, silently including or excluding rows by string order.
+    for (const value of [
+      '2026-02-31',
+      '2026-02-30',
+      '2025-02-29',
+      '2026-13-01',
+      '2026-00-10',
+      '2026-04-31',
+      '2026-01-32',
+      '2026-01-00',
+    ]) {
+      expect(isCalendarDate(value), value).toBe(false);
+    }
+  });
+
+  it('refuses anything that is not YYYY-MM-DD at all', () => {
+    for (const value of ['', '2026-1-1', '01/01/2026', '2026-01-01T00:00:00Z', 'nope']) {
+      expect(isCalendarDate(value), value).toBe(false);
+    }
+  });
+});
+
+describe('validateFilterInput — a date range must be two real dates', () => {
+  it('refuses an impossible day on either end', () => {
+    expect(validateFilterInput('date-range', { from: '2026-02-31', to: '2026-03-31' })).toEqual({
+      isValid: false,
+      error: 'Enter two real dates as YYYY-MM-DD',
+      value: '',
+    });
+    expect(
+      validateFilterInput('date-range', { from: '2026-01-01', to: '2026-13-01' }).isValid,
+    ).toBe(false);
+  });
+
+  it('still takes a real leap day', () => {
+    expect(validateFilterInput('date-range', { from: '2024-02-29', to: '2024-03-01' }).value).toBe(
+      '2024-02-29 – 2024-03-01',
+    );
+  });
+
+  it('holds dates to the same standard money ranges already met', () => {
+    // Money already refused non-numeric, negative and empty bounds and
+    // corrected a reversed pair. Dates now do all four.
+    expect(validateFilterInput('date-range', { from: 'x', to: '2026-01-01' }).isValid).toBe(false);
+    expect(validateFilterInput('date-range', { from: '2026-01-01', to: '' }).isValid).toBe(false);
+    expect(validateFilterInput('date-range', { from: '2026-03-31', to: '2026-01-01' }).value).toBe(
+      '2026-01-01 – 2026-03-31',
+    );
+  });
+});
+
+describe('normaliseTokenList and text-list chip identity', () => {
+  it('reduces a comma list to its set', () => {
+    expect(normaliseTokenList('Halcyon, Northwind')).toBe('halcyon,northwind');
+    expect(normaliseTokenList('northwind,Halcyon')).toBe('halcyon,northwind');
+    expect(normaliseTokenList(' , Halcyon ,, ')).toBe('halcyon');
+    expect(normaliseTokenList(', ')).toBe('');
+  });
+
+  it('treats two spellings of one token set as one chip', () => {
+    // `chipKey` used to lowercase the whole string and stop there, so these two
+    // were two entries in the bar narrowing to identical rows.
+    const first = addChip([], buildChip('client-any-of', 'Halcyon, Northwind'));
+    expect(addChip(first, buildChip('client-any-of', 'northwind,Halcyon'))).toHaveLength(1);
+    expect(addChip(first, buildChip('client-any-of', ' NORTHWIND ,  halcyon '))).toHaveLength(1);
+    expect(chipKey(buildChip('client-any-of', 'Halcyon, Northwind'))).toBe(
+      chipKey(buildChip('client-any-of', 'northwind,Halcyon')),
+    );
+  });
+
+  it('keeps a genuinely different token set apart', () => {
+    const first = addChip([], buildChip('client-any-of', 'Halcyon, Northwind'));
+    expect(addChip(first, buildChip('client-any-of', 'Halcyon'))).toHaveLength(2);
+    expect(addChip(first, buildChip('client-any-of', 'Halcyon, Acme'))).toHaveLength(2);
+  });
+
+  it('leaves a plain text predicate comparing whole strings', () => {
+    // `Contains…` is one substring, not a set: the comma is part of the needle.
+    expect(chipKey(buildChip('client-contains', 'Halcyon, Northwind'))).not.toBe(
+      chipKey(buildChip('client-contains', 'northwind,Halcyon')),
+    );
+  });
+
+  it('removes a text-list chip by a key built from a different spelling', () => {
+    const chips = addChip([], buildChip('client-any-of', 'Halcyon, Northwind'));
+    expect(removeChip(chips, chipKey(buildChip('client-any-of', 'northwind, halcyon')))).toEqual(
+      [],
+    );
+  });
+});
+
+describe('headerAccessibleName', () => {
+  it('carries the active order in words, quoting the label that set it', () => {
+    expect(headerAccessibleName(columnDef('total'), by('total', 'desc'))).toBe(
+      'TOTAL, sorted Largest first',
+    );
+    expect(headerAccessibleName(columnDef('total'), by('total', 'asc'))).toBe(
+      'TOTAL, sorted Smallest first',
+    );
+    expect(headerAccessibleName(columnDef('status'), by('status', 'asc'))).toBe(
+      'STATUS & DUE, sorted Most overdue first',
+    );
+  });
+
+  it('says "not sorted" on every column that is not the active one', () => {
+    expect(headerAccessibleName(columnDef('client'), by('total', 'desc'))).toBe(
+      'CLIENT, not sorted',
+    );
+  });
+
+  it('names exactly one column as sorted, for every state the list can be in', () => {
+    // This is the assertion `aria-sort` used to carry — kept, moved onto the
+    // control, and no longer claiming a table that does not exist.
+    for (const active of SORTABLE_COLUMNS) {
+      for (const direction of ['asc', 'desc'] as const) {
+        const sort = by(active, direction);
+        const sorted = SORTABLE_COLUMNS.filter((key) =>
+          headerAccessibleName(columnDef(key), sort).includes(', sorted '),
+        );
+        expect(sorted, `${active}/${direction}`).toEqual([active]);
+      }
+    }
+  });
+
+  it('quotes the direction’s own label, so the name cannot contradict the arrow', () => {
+    for (const key of SORTABLE_COLUMNS) {
+      for (const choice of sortLabelsFor(columnDef(key).kind)) {
+        expect(headerAccessibleName(columnDef(key), by(key, choice.direction))).toBe(
+          `${columnDef(key).label}, sorted ${choice.label}`,
+        );
+      }
+    }
+  });
+});
+
+describe('retainOpenMenu', () => {
+  const wide = listLayoutAt(1400).columns;
+  const narrow = listLayoutAt(600).columns;
+
+  it('keeps a menu whose column is still on screen', () => {
+    expect(retainOpenMenu('total', wide)).toBe('total');
+    expect(retainOpenMenu('client', narrow)).toBe('client');
+  });
+
+  it('closes a menu whose column the responsive tier dropped', () => {
+    // ISSUED is the first column to go; a menu open on it must not survive the
+    // window narrowing and re-open when the window widens again.
+    expect(narrow).not.toContain('issued');
+    expect(retainOpenMenu('issued', narrow)).toBeNull();
+    expect(retainOpenMenu('invoice', narrow)).toBeNull();
+  });
+
+  it('closes every menu when the header strip is not rendered at all', () => {
+    // An empty result set removes the strip; the state and its document
+    // listener used to outlive it and re-open on the next matching row.
+    const none: readonly ListColumnKey[] = [];
+    for (const key of SORTABLE_COLUMNS) {
+      expect(retainOpenMenu(key, none), key).toBeNull();
+    }
+  });
+
+  it('is a no-op on a closed menu', () => {
+    expect(retainOpenMenu(null, wide)).toBeNull();
+    expect(retainOpenMenu(null, [])).toBeNull();
   });
 });

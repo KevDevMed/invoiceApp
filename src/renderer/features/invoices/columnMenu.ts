@@ -18,6 +18,7 @@ import type {
   ColumnFilterInput,
   ColumnFilterPredicate,
   ListColumnDef,
+  ListColumnKey,
   ListColumnKind,
   SortColumnKey,
 } from './listColumns';
@@ -72,6 +73,34 @@ export function chevronRotation(isOpen: boolean): string {
 }
 
 /**
+ * A header button's accessible name, carrying the sort state in words.
+ *
+ * The header strip used to be a synthetic one-row `role="table"` whose
+ * `columnheader` cells carried `aria-sort`, while the data rows below were
+ * `role="link"` siblings *outside* it. Assistive technology saw column headers
+ * with no rows and then a pile of unassociated links: the `aria-sort` was
+ * syntactically valid and structurally meaningless. Converting the rows to a
+ * real table is a rewrite the row cannot survive (it is the click target and it
+ * contains a checkbox and a menu button), so the scaffolding is gone and the
+ * sort state rides here instead — announced on the control that sets it, which
+ * is where a reader operating the list actually is.
+ *
+ * `TOTAL, sorted Largest first` / `CLIENT, not sorted`. The active direction's
+ * own label is quoted verbatim rather than re-worded, for the same reason the
+ * arrow reads its rotation from that label: two spellings of one order are two
+ * chances to disagree.
+ */
+export function headerAccessibleName(definition: ListColumnDef, sort: SortState): string {
+  if (sort.column !== definition.key) return `${definition.label}, not sorted`;
+  const choice = sortLabelsFor(definition.kind).find(
+    (candidate) => candidate.direction === sort.direction,
+  );
+  return choice === undefined
+    ? `${definition.label}, not sorted`
+    : `${definition.label}, sorted ${choice.label}`;
+}
+
+/**
  * The toolbar pill's name for the active column: the label with ` & DUE`
  * stripped and title-cased, except STATUS & DUE itself, which reads `Due date`
  * because that is what the order actually is.
@@ -96,6 +125,28 @@ export function toggleMenu(
   column: SortColumnKey,
 ): SortColumnKey | null {
   return open === column ? null : column;
+}
+
+/**
+ * The open menu after a render, given the columns the header strip actually
+ * drew. Null once the column that owns it is gone.
+ *
+ * `openMenu` used to outlive its header. An empty result set removes the header
+ * strip entirely, and the responsive tiers drop columns as the window narrows —
+ * either way the state and the document-level close listener survived, so
+ * restoring rows or widening the window re-opened a menu the reader never asked
+ * for, sometimes minutes later. A menu belongs to a header; when the header
+ * stops being rendered the menu is closed, not suspended.
+ *
+ * `rendered` is empty whenever the strip itself is absent, which is why this
+ * takes the drawn columns rather than the layout's.
+ */
+export function retainOpenMenu(
+  open: SortColumnKey | null,
+  rendered: readonly ListColumnKey[],
+): SortColumnKey | null {
+  if (open === null) return null;
+  return rendered.includes(open) ? open : null;
 }
 
 export interface MenuAnchor {
@@ -137,14 +188,41 @@ export function chipLabel(chip: FilterChip): string {
 }
 
 /**
+ * A comma-separated value reduced to its set: split, trimmed, empties dropped,
+ * folded to lower case, sorted, rejoined.
+ *
+ * This is what a `text-list` chip *means*, as opposed to what the reader typed.
+ * `Halcyon, Northwind` and `northwind,Halcyon` are one predicate over one set
+ * of names and must therefore be one chip; the order the two names were typed
+ * in is not part of the filter.
+ */
+export function normaliseTokenList(value: string): string {
+  return value
+    .split(',')
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token !== '')
+    .sort()
+    .join(',');
+}
+
+/**
  * A chip's structural identity: what makes two chips the same filter.
  *
  * The predicate and the value, never the rendered label — `TOTAL: Between
  * 1,000 – 5,000` and `TOTAL: Between 1000 – 5000` are the same filter typed
  * two ways, and two different predicates could one day print the same words.
+ *
+ * A `text-list` value is reduced to its normalised token set first. Lower-casing
+ * the whole string, which is all this used to do, left `Halcyon, Northwind` and
+ * `northwind,Halcyon` as two different keys — two chips in the bar, both
+ * narrowing to the same rows, and the second one no more removable than the
+ * first because they are genuinely distinct entries.
  */
 export function chipKey(chip: FilterChip): string {
-  return `${chip.predicate}::${chip.value?.trim().toLowerCase() ?? ''}`;
+  const raw = chip.value?.trim() ?? '';
+  const { option } = optionFor(chip.predicate);
+  const value = option.input === 'text-list' ? normaliseTokenList(raw) : raw.toLowerCase();
+  return `${chip.predicate}::${value}`;
 }
 
 /** `chip` appended, or the list unchanged when that filter is already applied. */
@@ -209,6 +287,8 @@ export function inputFieldLabels(input: ColumnFilterInput): readonly string[] {
       return [];
     case 'text':
       return ['Value'];
+    case 'text-list':
+      return ['Values, comma separated'];
     case 'currency':
       return ['Currency code'];
     case 'money-range':
@@ -218,7 +298,7 @@ export function inputFieldLabels(input: ColumnFilterInput): readonly string[] {
   }
 }
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const CURRENCY_CODE = /^[A-Za-z]{3}$/;
 
 function money(raw: string): number | null {
@@ -229,12 +309,38 @@ function money(raw: string): number | null {
 }
 
 /**
+ * Whether `value` is a date that exists, not merely one shaped like a date.
+ *
+ * The shape check alone accepted `2026-02-31` and `2026-13-01`, which then went
+ * into a chip and were compared *lexically* against `issueDate` — so a "range"
+ * ending on a day that never happened silently included or excluded rows by
+ * string order with nothing on screen admitting it. `Date.UTC` normalises an
+ * impossible day into the next month, so a round trip that comes back with the
+ * same three fields is the whole test. UTC throughout: these are calendar
+ * dates, and building them in local time would move a date across a boundary
+ * depending on where the reader is sitting.
+ */
+export function isCalendarDate(value: string): boolean {
+  const match = ISO_DATE.exec(value);
+  if (match === null) return false;
+  const [, year, month, day] = match;
+  if (year === undefined || month === undefined || day === undefined) return false;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return (
+    date.getUTCFullYear() === Number(year) &&
+    date.getUTCMonth() === Number(month) - 1 &&
+    date.getUTCDate() === Number(day)
+  );
+}
+
+/**
  * Whether the draft can be committed, and what it commits as.
  *
  * Reversed ranges are corrected rather than rejected — a reader who typed the
  * larger number first meant a range, not a mistake — but anything that is not a
- * number, not a date, or not a three-letter code is refused, because a chip
- * that cannot be evaluated would silently match everything.
+ * number, not a *real calendar* date, not a three-letter code, or not at least
+ * one comma token is refused, because a chip that cannot be evaluated would
+ * silently match everything.
  */
 export function validateFilterInput(
   input: ColumnFilterInput,
@@ -252,6 +358,22 @@ export function validateFilterInput(
         ? { isValid: false, error: 'Enter a value', value: '' }
         : { isValid: true, error: null, value: from };
 
+    case 'text-list': {
+      // `", "` is not empty and used to pass the `text` check, committing a chip
+      // whose token list is empty — which matches every invoice. A chip that
+      // claims to restrict and narrows nothing is worse than a rejected field.
+      const tokens = from
+        .split(',')
+        .map((token) => token.trim())
+        .filter((token) => token !== '');
+      // The reader's own casing and order are kept: this is what the chip
+      // prints. `chipKey` normalises separately, so identity and display can
+      // disagree without either being wrong.
+      return tokens.length === 0
+        ? { isValid: false, error: 'Enter at least one value', value: '' }
+        : { isValid: true, error: null, value: tokens.join(', ') };
+    }
+
     case 'currency':
       return CURRENCY_CODE.test(from)
         ? { isValid: true, error: null, value: from.toUpperCase() }
@@ -268,8 +390,8 @@ export function validateFilterInput(
     }
 
     case 'date-range': {
-      if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
-        return { isValid: false, error: 'Enter two dates as YYYY-MM-DD', value: '' };
+      if (!isCalendarDate(from) || !isCalendarDate(to)) {
+        return { isValid: false, error: 'Enter two real dates as YYYY-MM-DD', value: '' };
       }
       const [a, b] = from <= to ? [from, to] : [to, from];
       return { isValid: true, error: null, value: formatRangeValue(a, b) };

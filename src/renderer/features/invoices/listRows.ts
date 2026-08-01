@@ -75,14 +75,41 @@ export function monogram(name: string): string {
  * Whether the money is out of play.
  *
  * A paid or void invoice is settled: nothing is owed and nothing is chased.
- * Everything else — overdue, due soon, due later, and drafts — is still
- * actionable, which is what the default order puts first. A draft is *not*
- * settled: it is unsent work, the earliest thing in the pipeline rather than
- * the last. Note this is deliberately narrower than `isMuted`, which also dims
- * drafts: dimming says "not yet money", sinking would say "no longer money".
+ * Note this is deliberately narrower than `isMuted`, which also dims drafts:
+ * dimming says "not yet money", settled says "no longer money".
  */
 export function isSettled(state: RowState): boolean {
   return state === 'paid' || state === 'void';
+}
+
+/**
+ * The three blocks the STATUS & DUE order sorts into, in order.
+ *
+ * **0 — open.** Overdue, due soon, and due later: every invoice that was sent
+ * and is still owed. These are ordered purely by due date, so `asc` puts the
+ * earliest due date at the very top — which is, by definition, the most overdue
+ * invoice in the set. That identity is the whole point of the label.
+ *
+ * **1 — drafts.** A draft is *not* overdue: it was never sent, so nothing about
+ * it is late, and its `dueDate` is a placeholder on a document nobody has
+ * received. It used to count as unsettled and then order by that raw due date,
+ * which floated a draft above a 319-day-late invoice under a label that says
+ * `Most overdue first`. Unsent work is real work, so it sits below the money
+ * actually owed and above the money no longer owed.
+ *
+ * **2 — settled.** Paid and void. Due date ascending alone floats the *oldest*
+ * invoices to the top, and the oldest invoices are the ones paid off long ago;
+ * the screen that answers "what do I owe attention to" would open on money
+ * already collected.
+ *
+ * The direction the reader picked applies to the due date *inside* a block,
+ * never to the block order — the blocks are what the label promises, and
+ * reversing them would put a settled invoice first under "Furthest due first".
+ */
+export function statusRank(state: RowState): number {
+  if (isSettled(state)) return 2;
+  if (state === 'draft') return 1;
+  return 0;
 }
 
 /** The tone a state is painted in. Only four, because 3a only draws four. */
@@ -265,16 +292,20 @@ export function nextSortState(
 }
 
 /**
- * What the footer calls the current order: `sorted by due date · open first`.
+ * What the footer calls the current order.
  *
- * The STATUS & DUE sentences carry the settled-last clause because the caption
- * is the only thing that explains why a 2024 paid invoice sits below a 2026
- * one. A caption that says only "due date" while the order is not purely due
- * date is worse than no caption — so the clause is on both of that column's
- * directions, which are the two orders that sink settled rows.
+ * The STATUS & DUE sentences carry the block clause because the caption is the
+ * only thing that explains why a draft sits below a due-in-90-days invoice and
+ * a 2024 paid one below both. A caption that says only "due date" while the
+ * order is not purely due date is worse than no caption — so the clause is on
+ * both of that column's directions, which are the two orders that block, and on
+ * no others.
  */
 const SORT_SENTENCE: Record<SortColumnKey, Record<SortDirection, string>> = {
-  status: { asc: 'due date · open first', desc: 'due date, furthest first · open first' },
+  status: {
+    asc: 'due date, most overdue first · drafts and settled last',
+    desc: 'due date, furthest first · drafts and settled last',
+  },
   client: { asc: 'client A–Z', desc: 'client Z–A' },
   invoice: { asc: 'invoice number A–Z', desc: 'invoice number Z–A' },
   issued: { asc: 'issue date, oldest first', desc: 'issue date, newest first' },
@@ -291,18 +322,16 @@ export function sortSentence(sort: SortState): string {
  * same day do not swap places between renders — a list that reorders under the
  * cursor loses the reader's place as surely as a wrong sort does.
  *
- * Ordering by STATUS & DUE sinks settled rows below unsettled ones before
- * comparing due dates at all. Due date ascending alone floats the *oldest*
- * invoices to the top, and the oldest invoices are the ones paid off long ago —
- * the screen that is supposed to answer "what do I owe attention to" would open
- * on money already collected. Within each of the two blocks the due-date
- * ordering is untouched, and the list stays flat: this is one comparator, not a
- * grouping. It rides on both directions of that column because the column *is*
- * the triage column: a settled invoice has no position in a queue of work.
+ * Ordering by STATUS & DUE compares `statusRank` first — open, then drafts,
+ * then settled — and only then the due date. Read that comment for why each
+ * block sits where it does. Within a block the due-date ordering is untouched
+ * and the list stays flat: this is one comparator, not a grouping. The blocks
+ * ride on both directions of that column because the column *is* the triage
+ * column: an unsent draft and a settled invoice have no position in a queue of
+ * work, from either end of it.
  *
- * Every other column is literal. Sinking settled rows behind the reader's back
- * when they asked for "Largest first" would hide the very row they were hunting
- * for.
+ * Every other column is literal. Blocking rows behind the reader's back when
+ * they asked for "Largest first" would hide the very row they were hunting for.
  */
 export function sortRows(rows: readonly ListRow[], sort: SortState): ListRow[] {
   const way = sort.direction === 'asc' ? 1 : -1;
@@ -312,7 +341,7 @@ export function sortRows(rows: readonly ListRow[], sort: SortState): ListRow[] {
     switch (sort.column) {
       case 'status':
         return (
-          Number(isSettled(a.state)) - Number(isSettled(b.state)) ||
+          statusRank(a.state) - statusRank(b.state) ||
           way * left.dueDate.localeCompare(right.dueDate)
         );
       case 'client':

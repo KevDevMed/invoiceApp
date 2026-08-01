@@ -28,6 +28,7 @@ import {
   applyClientFilters,
   buildInvoiceSearchConfig,
   formatRangeValue,
+  isUnfilteredRequest,
   matchesChip,
   openClientIdsOf,
   parseRangeValue,
@@ -36,6 +37,7 @@ import {
   sortInvoices,
   toListRequest,
 } from '../filters';
+import { validateFilterInput } from '../columnMenu';
 
 const NOW = new Date('2026-07-27T12:00:00.000Z');
 /** The same instant as a calendar date, for the chip predicates. */
@@ -391,6 +393,47 @@ describe('openClientIdsOf', () => {
     );
     expect([...ids]).toEqual(['c1']);
   });
+
+  it('answers "no" about a client whose only open invoice was filtered away', () => {
+    // This is the bug behind `isUnfilteredRequest`, expressed as data: hand
+    // `openClientIdsOf` a narrowed set and it reports a client with a live
+    // receivable as having no open balance. The predicate is client-wide; the
+    // set it reads has to be too.
+    const all = [
+      invoice({ id: 'a', clientId: 'c1', status: 'sent', dueDate: '2026-08-01' }),
+      invoice({ id: 'b', clientId: 'c1', status: 'paid' }),
+    ];
+    const paidOnly = all.filter((item) => item.status === 'paid');
+    expect([...openClientIdsOf(all, TODAY)]).toEqual(['c1']);
+    expect([...openClientIdsOf(paidOnly, TODAY)]).toEqual([]);
+  });
+});
+
+describe('isUnfilteredRequest', () => {
+  it('is true for a request that only pages', () => {
+    expect(isUnfilteredRequest(toListRequest([], { limit: 500, offset: 0 }))).toBe(true);
+    expect(isUnfilteredRequest(toListRequest([], { limit: 500, offset: 1000 }))).toBe(true);
+    // A blank search term is not a filter.
+    expect(isUnfilteredRequest(toListRequest([], { limit: 500, offset: 0, search: '   ' }))).toBe(
+      true,
+    );
+  });
+
+  it('is false for every narrowing the backend understands', () => {
+    const narrowing: readonly PowerSearchFilter[][] = [
+      [statusFilter('paid')],
+      [statusListFilter(['paid'])],
+      [clientFilter('c1')],
+      [issuedFilter('2026-01-01', '2026-03-31')],
+    ];
+    for (const filters of narrowing) {
+      const request = toListRequest(filters, { limit: 500, offset: 0, now: NOW });
+      expect(isUnfilteredRequest(request), JSON.stringify(request)).toBe(false);
+    }
+    expect(
+      isUnfilteredRequest(toListRequest([], { limit: 500, offset: 0, search: 'halcyon' })),
+    ).toBe(false);
+  });
 });
 
 describe('matchesChip', () => {
@@ -418,6 +461,20 @@ describe('matchesChip', () => {
   it('matches any of a comma-separated list of clients', () => {
     expect(match('client-any-of', { clientId: 'c2' }, 'Halcyon, Northwind')).toBe(true);
     expect(match('client-any-of', { clientId: 'c2' }, 'Halcyon, Acme')).toBe(false);
+  });
+
+  it('never gets a committed "Is any of…" value that matches everything', () => {
+    // The two halves checked against each other: `", "` used to validate and
+    // then arrive here as an empty token list, which matches every invoice.
+    // Validation refuses it, so no value this predicate can be handed is one
+    // that narrows nothing.
+    for (const raw of ['', ' ', ',', ', ', ',,,']) {
+      expect(validateFilterInput('text-list', { from: raw, to: '' }).isValid, raw).toBe(false);
+    }
+    const committed = validateFilterInput('text-list', { from: ', Acme ,', to: '' });
+    expect(committed.isValid).toBe(true);
+    expect(match('client-any-of', { clientId: 'c1' }, committed.value)).toBe(false);
+    expect(match('client-any-of', { clientId: 'c2' }, committed.value)).toBe(false);
   });
 
   it('reads "has open balance" off the set-level fact, not off the row', () => {
