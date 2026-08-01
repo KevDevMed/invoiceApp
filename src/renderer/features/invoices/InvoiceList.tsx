@@ -108,6 +108,8 @@ import {
   inputFieldLabels,
   isSortChoiceActive,
   menuAnchor,
+  menuFocusSelectors,
+  menuHandlesArrowKeys,
   removeChip,
   retainOpenMenu,
   sortLabelsFor,
@@ -122,7 +124,7 @@ import {
   stepCurrencyPage,
 } from './currencyBreakdown';
 import type { CurrencyBreakdown } from './currencyBreakdown';
-import { buildMoneyTiles } from './moneyTiles';
+import { buildMoneyTiles, tileSlotTakesClicks } from './moneyTiles';
 import type { MoneyTile } from './moneyTiles';
 import {
   DEFAULT_SORT,
@@ -1097,20 +1099,37 @@ const BAR_MIN_SEGMENT = '10px';
  * exactly as the design has it — one tinted surface among four reads as an
  * alarm, four read as decoration.
  *
- * Every tile is a filter shortcut: clicking the label-and-figure region applies
- * the filter it describes, producing the same chip the matching column-menu
- * option would.
+ * Every tile is a filter shortcut: clicking anywhere on the card applies the
+ * filter it describes, producing the same chip the matching column-menu option
+ * would.
  *
- * That region is the control; the *card* is not. The card used to be a
- * `role="button"` containing the Overdue tile's `Chase all N` and the
- * Outstanding tile's two pager buttons. Avoiding a nested native `<button>` did
- * not avoid nested interactive semantics — a control inside a control is
- * flattened or exposed inconsistently depending on the assistive technology, so
- * the reader either cannot reach `Chase all` or cannot tell what it belongs to.
- * The card is now plain layout, the filter region is a real `<button>`, and the
- * Chase button and the pager are its siblings inside the card rather than its
- * descendants. The top-right slot is positioned rather than laid out in a row
- * so the figure keeps the card's full width.
+ * How the whole card can be pressable without any control being inside another:
+ *
+ * The card used to be a `role="button"` wrapping the Overdue tile's
+ * `Chase all N` and the Outstanding tile's two pager buttons. Avoiding a nested
+ * native `<button>` did not avoid nested interactive semantics — a control
+ * inside a control is flattened or exposed inconsistently depending on the
+ * assistive technology, so the reader either cannot reach `Chase all` or cannot
+ * tell what it belongs to. Making only the label-and-figure region the control
+ * fixed the tree and broke the affordance the other way: the header count, the
+ * sub-line and the proportion bar all went inert, and a card that looks like one
+ * target but answers on a third of itself is worse than either.
+ *
+ * So the card is plain `position: relative` layout, the filter region is a real
+ * `<button>` that is deliberately `position: static`, and that button carries a
+ * decorative absolutely-positioned child pinned to `inset: 0` — which therefore
+ * resolves against the *card*, not the button, and stretches one hit area over
+ * the whole tile. One control, the card's full bounds, nothing nested.
+ *
+ * Everything painted after that overlay has to say what it wants:
+ *
+ * - `Chase all N` and the currency pager sit above it (`position: relative`,
+ *   `zIndex: 1`) and take their own clicks.
+ * - The header count and the proportion bar are text and decoration; they let
+ *   the click through (`pointerEvents: 'none'`) so the region under them still
+ *   filters. `tileSlotTakesClicks` is the one place that decision is written.
+ * - The sub-line and the extra-currency line are unpositioned, so the overlay
+ *   already covers them.
  *
  * A tile with more than one currency behind it says how many rather than
  * converting: this app has no exchange rate.
@@ -1161,8 +1180,15 @@ function MoneyTiles({
               position: 'relative',
             }}
           >
-            {/* The one control the tile's own click is: label and figure, the
-                card's full width, so the reader presses what they read. */}
+            {/* The one control the tile's own click is. `position: static` and
+                `transform: none` are both load-bearing: they are what hands the
+                overlay below the *card* as its containing block, which is what
+                makes the hit area the card rather than the button. Astryx's
+                `Button` is `position: relative` with a `transform: scale(1)`
+                press effect, and a transform establishes a containing block for
+                absolutely-positioned descendants even when the element is
+                static — so dropping only the `position` left the overlay
+                exactly the size of the button and the sub-line still inert. */}
             <Button
               label={`Filter by ${tile.label}`}
               variant="ghost"
@@ -1171,6 +1197,8 @@ function MoneyTiles({
                 onApply(tile.predicate);
               }}
               style={{
+                position: 'static',
+                transform: 'none',
                 justifyContent: 'flex-start',
                 textAlign: 'start',
                 paddingInline: 0,
@@ -1198,9 +1226,20 @@ function MoneyTiles({
                   {tile.figure}
                 </Text>
               </VStack>
+              {/* The stretched hit area. Decorative and inside the button, so
+                  it adds nothing to the tree and nothing to the name. */}
+              <span
+                aria-hidden="true"
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  borderRadius: 'var(--radius-container)',
+                }}
+              />
             </Button>
 
-            {/* A sibling of that control, never a descendant of it. */}
+            {/* A sibling of that control, never a descendant of it. It is drawn
+                over the hit area, so it either takes the click or waives it. */}
             <VStack
               gap={0}
               align="end"
@@ -1208,6 +1247,8 @@ function MoneyTiles({
                 position: 'absolute',
                 insetBlockStart: 'var(--spacing-3)',
                 insetInlineEnd: 'var(--spacing-4)',
+                zIndex: 1,
+                pointerEvents: tileSlotTakesClicks(tile.key) ? undefined : 'none',
               }}
             >
               {tile.key === 'overdue' ? (
@@ -1257,6 +1298,11 @@ function MoneyTiles({
  * ./currencyBreakdown). The pager prints each currency's own total beside its
  * code. It sits beside the tile's filter button rather than inside it, so
  * paging cannot fire click-to-filter and there is nothing to stop propagating.
+ *
+ * The bar and the pager sit on opposite sides of the tile's stretched hit area
+ * (see `MoneyTiles`): the bar is decoration and waives its clicks so the region
+ * still filters, the pager is a control and is lifted above the overlay so its
+ * two arrows answer first.
  */
 function CurrencyBar({
   breakdown,
@@ -1274,7 +1320,7 @@ function CurrencyBar({
         gap={0.5}
         align="stretch"
         aria-hidden="true"
-        style={{ blockSize: BAR_HEIGHT }}
+        style={{ blockSize: BAR_HEIGHT, pointerEvents: 'none' }}
       >
         {breakdown.segments.map((segment) => (
           <VStack
@@ -1298,6 +1344,7 @@ function CurrencyBar({
         align="center"
         role="group"
         aria-label="Outstanding by currency"
+        style={{ position: 'relative', zIndex: 1 }}
       >
         <Button
           label="Previous currencies"
@@ -1767,10 +1814,19 @@ function ColumnMenu({
   const [pending, setPending] = useState<ListFilterOption | null>(null);
   const [draft, setDraft] = useState<FilterInputDraft>(EMPTY_DRAFT);
 
-  // Opening a menu with the mouse should still land the keyboard inside it.
+  // Opening a menu with the mouse should still land the keyboard inside it —
+  // and the value step has to land it in the *field*, which is the only thing
+  // on that page there is anything to do with. `button` alone put it on Cancel.
   useEffect(() => {
-    const first = surfaceRef.current?.querySelector('button');
-    first?.focus();
+    const surface = surfaceRef.current;
+    if (surface === null) return;
+    for (const selector of menuFocusSelectors(pending !== null)) {
+      const target = surface.querySelector<HTMLElement>(selector);
+      if (target !== null) {
+        target.focus();
+        return;
+      }
+    }
   }, [pending]);
 
   const items = (): HTMLButtonElement[] =>
@@ -1784,6 +1840,8 @@ function ColumnMenu({
       return;
     }
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    // Up/Down belong to the caret once a field has the focus.
+    if (!menuHandlesArrowKeys(pending !== null)) return;
     const all = items();
     const here = all.indexOf(document.activeElement as HTMLButtonElement);
     if (all.length === 0) return;

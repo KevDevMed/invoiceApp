@@ -213,6 +213,38 @@ describe('segmentShowing', () => {
       }
     }
   });
+
+  it('lands on the tab the state is ABOUT, not the first one that tolerates it', () => {
+    // The regression: `LIST_SEGMENTS.find(matchesSegment)` reached the
+    // universal `all` before it ever reached `overdue`, so Chase from Sent,
+    // Drafts or Paid selected the right 17 rows under the wrong tab — `All`
+    // pressed, `Overdue` still reporting `aria-pressed="false"`.
+    for (const segment of ['sent', 'drafts', 'paid'] as const) {
+      expect(segmentShowing('overdue', segment), segment).toBe('overdue');
+    }
+    expect(segmentShowing('draft', 'paid')).toBe('drafts');
+    expect(segmentShowing('paid', 'drafts')).toBe('paid');
+    expect(segmentShowing('due-soon', 'paid')).toBe('sent');
+    expect(segmentShowing('later', 'overdue')).toBe('sent');
+  });
+
+  it('sends `void` to All, which is the only tab that shows it', () => {
+    // `void` has no tab of its own by design. `all` is the answer, not a
+    // fallback — and it is the only segment that matches, so the invariant
+    // above cannot distinguish the two readings.
+    for (const { key } of LIST_SEGMENTS) {
+      expect(segmentShowing('void', key), key).toBe('all');
+    }
+  });
+
+  it('never moves a reader off a tab that already shows the state', () => {
+    for (const state of ROW_STATES) {
+      for (const { key } of LIST_SEGMENTS) {
+        if (!matchesSegment(state, key)) continue;
+        expect(segmentShowing(state, key), `${state} from ${key}`).toBe(key);
+      }
+    }
+  });
 });
 
 describe('adjacentRowId / rowPosition', () => {

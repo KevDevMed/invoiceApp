@@ -60,6 +60,21 @@ export interface MoneyTile {
   readonly predicate: ColumnFilterPredicate;
 }
 
+/**
+ * Whether a tile's top-right slot is something to press.
+ *
+ * The whole card is click-to-filter, which the view implements as one stretched
+ * hit area belonging to the tile's filter button. Anything drawn *after* that
+ * overlay paints over it, so each such region has to declare whether it wants
+ * the click or wants to let it through. The overdue tile's slot holds
+ * `Chase all N` and takes its own clicks; every other tile's slot is a count,
+ * which is text, and text that swallowed the click would leave a dead patch in
+ * the middle of a card the reader was told is pressable.
+ */
+export function tileSlotTakesClicks(key: MoneyTileKey): boolean {
+  return key === 'overdue';
+}
+
 /** The empty figure. An em dash, not `$0` — nothing is not zero of something. */
 const NO_FIGURE = '—';
 

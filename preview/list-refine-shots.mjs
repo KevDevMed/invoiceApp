@@ -101,6 +101,101 @@ check(
   true,
 );
 
+// --- the whole card is the hit area, and the controls on it still win ------
+// Dropping `role="button"` from the card fixed the nested-control defect and
+// left the header count, the sub-line and the proportion bar inert — a card
+// that looks like one target and answers on a third of itself. The card now
+// carries one stretched hit area belonging to its filter button; the Chase
+// button and the pager sit above it. `elementFromPoint` is the direct test of
+// that z-order, and a real click is the test of what it does.
+
+/** Which button, if any, would actually receive a click at this element's centre. */
+const topmostButtonAt = async (locator) => {
+  const box = await locator.boundingBox();
+  if (box === null) return 'no box';
+  return page.evaluate(
+    ({ x, y }) => {
+      const el = document.elementFromPoint(x, y);
+      if (el === null) return 'nothing';
+      const owner = el.closest('button');
+      if (owner === null) return `${el.tagName} (no button)`;
+      return owner.getAttribute('aria-label') ?? owner.textContent?.trim() ?? '';
+    },
+    { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+  );
+};
+
+/**
+ * A direct child of a tile card, by position. The card's children are, in
+ * order: the filter button (which carries the overlay), the top-right slot,
+ * then the sub-line — or, on Outstanding, the currency bar in the sub-line's
+ * place.
+ */
+const cardRegion = (label, index) => tileCard(label).locator('> *').nth(index);
+
+const clearAllIfPresent = async () => {
+  const clearAll = page.getByRole('button', { name: 'Clear all' });
+  if ((await clearAll.count()) > 0) await clearAll.click();
+};
+
+// The regions that were inert. Each must hand its click to the tile's filter.
+const INERT_REGIONS = [
+  ['Drafts header count', 'Drafts', 1, 'Filter by Drafts', 'STATUS: Drafts'],
+  ['Drafts sub-line', 'Drafts', 2, 'Filter by Drafts', 'STATUS: Drafts'],
+  ['Due in 7 days sub-line', 'Due in 7 days', 2, 'Filter by Due in 7 days', 'STATUS: Due in 7 days'],
+];
+for (const [name, label, index, owner, chipText] of INERT_REGIONS) {
+  await clearAllIfPresent();
+  const region = cardRegion(label, index);
+  console.log(`${name}: "${(await region.innerText()).replace(/\s+/g, ' ').trim()}"`);
+  check(`${name} is covered by the tile's filter button`, await topmostButtonAt(region), owner);
+  const box = await region.boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.getByRole('group', { name: 'Active column filters' }).waitFor({ timeout: 5000 });
+  check(
+    `clicking ${name} applies the tile's filter`,
+    (await page.getByRole('group', { name: 'Active column filters' }).innerText()).includes(chipText),
+    true,
+  );
+  await clearAllIfPresent();
+}
+
+// The Outstanding tile's proportion bar sits *inside* the currency bar block,
+// above the pager. It is decoration and must pass its click through too.
+const proportionBar = cardRegion('Outstanding', 2).locator('> *').nth(0);
+check(
+  'the proportion bar is covered by the Outstanding filter button',
+  await topmostButtonAt(proportionBar),
+  'Filter by Outstanding',
+);
+{
+  const box = await proportionBar.boundingBox();
+  console.log(`proportion bar box: ${JSON.stringify(box)}`);
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.getByRole('group', { name: 'Active column filters' }).waitFor({ timeout: 5000 });
+  check(
+    'clicking the proportion bar applies the Outstanding filter',
+    (await page.getByRole('group', { name: 'Active column filters' }).innerText()).includes('STATUS: Open · unpaid'),
+    true,
+  );
+  await clearAllIfPresent();
+}
+await shot(page, '16-whole-card-hit-area');
+
+// And the three real controls on those cards are NOT covered: they are above
+// the overlay and receive their own clicks first.
+check('Chase all N receives its own clicks', await topmostButtonAt(chase), await chase.innerText());
+check(
+  'the back arrow receives its own clicks',
+  await topmostButtonAt(page.getByRole('button', { name: 'Previous currencies' })),
+  'Previous currencies',
+);
+check(
+  'the forward arrow receives its own clicks',
+  await topmostButtonAt(page.getByRole('button', { name: 'More currencies' })),
+  'More currencies',
+);
+
 const overdueTile = tileCard('Overdue');
 const overdueLines = (await overdueTile.innerText()).split('\n').map((line) => line.trim());
 console.log(`overdue tile:\n${overdueLines.map((line) => `    ${line}`).join('\n')}`);
@@ -350,6 +445,40 @@ await header('TOTAL').click();
 await page.getByRole('menuitem', { name: 'Between…' }).click();
 const from = page.getByRole('textbox', { name: 'From' });
 await from.waitFor({ timeout: 5000 });
+
+// The value step focuses its first *field*. It used to query the surface for
+// `button`; the fields render above the footer and are not buttons, so Cancel
+// took the focus and everything typed on that step went nowhere.
+const activeOnValueStep = async () =>
+  page.evaluate(() => {
+    const el = document.activeElement;
+    return {
+      tag: el?.tagName ?? 'none',
+      name: el?.getAttribute('aria-label') ?? el?.getAttribute('placeholder') ?? el?.textContent?.trim() ?? '',
+    };
+  });
+console.log(`focus on the Between… step: ${JSON.stringify(await activeOnValueStep())}`);
+check('the value step focuses an input, not a button', (await activeOnValueStep()).tag, 'INPUT');
+check('and it is inside the menu', await page.evaluate(() => document.activeElement?.closest('[role="menu"]') !== null), true);
+// Typing straight away has to land in the field, which is the whole point.
+await page.keyboard.type('4321');
+check('typing goes into the first field', await from.inputValue(), '4321');
+// Up/Down belong to the caret here, not to the menu's row-walking.
+await page.keyboard.press('ArrowUp');
+check('ArrowUp does not jump the focus to a button', (await activeOnValueStep()).tag, 'INPUT');
+await from.fill('');
+// Escape still closes the menu and hands focus back to the header that owns it.
+await page.keyboard.press('Escape');
+await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+check(
+  'Escape from the value step returns focus to the header',
+  await page.evaluate(() => document.activeElement?.textContent?.trim() ?? ''),
+  (await header('TOTAL').innerText()).trim(),
+);
+
+await header('TOTAL').click();
+await page.getByRole('menuitem', { name: 'Between…' }).click();
+await from.waitFor({ timeout: 5000 });
 check('Apply is refused until the range is valid', await page.getByRole('button', { name: 'Apply' }).isDisabled(), true);
 await from.fill('5000');
 await page.getByRole('textbox', { name: 'To' }).fill('1000');
@@ -412,6 +541,10 @@ await header('CLIENT').click();
 await page.getByRole('menuitem', { name: 'Is any of…' }).click();
 const anyOf = page.getByRole('textbox', { name: 'Values, comma separated' });
 await anyOf.waitFor({ timeout: 5000 });
+// The single-field value step focuses its field too, not Cancel.
+check('Is any of… focuses its field', await page.evaluate(() => document.activeElement?.tagName ?? 'none'), 'INPUT');
+await page.keyboard.type('Halcyon');
+check('and typing lands in it', await anyOf.inputValue(), 'Halcyon');
 await anyOf.fill(', ');
 check('", " is refused rather than matching everything', await page.getByRole('button', { name: 'Apply' }).isDisabled(), true);
 await anyOf.fill('Halcyon, Northwind');
@@ -437,6 +570,39 @@ check('a different token set is a second chip', await chipBar.getByRole('button'
 await shot(page, '14-any-of-dedupe');
 await page.getByRole('button', { name: 'Clear all' }).click();
 check('cleared', await chipBar.count(), 0);
+
+// A repeated token is the same set. `normaliseTokenList` sorted and lowercased
+// but kept duplicates, so `Halcyon` keyed `client-any-of::halcyon` and
+// `Halcyon, Halcyon` keyed `client-any-of::halcyon,halcyon` — two chips, while
+// `matchesChip` narrows on the token set and treated them as one predicate.
+// Removing either left the other still filtering.
+const applyAnyOf = async (value) => {
+  await header('CLIENT').click();
+  await page.getByRole('menuitem', { name: 'Is any of…' }).click();
+  await page.getByRole('textbox', { name: 'Values, comma separated' }).waitFor({ timeout: 5000 });
+  await page.getByRole('textbox', { name: 'Values, comma separated' }).fill(value);
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: 5000 });
+};
+// `Northwind`, not `Halcyon`: the checks above only need a name to key a chip
+// on, but this one has to count rows, and `client-any-of` is a substring match
+// against a real client name.
+await applyAnyOf('Northwind');
+await chipBar.waitFor({ timeout: 5000 });
+const rowsForOneToken = await page.locator('[role="link"]').count();
+console.log(`rows for the Northwind token list: ${rowsForOneToken}`);
+assert('the single-token list really narrows', rowsForOneToken > 0, String(rowsForOneToken));
+await applyAnyOf('Northwind, Northwind');
+console.log(`chips after the repeated token: ${(await chipBar.innerText()).replace(/\s+/g, ' ').trim()}`);
+check('a repeated token adds no second chip', await chipBar.getByRole('button', { name: /^Remove/ }).count(), 1);
+check('and it narrows to the same rows', await page.locator('[role="link"]').count(), rowsForOneToken);
+await shot(page, '17-repeated-token-dedupe');
+// One remove really removes the filter, rather than leaving a twin behind.
+await chipBar.getByRole('button', { name: /^Remove/ }).first().click();
+check('one remove empties the bar', await chipBar.count(), 0);
+const rowsUnfiltered = await page.locator('[role="link"]').count();
+console.log(`rows once the chip is gone: ${rowsUnfiltered}`);
+assert('and the filter is really gone', rowsUnfiltered > rowsForOneToken, `${rowsForOneToken} -> ${rowsUnfiltered}`);
 
 // --- a menu does not outlive its header ----------------------------------
 const searchBox = page.getByRole('textbox', { name: 'Search invoices' });
@@ -483,6 +649,16 @@ for (const segment of ['Paid', 'Drafts', 'Sent']) {
   await chase.click();
   await chipBar.waitFor({ timeout: 5000 });
   check(`Chase from ${segment} applies the overdue chip`, (await chipBar.innerText()).includes('STATUS: Overdue only'), true);
+  // And lands on the tab the action is ABOUT. `LIST_SEGMENTS.find(matches)`
+  // reached the universal `All` first, so the rows and the chip were right
+  // while `Overdue` still reported `aria-pressed="false"`.
+  check(`Chase from ${segment} lands on Overdue`, await tab('Overdue').getAttribute('aria-pressed'), 'true');
+  check(`and ${segment} is no longer pressed`, await tab(segment).getAttribute('aria-pressed'), 'false');
+  const pressed = await page
+    .getByRole('group', { name: 'Invoice status' })
+    .locator('[aria-pressed="true"]')
+    .evaluateAll((els) => els.map((el) => el.textContent?.trim().split(/\s+/)[0] ?? ''));
+  check(`exactly one tab is pressed after Chase from ${segment}`, pressed, ['Overdue']);
   const rowsNow = await page.locator('[role="link"]').count();
   const labelsNow = await page.locator('[role="link"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('aria-label') ?? ''));
   console.log(`Chase from ${segment}: ${rowsNow} rows visible`);

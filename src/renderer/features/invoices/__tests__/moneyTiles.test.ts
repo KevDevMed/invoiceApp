@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { Invoice } from '../../../../shared/types';
 import { COLUMNS } from '../listColumns';
-import { buildMoneyTiles } from '../moneyTiles';
+import { buildMoneyTiles, tileSlotTakesClicks } from '../moneyTiles';
 import type { MoneyTile, MoneyTileKey } from '../moneyTiles';
 
 const TODAY = '2026-07-29';
@@ -232,6 +232,22 @@ describe('buildMoneyTiles', () => {
       'status-due-soon',
       'status-draft',
     ]);
+  });
+
+  it('gives the click to the Chase slot and lets every other slot pass it on', () => {
+    // The whole card is one hit area. The top-right slot paints over it, so it
+    // has to declare itself: Overdue's slot is `Chase all N` and answers, the
+    // rest are counts and must not swallow the click — a card advertised as
+    // pressable with a dead patch in its corner is the defect this replaced.
+    expect(tileSlotTakesClicks('overdue')).toBe(true);
+    for (const key of ['outstanding', 'due-soon', 'drafts'] as const) {
+      expect(tileSlotTakesClicks(key), key).toBe(false);
+    }
+  });
+
+  it('marks exactly one tile slot as a control', () => {
+    const takers = buildMoneyTiles([], TODAY).filter((tile) => tileSlotTakesClicks(tile.key));
+    expect(takers.map((tile) => tile.key)).toEqual(['overdue']);
   });
 
   it('names every tile predicate as a real option on the STATUS & DUE menu', () => {

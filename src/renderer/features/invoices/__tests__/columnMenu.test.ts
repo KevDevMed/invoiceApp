@@ -16,6 +16,8 @@ import {
   isSortActive,
   isSortChoiceActive,
   menuAnchor,
+  menuFocusSelectors,
+  menuHandlesArrowKeys,
   normaliseTokenList,
   removeChip,
   retainOpenMenu,
@@ -480,6 +482,28 @@ describe('normaliseTokenList and text-list chip identity', () => {
     );
   });
 
+  it('drops repeats, because a set has no counts', () => {
+    // The regression: `Halcyon` normalised to `halcyon` and `Halcyon, Halcyon`
+    // to `halcyon,halcyon`, so the two were different chip keys — while
+    // `matchesChip` narrows on the token set and treated them as one
+    // predicate. Two chips, one filter, and removing either left the other
+    // still narrowing.
+    expect(normaliseTokenList('Halcyon, Halcyon')).toBe('halcyon');
+    expect(normaliseTokenList('Halcyon, halcyon , HALCYON')).toBe('halcyon');
+    expect(normaliseTokenList('Northwind, Halcyon, northwind')).toBe('halcyon,northwind');
+    expect(chipKey(buildChip('client-any-of', 'Halcyon, Halcyon'))).toBe(
+      chipKey(buildChip('client-any-of', 'Halcyon')),
+    );
+  });
+
+  it('refuses to add a repeat-spelled chip a second time, and removes it whole', () => {
+    const first = addChip([], buildChip('client-any-of', 'Halcyon'));
+    expect(addChip(first, buildChip('client-any-of', 'Halcyon, Halcyon'))).toHaveLength(1);
+    const other = addChip([], buildChip('client-any-of', 'Halcyon, Halcyon'));
+    expect(other).toHaveLength(1);
+    expect(removeChip(other, chipKey(buildChip('client-any-of', 'Halcyon')))).toEqual([]);
+  });
+
   it('keeps a genuinely different token set apart', () => {
     const first = addChip([], buildChip('client-any-of', 'Halcyon, Northwind'));
     expect(addChip(first, buildChip('client-any-of', 'Halcyon'))).toHaveLength(2);
@@ -498,6 +522,32 @@ describe('normaliseTokenList and text-list chip identity', () => {
     expect(removeChip(chips, chipKey(buildChip('client-any-of', 'northwind, halcyon')))).toEqual(
       [],
     );
+  });
+});
+
+describe('menuFocusSelectors / menuHandlesArrowKeys', () => {
+  it('asks for the field first on the value step', () => {
+    // The regression: the menu focused `surface.querySelector("button")` on
+    // every body change. The two fields render above the footer but are not
+    // buttons, so choosing `Between…` or `Is any of…` by keyboard put focus on
+    // `Cancel` and everything the reader typed went nowhere.
+    expect(menuFocusSelectors(true)[0]).toBe('input, textarea');
+    expect(menuFocusSelectors(true)).toContain('button');
+  });
+
+  it('still lands on the first row of the list step', () => {
+    expect([...menuFocusSelectors(false)]).toEqual(['button']);
+  });
+
+  it('keeps a button as the last resort, so focus never leaves the surface', () => {
+    // An input step that somehow drew no field must still land the keyboard
+    // inside the menu rather than at the top of the document.
+    expect(menuFocusSelectors(true).at(-1)).toBe('button');
+  });
+
+  it('hands Up/Down to the caret once a field is showing', () => {
+    expect(menuHandlesArrowKeys(false)).toBe(true);
+    expect(menuHandlesArrowKeys(true)).toBe(false);
   });
 });
 

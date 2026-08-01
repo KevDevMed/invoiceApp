@@ -275,6 +275,25 @@ export function matchesSegment(state: RowState, segment: ListSegment): boolean {
 }
 
 /**
+ * The tab that is *about* a state, as opposed to one that merely tolerates it.
+ *
+ * `matchesSegment` is a containment test and `all` contains everything, so
+ * searching `LIST_SEGMENTS` for the first segment that matches a state always
+ * answers `all` — which is true and useless. This is the other relation: the
+ * one segment whose subject is this state. `void` has no tab of its own and is
+ * only reachable through `all` and the filter vocabulary, so `all` is its
+ * honest answer rather than a fallback.
+ */
+const SEGMENT_ABOUT: Record<RowState, ListSegment> = {
+  overdue: 'overdue',
+  'due-soon': 'sent',
+  later: 'sent',
+  draft: 'drafts',
+  paid: 'paid',
+  void: 'all',
+};
+
+/**
  * The tab an action targeting `state` has to land on, given where the reader is.
  *
  * `Chase all N` selects the overdue invoices and applies the Overdue chip, but
@@ -284,11 +303,16 @@ export function matchesSegment(state: RowState, segment: ListSegment): boolean {
  * nothing at all with no error and no change on screen. A segment that already
  * shows the state is left exactly as it is, so pressing Chase from `All` does
  * not yank the reader onto a narrower tab for no reason.
+ *
+ * The move itself is by *identity*, never by predicate search: `LIST_SEGMENTS`
+ * leads with the universal `all`, so `find(matchesSegment)` reached `all` first
+ * and Chase from `Sent` landed on `All` — the right 17 rows and the right chip
+ * under a tab that was not the one the action is about, with `Overdue` still
+ * reporting `aria-pressed="false"`.
  */
 export function segmentShowing(state: RowState, segment: ListSegment): ListSegment {
   if (matchesSegment(state, segment)) return segment;
-  const target = LIST_SEGMENTS.find((item) => matchesSegment(state, item.key));
-  return target?.key ?? 'all';
+  return SEGMENT_ABOUT[state];
 }
 
 /**

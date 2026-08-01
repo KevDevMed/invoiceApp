@@ -189,20 +189,25 @@ export function chipLabel(chip: FilterChip): string {
 
 /**
  * A comma-separated value reduced to its set: split, trimmed, empties dropped,
- * folded to lower case, sorted, rejoined.
+ * folded to lower case, **deduplicated**, sorted, rejoined.
  *
  * This is what a `text-list` chip *means*, as opposed to what the reader typed.
  * `Halcyon, Northwind` and `northwind,Halcyon` are one predicate over one set
  * of names and must therefore be one chip; the order the two names were typed
  * in is not part of the filter.
+ *
+ * Nor is the *multiplicity*. Without the dedupe this said `halcyon` for one
+ * mention and `halcyon,halcyon` for two, so `Halcyon` and `Halcyon, Halcyon`
+ * were two chips — and `matchesChip` narrows on the token set, so both narrowed
+ * to the same rows and removing either left the other still filtering, with the
+ * bar showing a chip the reader had already dismissed. A set has no counts.
  */
 export function normaliseTokenList(value: string): string {
-  return value
+  const tokens = value
     .split(',')
     .map((token) => token.trim().toLowerCase())
-    .filter((token) => token !== '')
-    .sort()
-    .join(',');
+    .filter((token) => token !== '');
+  return [...new Set(tokens)].sort().join(',');
 }
 
 /**
@@ -279,6 +284,32 @@ export interface FilterInputResult {
 }
 
 export const EMPTY_DRAFT: FilterInputDraft = { from: '', to: '' };
+
+/**
+ * What the menu focuses when its body changes, most wanted first — the caller
+ * takes the first selector that matches something inside the surface.
+ *
+ * The list step is all buttons, so the first button is the first row. The value
+ * step is the whole reason there is a second page, and it opened with focus on
+ * `Cancel`: the surface was queried for `button`, and the two fields render
+ * above the footer but are not buttons, so choosing `Between…` or `Is any of…`
+ * with the keyboard left the reader typing into nothing. The field comes first
+ * there, and the button stays as the fallback for an input step that somehow
+ * drew none.
+ */
+export function menuFocusSelectors(hasValueStep: boolean): readonly string[] {
+  return hasValueStep ? ['input, textarea', 'button'] : ['button'];
+}
+
+/**
+ * Whether the menu's own Up/Down row-walking applies. It does not on the value
+ * step: focus is in a text field there, and the arrow keys belong to the
+ * caret — stealing them to cycle Cancel/Apply would make the field
+ * unnavigable the moment it is focused, which is what this round just fixed.
+ */
+export function menuHandlesArrowKeys(hasValueStep: boolean): boolean {
+  return !hasValueStep;
+}
 
 /** How many fields the input step draws, and what it calls them. */
 export function inputFieldLabels(input: ColumnFilterInput): readonly string[] {
