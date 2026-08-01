@@ -273,26 +273,118 @@ describe('sortRows', () => {
   });
 });
 
+describe('sortRows — the default sinks settled invoices', () => {
+  // Today is 2026-07-29. The settled pair is *older* than everything else, so
+  // a pure due-date ascending sort would open the screen on collected money.
+  const mixed = buildListRows({
+    invoices: [
+      makeInvoice({
+        id: 'paid-2024',
+        number: 'INV-0001',
+        status: 'paid',
+        dueDate: '2024-01-05',
+        paidAt: '2024-01-04T09:00:00.000Z',
+      }),
+      makeInvoice({ id: 'void-2024', number: 'INV-0002', status: 'void', dueDate: '2024-02-05' }),
+      makeInvoice({
+        id: 'paid-2025',
+        number: 'INV-0003',
+        status: 'paid',
+        dueDate: '2025-03-05',
+        paidAt: '2025-03-04T09:00:00.000Z',
+      }),
+      makeInvoice({ id: 'overdue', number: 'INV-0004', status: 'sent', dueDate: '2026-05-20' }),
+      makeInvoice({ id: 'overdue-2', number: 'INV-0005', status: 'sent', dueDate: '2026-07-01' }),
+      makeInvoice({ id: 'due-soon', number: 'INV-0006', status: 'sent', dueDate: '2026-08-02' }),
+      makeInvoice({ id: 'draft', number: 'INV-0007', status: 'draft', dueDate: '2026-08-20' }),
+      makeInvoice({ id: 'later', number: 'INV-0008', status: 'sent', dueDate: '2026-12-01' }),
+    ],
+    clientNames: NAMES,
+    today: TODAY,
+  });
+
+  const order = (key: SortKey): string[] => sortRows(mixed, key).map((row) => row.id);
+
+  it('sorts a paid invoice below an overdue one even though it is far older', () => {
+    const ids = order('due-asc');
+    expect(ids.indexOf('overdue')).toBeLessThan(ids.indexOf('paid-2024'));
+    expect(ids[0]).toBe('overdue');
+  });
+
+  it('puts a void invoice in the settled block, not the unsettled one', () => {
+    const ids = order('due-asc');
+    expect(ids.indexOf('void-2024')).toBeGreaterThan(ids.indexOf('later'));
+  });
+
+  it('keeps drafts in the unsettled block — unsent work is still in play', () => {
+    const ids = order('due-asc');
+    expect(ids.indexOf('draft')).toBeLessThan(ids.indexOf('paid-2024'));
+  });
+
+  it('still runs due date ascending inside the unsettled block', () => {
+    expect(order('due-asc').slice(0, 5)).toEqual([
+      'overdue',
+      'overdue-2',
+      'due-soon',
+      'draft',
+      'later',
+    ]);
+  });
+
+  it('still runs due date ascending inside the settled block', () => {
+    expect(order('due-asc').slice(5)).toEqual(['paid-2024', 'void-2024', 'paid-2025']);
+  });
+
+  it('leaves an explicitly chosen sort literal — settled rows are not sunk', () => {
+    // Largest first: every invoice is 100_000 cents, so the tie-break on the
+    // number decides, and the settled rows keep their natural places.
+    expect(order('total-desc')).toEqual([
+      'paid-2024',
+      'void-2024',
+      'paid-2025',
+      'overdue',
+      'overdue-2',
+      'due-soon',
+      'draft',
+      'later',
+    ]);
+    // Newest issued: same issue date throughout, so again the number decides.
+    expect(order('issued-desc')[0]).toBe('paid-2024');
+    // And due date descending is a choice too, so it stays literal.
+    expect(order('due-desc')[0]).toBe('later');
+    expect(order('due-desc').at(-1)).toBe('paid-2024');
+  });
+
+  it('orders an all-settled list by due date rather than emptying or reversing it', () => {
+    const settled = mixed.filter((row) => row.state === 'paid' || row.state === 'void');
+    expect(sortRows(settled, 'due-asc').map((row) => row.id)).toEqual([
+      'paid-2024',
+      'void-2024',
+      'paid-2025',
+    ]);
+  });
+});
+
 describe('footerSummary', () => {
   it('reads as the design has it', () => {
     expect(footerSummary(66, 1, 10, 'due-asc')).toBe(
-      'Showing 1-10 of 66 · sorted by due date',
+      'Showing 1-10 of 66 · sorted by due date · open first',
     );
   });
 
   it('clamps a page past the end rather than printing an impossible range', () => {
     expect(footerSummary(66, 99, 10, 'due-asc')).toBe(
-      'Showing 61-66 of 66 · sorted by due date',
+      'Showing 61-66 of 66 · sorted by due date · open first',
     );
   });
 
   it('says so when nothing matches', () => {
-    expect(footerSummary(0, 1, 25, 'due-asc')).toBe('Showing 0 of 0 · sorted by due date');
+    expect(footerSummary(0, 1, 25, 'due-asc')).toBe('Showing 0 of 0 · sorted by due date · open first');
   });
 
   it('names each order in words', () => {
     const sentences: Record<SortKey, string> = {
-      'due-asc': 'due date',
+      'due-asc': 'due date · open first',
       'due-desc': 'due date, latest first',
       'total-desc': 'total, largest first',
       'client-asc': 'client',

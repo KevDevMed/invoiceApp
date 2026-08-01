@@ -70,6 +70,20 @@ export function monogram(name: string): string {
   return initials.toLocaleUpperCase();
 }
 
+/**
+ * Whether the money is out of play.
+ *
+ * A paid or void invoice is settled: nothing is owed and nothing is chased.
+ * Everything else — overdue, due soon, due later, and drafts — is still
+ * actionable, which is what the default order puts first. A draft is *not*
+ * settled: it is unsent work, the earliest thing in the pipeline rather than
+ * the last. Note this is deliberately narrower than `isMuted`, which also dims
+ * drafts: dimming says "not yet money", sinking would say "no longer money".
+ */
+export function isSettled(state: RowState): boolean {
+  return state === 'paid' || state === 'void';
+}
+
 /** The tone a state is painted in. Only four, because 3a only draws four. */
 export function toneOf(state: RowState): RowTone {
   switch (state) {
@@ -195,9 +209,16 @@ export const SORT_OPTIONS: readonly { readonly key: SortKey; readonly label: str
 
 export const DEFAULT_SORT: SortKey = 'due-asc';
 
-/** What the footer calls the current order: `sorted by due date`. */
+/**
+ * What the footer calls the current order: `sorted by due date · open first`.
+ *
+ * The default's sentence carries the settled-last clause because the caption is
+ * the only thing that explains why a 2024 paid invoice sits below a 2026 one.
+ * A caption that says only "due date" while the order is not purely due date
+ * is worse than no caption.
+ */
 const SORT_SENTENCE: Record<SortKey, string> = {
-  'due-asc': 'due date',
+  'due-asc': 'due date · open first',
   'due-desc': 'due date, latest first',
   'total-desc': 'total, largest first',
   'client-asc': 'client',
@@ -208,6 +229,17 @@ const SORT_SENTENCE: Record<SortKey, string> = {
  * A stable sort. Ties fall back to the invoice number so two invoices due the
  * same day do not swap places between renders — a list that reorders under the
  * cursor loses the reader's place as surely as a wrong sort does.
+ *
+ * The default order sinks settled rows below unsettled ones before comparing
+ * due dates at all. Due date ascending alone floats the *oldest* invoices to
+ * the top, and the oldest invoices are the ones paid off long ago — the screen
+ * that is supposed to answer "what do I owe attention to" would open on money
+ * already collected. Within each of the two blocks the due-date ordering is
+ * untouched, and the list stays flat: this is one comparator, not a grouping.
+ *
+ * It applies to the default only. An order the reader picked out of the sort
+ * control is literal — sinking settled rows behind their back when they asked
+ * for "Largest first" would hide the very row they were hunting for.
  */
 export function sortRows(rows: readonly ListRow[], key: SortKey): ListRow[] {
   const compare = (a: ListRow, b: ListRow): number => {
@@ -215,7 +247,10 @@ export function sortRows(rows: readonly ListRow[], key: SortKey): ListRow[] {
     const right = b.invoice;
     switch (key) {
       case 'due-asc':
-        return left.dueDate.localeCompare(right.dueDate);
+        return (
+          Number(isSettled(a.state)) - Number(isSettled(b.state)) ||
+          left.dueDate.localeCompare(right.dueDate)
+        );
       case 'due-desc':
         return right.dueDate.localeCompare(left.dueDate);
       case 'total-desc':
