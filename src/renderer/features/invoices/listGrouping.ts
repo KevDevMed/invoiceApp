@@ -1,17 +1,22 @@
 /**
- * The invoice list as a triage queue: what state a row is in, when it is due in
- * words, which group it belongs to, and what each group adds up to.
+ * What state an invoice is in, which status tab it answers to, and what a set
+ * of invoices adds up to.
  *
  * Pure module — no React, no `window.api`. The vitest project is
- * `environment: 'node'`, so every decision the cockpit makes about ordering,
- * grouping and relative time has to live here to be testable at all.
+ * `environment: 'node'`, so every decision the list makes about state, segments
+ * and money has to live here to be testable at all.
+ *
+ * The presentation built on top of these lives next door: ./listRows turns a
+ * state into the row's merged status-and-due phrase, ./moneyTiles turns these
+ * sums into the four tiles, and ./listColumns decides which columns survive the
+ * available width. This module is the vocabulary all three share.
  *
  * Two rules the rest of the feature depends on:
  *
  * 1. **Relative timing is the payload.** A status pill says `overdue`; a row
- *    has to say `34 days late`, because the number is what decides whether you
- *    nudge, call, or write off. Every state therefore carries a sentence, not a
- *    label.
+ *    has to say `Overdue 34 days`, because the number is what decides whether
+ *    you nudge, call, or write off. Every state therefore earns a sentence in
+ *    ./listRows, not a label.
  * 2. **Sums are per currency.** This app stores one currency per invoice and
  *    holds no exchange rate anywhere (`src/shared/types.ts` has `currency` on
  *    the row and nothing that converts it). Adding GBP cents to USD cents would
@@ -24,56 +29,7 @@
  */
 
 import type { Invoice } from '../../../shared/types';
-import { calendarDateOf, daysBetween, daysPastDue } from './detail';
-import { money } from './format';
-
-/**
- * Width of the list column. Structural: it has to hold a client name, an
- * invoice number, a relative-time phrase and a right-aligned amount on two
- * lines, which no spacing token expresses.
- */
-export const LIST_COLUMN_WIDTH = 396;
-
-/**
- * The narrowest the list column is allowed to get before the pane stops taking
- * space off it. Two lines of ellipsised text and a right-aligned amount still
- * read at this width; below it the amount and the client name start colliding.
- */
-export const LIST_COLUMN_MIN_WIDTH = 248;
-
-/**
- * The narrowest the invoice pane is allowed to get. Below this the line-item
- * table's three fixed columns (qty, rate, amount) plus a description stop
- * fitting and the pane would rather scroll sideways than shrink.
- */
-export const PANE_MIN_WIDTH = 448;
-
-/**
- * How wide the list column is when the cockpit body has `available` px.
- *
- * The cockpit has to fit the app's own minimum window (`src/main/window.ts`
- * sets `minWidth: 960`, and the side nav takes 224-240 of it), so the two
- * columns cannot both be rigid. The rule: the pane is served first down to
- * `PANE_MIN_WIDTH`, the list gives up the difference, and neither goes below
- * its own floor — past that the *pane* scrolls inside itself rather than the
- * whole content region growing a horizontal scrollbar.
- *
- * This is the same rule the stylesheet evaluates via `listColumnWidthCss`; it
- * lives here as a number so the node-only suite can assert it.
- */
-export function listColumnWidthAt(available: number): number {
-  const wanted = available - PANE_MIN_WIDTH;
-  return Math.min(Math.max(wanted, LIST_COLUMN_MIN_WIDTH), LIST_COLUMN_WIDTH);
-}
-
-/**
- * `listColumnWidthAt` as a CSS length. `100%` inside a flex item resolves
- * against the flex container's content box, which is the cockpit body — so the
- * clamp reacts to the window without a resize listener or a media query.
- */
-export function listColumnWidthCss(): string {
-  return `clamp(${String(LIST_COLUMN_MIN_WIDTH)}px, calc(100% - ${String(PANE_MIN_WIDTH)}px), ${String(LIST_COLUMN_WIDTH)}px)`;
-}
+import { daysBetween } from './detail';
 
 /** How far ahead "Due this week" reaches. */
 export const DUE_SOON_DAYS = 7;
@@ -81,63 +37,27 @@ export const DUE_SOON_DAYS = 7;
 /** What a row is, as far as triage is concerned. */
 export type RowState = 'overdue' | 'due-soon' | 'later' | 'draft' | 'paid' | 'void';
 
-/** The buckets rows fall into, in the order they are shown. */
-export type GroupKey = 'overdue' | 'due-soon' | 'later' | 'drafts' | 'paid' | 'void';
+/** The status tabs above the list. */
+export type ListSegment = 'all' | 'overdue' | 'sent' | 'drafts' | 'paid';
 
-/** The segmented control above the list. */
-export type ListSegment = 'all' | 'overdue' | 'sent' | 'drafts';
-
-export const GROUP_ORDER: readonly GroupKey[] = [
-  'overdue',
-  'due-soon',
-  'later',
-  'drafts',
-  'paid',
-  'void',
-];
-
-const GROUP_TITLES: Record<GroupKey, string> = {
-  overdue: 'Overdue',
-  'due-soon': 'Due this week',
-  later: 'Later',
-  drafts: 'Drafts',
-  paid: 'Paid',
-  void: 'Void',
-};
-
-/** Segments in display order. `void` and `paid` rows are only in `all`. */
+/**
+ * Segments in display order — design 3a's five tabs. `paid` earns one because
+ * a settled invoice is the thing you go looking for when a client says they
+ * already paid; `void` still has no tab and stays reachable through `all` and
+ * the filter vocabulary.
+ */
 export const LIST_SEGMENTS: readonly { readonly key: ListSegment; readonly label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'overdue', label: 'Overdue' },
   { key: 'sent', label: 'Sent' },
   { key: 'drafts', label: 'Drafts' },
+  { key: 'paid', label: 'Paid' },
 ];
 
 /** A sum of money that is only meaningful next to its currency. */
 export interface CurrencyTotal {
   readonly currency: string;
   readonly cents: number;
-}
-
-export interface ListRow {
-  readonly id: string;
-  readonly invoice: Invoice;
-  readonly clientName: string;
-  readonly state: RowState;
-  /** `34 days late`, `due in 2 days`, `paid 24 Jul` — never a status word alone. */
-  readonly timing: string;
-  /** The second line as shown: `INV-0051 · 34 days late`. */
-  readonly secondary: string;
-  readonly amount: string;
-  /** Settled and unissued rows recede: lighter text, regular weight. */
-  readonly isMuted: boolean;
-}
-
-export interface ListGroup {
-  readonly key: GroupKey;
-  readonly title: string;
-  readonly totals: readonly CurrencyTotal[];
-  readonly rows: readonly ListRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +102,6 @@ export function daysUntilDue(dueDate: string, today: string): number | null {
   return daysBetween(today, dueDate);
 }
 
-function plural(count: number, unit: string): string {
-  return `${String(count)} ${unit}${count === 1 ? '' : 's'}`;
-}
-
 // ---------------------------------------------------------------------------
 // State and timing
 // ---------------------------------------------------------------------------
@@ -219,46 +135,6 @@ export function rowStateOf(
       return days <= DUE_SOON_DAYS ? 'due-soon' : 'later';
     }
   }
-}
-
-/**
- * The half-sentence that replaces the status pill. Every branch answers *when*,
- * because "when" is the thing the pill never said.
- */
-export function relativeTiming(
-  invoice: Pick<Invoice, 'dueDate' | 'updatedAt' | 'paidAt'>,
-  state: RowState,
-  today: string,
-): string {
-  switch (state) {
-    case 'overdue': {
-      const late = daysPastDue(invoice.dueDate, today);
-      // A row stored as `overdue` whose due date has not arrived yet: say that
-      // it is marked overdue rather than invent a negative day count.
-      return late > 0 ? `${plural(late, 'day')} late` : 'marked overdue';
-    }
-    case 'due-soon': {
-      const days = daysUntilDue(invoice.dueDate, today) ?? 0;
-      if (days <= 0) return 'due today';
-      if (days === 1) return 'due tomorrow';
-      return `due in ${plural(days, 'day')}`;
-    }
-    case 'later':
-      return `due ${shortDate(invoice.dueDate, today)}`;
-    case 'draft':
-      return `edited ${shortDate(calendarDateOf(invoice.updatedAt), today)}`;
-    case 'paid':
-      return invoice.paidAt === null
-        ? 'paid'
-        : `paid ${shortDate(calendarDateOf(invoice.paidAt), today)}`;
-    case 'void':
-      return `voided ${shortDate(calendarDateOf(invoice.updatedAt), today)}`;
-  }
-}
-
-/** Which group a state lands in. */
-export function groupOf(state: RowState): GroupKey {
-  return state === 'draft' ? 'drafts' : state;
 }
 
 /** Open states — the ones with a receivable behind them. */
@@ -393,6 +269,8 @@ export function matchesSegment(state: RowState, segment: ListSegment): boolean {
       return state === 'due-soon' || state === 'later';
     case 'drafts':
       return state === 'draft';
+    case 'paid':
+      return state === 'paid';
   }
 }
 
@@ -405,7 +283,13 @@ export function countSegments(
   invoices: readonly Invoice[],
   today: string,
 ): Record<ListSegment, number> {
-  const counts: Record<ListSegment, number> = { all: 0, overdue: 0, sent: 0, drafts: 0 };
+  const counts: Record<ListSegment, number> = {
+    all: 0,
+    overdue: 0,
+    sent: 0,
+    drafts: 0,
+    paid: 0,
+  };
   for (const invoice of invoices) {
     const state = rowStateOf(invoice, today);
     for (const { key } of LIST_SEGMENTS) {
@@ -416,124 +300,12 @@ export function countSegments(
 }
 
 // ---------------------------------------------------------------------------
-// Grouping
+// Keyboard navigation
 // ---------------------------------------------------------------------------
 
-/**
- * Within a group, the most urgent row first. Open groups sort by due date;
- * settled and unissued groups sort by when they last moved, newest first. Ties
- * fall back to the invoice number so the order is stable across renders.
- */
-function compareInGroup(group: GroupKey, a: ListRow, b: ListRow): number {
-  const left = a.invoice;
-  const right = b.invoice;
-  let primary = 0;
-  switch (group) {
-    case 'overdue':
-    case 'due-soon':
-    case 'later':
-      primary = left.dueDate.localeCompare(right.dueDate);
-      break;
-    case 'paid':
-      primary = (right.paidAt ?? right.updatedAt).localeCompare(left.paidAt ?? left.updatedAt);
-      break;
-    case 'drafts':
-    case 'void':
-      primary = right.updatedAt.localeCompare(left.updatedAt);
-      break;
-  }
-  return primary !== 0 ? primary : left.number.localeCompare(right.number);
-}
-
-export interface BuildGroupsInput {
-  readonly invoices: readonly Invoice[];
-  /** clientId -> display name, joined in the view from `clients:list`. */
-  readonly clientNames: ReadonlyMap<string, string>;
-  readonly today: string;
-  readonly segment: ListSegment;
-}
-
-/**
- * The list as the reader sees it: groups in urgency order, empty groups
- * dropped, each carrying its own per-currency sum.
- *
- * Paid rows get no sum in the mockup, and they get none here either: money that
- * has arrived is not a figure you are chasing, and printing it beside four
- * chase totals invites adding it to them.
- */
-export function buildInvoiceGroups({
-  invoices,
-  clientNames,
-  today,
-  segment,
-}: BuildGroupsInput): ListGroup[] {
-  const buckets = new Map<GroupKey, ListRow[]>();
-  const sources = new Map<GroupKey, Invoice[]>();
-
-  for (const invoice of invoices) {
-    const state = rowStateOf(invoice, today);
-    if (!matchesSegment(state, segment)) continue;
-    const group = groupOf(state);
-    const timing = relativeTiming(invoice, state, today);
-    const row: ListRow = {
-      id: invoice.id,
-      invoice,
-      clientName: clientNames.get(invoice.clientId) ?? invoice.clientId,
-      state,
-      timing,
-      secondary: `${invoice.number} · ${timing}`,
-      amount: money(invoice.totalCents, invoice.currency),
-      isMuted: !isOpenState(state),
-    };
-    const rows = buckets.get(group);
-    if (rows === undefined) buckets.set(group, [row]);
-    else rows.push(row);
-    const raw = sources.get(group);
-    if (raw === undefined) sources.set(group, [invoice]);
-    else raw.push(invoice);
-  }
-
-  const groups: ListGroup[] = [];
-  for (const key of GROUP_ORDER) {
-    const rows = buckets.get(key);
-    if (rows === undefined || rows.length === 0) continue;
-    rows.sort((a, b) => compareInGroup(key, a, b));
-    groups.push({
-      key,
-      title: GROUP_TITLES[key],
-      totals: key === 'paid' ? [] : sumByCurrency(sources.get(key) ?? []),
-      rows,
-    });
-  }
-  return groups;
-}
-
-/**
- * The sticky caption, in the two parts the view paints differently:
- * `Overdue · £124,333` at full strength and `+3 currencies` beside it in the
- * muted colour.
- *
- * The caption used to read `DRAFTS · $73,308 · €49,499 +2`, which is three
- * numbers deep in a 248-396px column and still hides half the currencies. One
- * figure and a count of what it stands in front of says the same thing without
- * pretending the rest are not there; the page header's disclosure has the
- * whole breakdown.
- */
-export interface GroupHeaderParts {
-  readonly label: string;
-  readonly more: string | null;
-}
-
-/** `Overdue · $42,915` + `+3 currencies`, or just `Overdue` when there is no sum. */
-export function groupHeaderParts(group: ListGroup): GroupHeaderParts {
-  const summary = summariseTotals(group.totals);
-  if (summary.lead === '') return { label: group.title, more: null };
-  return { label: `${group.title} · ${summary.lead}`, more: summary.more };
-}
-
-/** Every row in reading order — what `J`/`K` walk. */
-export function flattenGroups(groups: readonly ListGroup[]): ListRow[] {
-  return groups.flatMap((group) => [...group.rows]);
+/** The least a row has to be for `J`/`K` to walk it. */
+export interface IdentifiedRow {
+  readonly id: string;
 }
 
 /**
@@ -543,7 +315,7 @@ export function flattenGroups(groups: readonly ListGroup[]): ListRow[] {
  * current selection is no longer in the list.
  */
 export function adjacentRowId(
-  rows: readonly ListRow[],
+  rows: readonly IdentifiedRow[],
   currentId: string | null,
   delta: number,
 ): string | null {
@@ -555,7 +327,7 @@ export function adjacentRowId(
 }
 
 /** 1-based position of a row in the flattened list, or null when absent. */
-export function rowPosition(rows: readonly ListRow[], id: string | null): number | null {
+export function rowPosition(rows: readonly IdentifiedRow[], id: string | null): number | null {
   if (id === null) return null;
   const index = rows.findIndex((row) => row.id === id);
   return index === -1 ? null : index + 1;

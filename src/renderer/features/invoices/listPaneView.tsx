@@ -53,6 +53,14 @@ const QTY_WIDTH = 64;
 const RATE_WIDTH = 108;
 const AMOUNT_WIDTH = 120;
 
+/**
+ * The tones this mapping can paint. `accent` is not a pane tone — the pane has
+ * no "coming up soon" state — but design 3a's list marks a due-soon row in the
+ * accent hue, and one mapping from tone to token is the whole point of this
+ * function, so it lives here rather than being re-derived next door.
+ */
+export type RowToneName = PaneTone | 'accent';
+
 interface ToneColours {
   /** A large tinted surface: a banner, a sticky group header. Opaque. */
   readonly wash: string;
@@ -100,7 +108,7 @@ function mix(accent: string, strength: string, over: string): string {
  * sticky header over the list both composite against the right thing.
  */
 export function toneColours(
-  tone: PaneTone,
+  tone: RowToneName,
   over = 'var(--color-background-surface)',
 ): ToneColours {
   const build = (accent: string, text: string, dot: ToneColours['dot']): ToneColours => ({
@@ -119,6 +127,11 @@ export function toneColours(
       return build('var(--color-border-yellow)', 'var(--color-text-yellow)', 'warning');
     case 'success':
       return build('var(--color-border-green)', 'var(--color-text-green)', 'success');
+    case 'accent':
+      // `dot` names one of `StatusDot`'s four semantic variants and there is no
+      // accent among them; a due-soon row is not a warning, so it takes the
+      // neutral variant and carries its blue in the chip, the text and the wash.
+      return build('var(--color-border-blue)', 'var(--color-text-blue)', 'neutral');
     case 'neutral':
       return {
         wash: mix('var(--color-text-primary)', WASH_STRENGTH, over),
