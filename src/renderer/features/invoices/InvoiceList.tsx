@@ -94,6 +94,7 @@ import type { ListRow, RowTone, SortKey } from './listRows';
 import {
   retainVisible,
   selectAllValue,
+  setSelectedForRows,
   summariseSelection,
   toggleSelected,
 } from './listSelection';
@@ -489,7 +490,7 @@ export function InvoiceList(): React.JSX.Element {
 
   const toggleAll = useCallback(
     (checked: boolean) => {
-      setRawSelected(checked ? new Set(pageRows.map((row) => row.id)) : new Set());
+      setRawSelected((current) => setSelectedForRows(current, pageRows, checked));
     },
     [pageRows],
   );

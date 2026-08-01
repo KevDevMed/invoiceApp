@@ -73,13 +73,41 @@ export function retainVisible(
   return new Set([...selected].filter((id) => visible.has(id)));
 }
 
-/** The header checkbox: checked when all rows are in, indeterminate when some are. */
+/**
+ * The header checkbox: checked when all rows are in, indeterminate when some are.
+ *
+ * Counted by *membership of the rows it was given*, never by the size of the
+ * selection. The header sits above one page while the selection spans every
+ * page, so a size comparison reads a full page 1 as a full page 2 and renders
+ * a checked box over rows that were never selected.
+ */
 export function selectAllValue(
   selected: ReadonlySet<string>,
   rows: readonly SelectableRow[],
 ): boolean | 'indeterminate' {
-  if (rows.length === 0 || selected.size === 0) return false;
-  return selected.size >= rows.length ? true : 'indeterminate';
+  if (rows.length === 0) return false;
+  const chosen = rows.filter((row) => selected.has(row.id)).length;
+  if (chosen === 0) return false;
+  return chosen === rows.length ? true : 'indeterminate';
+}
+
+/**
+ * The header checkbox's toggle: adds or removes exactly the rows it was given.
+ *
+ * The mirror of `selectAllValue` — ticking the box on page 2 must not discard
+ * what page 1 had selected, and unticking it must not clear the other pages.
+ */
+export function setSelectedForRows(
+  selected: ReadonlySet<string>,
+  rows: readonly SelectableRow[],
+  checked: boolean,
+): Set<string> {
+  const next = new Set(selected);
+  for (const row of rows) {
+    if (checked) next.add(row.id);
+    else next.delete(row.id);
+  }
+  return next;
 }
 
 /** Everything the bulk bar prints and enables. */

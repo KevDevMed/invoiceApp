@@ -4,6 +4,7 @@ import type { Invoice } from '../../../../shared/types';
 import {
   retainVisible,
   selectAllValue,
+  setSelectedForRows,
   summariseSelection,
   toggleSelected,
 } from '../listSelection';
@@ -40,6 +41,19 @@ const ROWS: readonly SelectableRow[] = [
   row({ id: 'b', number: 'INV-0002', status: 'overdue', totalCents: 3_600_000 }),
   row({ id: 'c', number: 'INV-0003', status: 'draft' }),
   row({ id: 'd', number: 'INV-0004', status: 'paid' }),
+];
+
+/** Two pages of the same result set — what pagination hands the header. */
+const PAGE_ONE: readonly SelectableRow[] = [
+  row({ id: 'p1a', number: 'INV-0101' }),
+  row({ id: 'p1b', number: 'INV-0102' }),
+  row({ id: 'p1c', number: 'INV-0103' }),
+];
+
+const PAGE_TWO: readonly SelectableRow[] = [
+  row({ id: 'p2a', number: 'INV-0201' }),
+  row({ id: 'p2b', number: 'INV-0202' }),
+  row({ id: 'p2c', number: 'INV-0203' }),
 ];
 
 describe('toggleSelected', () => {
@@ -82,6 +96,51 @@ describe('selectAllValue', () => {
 
   it('is false for an empty list rather than vacuously true', () => {
     expect(selectAllValue(new Set(), [])).toBe(false);
+  });
+
+  // The header sits above one page; the selection spans every page. Counting the
+  // set's size instead of membership of these rows checks the box over rows that
+  // were never selected.
+  it('ignores rows selected on another page', () => {
+    expect(selectAllValue(new Set(PAGE_ONE.map((r) => r.id)), PAGE_TWO)).toBe(false);
+  });
+
+  it('is true for the page that is selected and false for the one that is not', () => {
+    const pageOneSelected = new Set(PAGE_ONE.map((r) => r.id));
+    expect(selectAllValue(pageOneSelected, PAGE_ONE)).toBe(true);
+    expect(selectAllValue(pageOneSelected, PAGE_TWO)).toBe(false);
+  });
+
+  it('is indeterminate for a partly selected page, whatever other pages hold', () => {
+    const selected = new Set(['p1a', 'p1b', 'p1c', 'p2a']);
+    expect(selectAllValue(selected, PAGE_TWO)).toBe('indeterminate');
+  });
+
+  it('is false for an empty page however much is selected elsewhere', () => {
+    expect(selectAllValue(new Set(['p1a', 'p1b', 'p1c']), [])).toBe(false);
+  });
+});
+
+describe('setSelectedForRows', () => {
+  it('adds exactly this page and keeps the previous page selected', () => {
+    const next = setSelectedForRows(new Set(PAGE_ONE.map((r) => r.id)), PAGE_TWO, true);
+    expect([...next].sort()).toEqual(['p1a', 'p1b', 'p1c', 'p2a', 'p2b', 'p2c']);
+    expect(selectAllValue(next, PAGE_ONE)).toBe(true);
+    expect(selectAllValue(next, PAGE_TWO)).toBe(true);
+  });
+
+  it('removes exactly this page and leaves the previous page intact', () => {
+    const both = new Set([...PAGE_ONE, ...PAGE_TWO].map((r) => r.id));
+    const next = setSelectedForRows(both, PAGE_TWO, false);
+    expect([...next].sort()).toEqual(['p1a', 'p1b', 'p1c']);
+    expect(selectAllValue(next, PAGE_ONE)).toBe(true);
+    expect(selectAllValue(next, PAGE_TWO)).toBe(false);
+  });
+
+  it('never mutates the set it was given', () => {
+    const before = new Set(['p1a']);
+    setSelectedForRows(before, PAGE_TWO, true);
+    expect([...before]).toEqual(['p1a']);
   });
 });
 
