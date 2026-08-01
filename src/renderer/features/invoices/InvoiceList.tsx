@@ -1,43 +1,47 @@
 /**
- * Invoices, as a triage cockpit.
+ * Invoices, as design 3a: one bordered card that answers *what do I owe
+ * attention to* before it shows a single row.
  *
- * Chasing is the job, so the list never leaves the screen: a grouped list on
- * the left, the selected invoice rendered in full on the right, and the chase
- * actions pinned to the bottom of that pane. Select a row, read the invoice,
- * act, press `J` for the next one — no navigation, no losing your place.
+ * The shape, top to bottom, is the design's: card header, four money tiles,
+ * status tabs with counts beside the search and sort controls, a column header
+ * strip, a dense ~48px row list that scrolls *inside* the card so the page
+ * never grows, a footer pager, and a bulk action bar that appears only when
+ * rows are selected.
  *
- * What changed from the table this replaced, and why:
- *   - Rows are two lines and say *when* (`INV-0051 · 34 days late`), because a
- *     status pill never did. Grouping, ordering and every one of those phrases
- *     is decided in ./listGrouping, which the node-only vitest project covers.
- *   - The row is the link; there is no `Open` button, and selection is a rail
- *     in the foreground colour rather than a colour-coded highlight.
- *   - Selection is *state*, not navigation. `/invoices/:id` appends a tab
- *     (ui/invoiceTabsState.ts `syncTabs`), so routing on every `J` would open
- *     sixty pills in a minute. The pane's overflow menu opens the route
- *     deliberately when a tab is what you want.
+ * Three things this file deliberately does not do:
  *
- * The visible filter chrome is a compact search box and a segmented control.
- * The `PowerSearch` filter vocabulary is not deleted: it still owns what a
- * filter *is* (./filters), still builds the `invoices:list` request, and is one
- * click away behind the Filters toggle — the segments and the search box are
- * the two filters that earn permanent chrome, not a replacement for the rest.
+ *   - **It does not set its own width.** It renders into `<Page maxWidth>` like
+ *     every other route. The list used to be the one screen that built its own
+ *     full-bleed column, which is why it spanned a wide monitor edge to edge
+ *     while every sibling route stayed in a centred column. 1240 is 3a's own
+ *     authored width.
+ *   - **It does not decide anything testable.** Which columns survive the
+ *     available width (./listColumns), what the tiles say (./moneyTiles), how a
+ *     row phrases its status and draws its monogram (./listRows), and what the
+ *     bulk bar permits (./listSelection) are all pure modules with tests,
+ *     because the vitest project is `environment: 'node'` and never mounts a
+ *     component.
+ *   - **It does not convert currency.** There is no exchange rate in this app.
+ *     The row's total is its own money in its own currency; the tiles lead with
+ *     the dominant currency and say how many others they stand in front of.
  *
- * `load` still pages `invoices:list` until it holds the whole matching set:
- * group sums and the segment counts speak for every matching invoice, not for
- * the first window of them.
+ * The split preview pane is gone — 3a has no pane, the row itself is the link,
+ * and `/invoices/:id` renders the same `InvoicePane` at full width.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
+import { CheckboxInput } from '@astryxdesign/core/CheckboxInput';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
+import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Icon } from '@astryxdesign/core/Icon';
-import { Item } from '@astryxdesign/core/Item';
 import { Kbd } from '@astryxdesign/core/Kbd';
+import { MoreMenu } from '@astryxdesign/core/MoreMenu';
+import { Pagination } from '@astryxdesign/core/Pagination';
 import { PowerSearch } from '@astryxdesign/core/PowerSearch';
 import type {
   PowerSearchComponents,
@@ -45,16 +49,16 @@ import type {
   PowerSearchFilter,
   PowerSearchTokenProps,
 } from '@astryxdesign/core/PowerSearch';
-import { SegmentedControl, SegmentedControlItem } from '@astryxdesign/core/SegmentedControl';
+import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { HStack, StackItem, VStack } from '@astryxdesign/core/Stack';
-import { StatusDot } from '@astryxdesign/core/StatusDot';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 import { Token } from '@astryxdesign/core/Token';
 
-import { SHELL_GUTTER_STEP } from '../../chrome';
-import type { Client, Invoice, InvoiceWithItems } from '../../../shared/types';
+import type { Client, Invoice } from '../../../shared/types';
+import { Page } from '../../ui/Page';
+import { pageSlice } from '../../ui/pagination';
 import { todayIso } from './format';
 import {
   FIELD_AMOUNT,
@@ -62,40 +66,69 @@ import {
   FIELD_ISSUED,
   FIELD_NUMBER,
   FIELD_STATUS,
-  OPERATOR_IS,
   applyClientFilters,
   buildInvoiceSearchConfig,
   toListRequest,
 } from './filters';
-import { fetchClientInvoices } from './listData';
 import {
   LIST_SEGMENTS,
   adjacentRowId,
-  buildInvoiceGroups,
   countSegments,
   extraCurrencyLabel,
-  flattenGroups,
-  groupHeaderParts,
-  listColumnWidthCss,
-  outstandingTotals,
-  overdueTotals,
-  rowPosition,
-  summariseTotals,
+  matchesSegment,
+  rowStateOf,
 } from './listGrouping';
-import type { ListRow, ListSegment, RowState } from './listGrouping';
-import { InvoicePane, toneColours } from './listPaneView';
+import type { ListSegment } from './listGrouping';
+import { listLayoutAt } from './listColumns';
+import type { ListColumnKey } from './listColumns';
+import { buildMoneyTiles } from './moneyTiles';
+import type { MoneyTile } from './moneyTiles';
+import {
+  DEFAULT_SORT,
+  SORT_OPTIONS,
+  buildListRows,
+  footerSummary,
+  sortRows,
+} from './listRows';
+import type { ListRow, RowTone, SortKey } from './listRows';
+import {
+  retainVisible,
+  selectAllValue,
+  setSelectedForRows,
+  summariseSelection,
+  toggleSelected,
+} from './listSelection';
+import { toneColours } from './listPaneView';
 
 /**
  * Rows per `invoices:list` request. The contract caps `limit` at 500
  * (src/shared/ipc-contract.ts, `Pagination`), so this is one round trip per 500
  * matching invoices — the whole matching set is pulled, never a prefix of it.
  * The database is local SQLite on the user's own machine, so this is cheap, and
- * it is the only way the group sums and the segment counts can be true.
+ * it is the only way the tile figures and the tab counts can be true.
  */
 const PAGE_LIMIT = 500;
 
-/** Width of the selection rail down the left edge of a row. */
-const RAIL_WIDTH = 'var(--spacing-0-5)';
+/** 3a's own authored width. The cap is the fix for the full-bleed list. */
+const CONTENT_MAX_WIDTH = 1240;
+
+/**
+ * The row list scrolls inside the card at this height. Load-bearing, and the
+ * design says so: ten rows at ~48px, and the page itself never grows.
+ */
+const ROW_LIST_MAX_HEIGHT = 430;
+
+/** Column gap of the header strip and every row — 3a's `gap:14px`. */
+const COLUMN_GAP = '14px';
+
+/** The monogram square: 26px, 7px radius, 10px initials. All from the design. */
+const MONOGRAM_SIZE = '26px';
+const MONOGRAM_RADIUS = '7px';
+
+const CARD_BORDER = '1px solid var(--color-border)';
+
+/** Rows-per-page choices. 3a's footer shows `Rows [25 ⌄]`. */
+const PAGE_SIZE_OPTIONS: readonly number[] = [10, 25, 50, 100];
 
 // The semantic icon set ships no person / money / hash glyph, and the Icon docs
 // sanction passing an SVG component directly. These follow the same conventions
@@ -233,40 +266,37 @@ const SEARCH_COMPONENTS: PowerSearchComponents = {
 };
 
 /**
- * The state dot. Four of the six states map onto a semantic `StatusDot`; a
- * draft is the exception — it is the *absence* of a state, and the design says
- * so with a hollow ring, which the five semantic variants cannot express.
+ * The width of the content column, measured rather than assumed.
+ *
+ * `window.innerWidth` is the wrong number: the shell's side nav collapses, so
+ * the viewport and the content column disagree by 224-240px depending on a
+ * setting the list knows nothing about. A `ResizeObserver` on the card itself
+ * is the only source that is right in both states, and it also covers the
+ * `<Page>` cap — a 2000px window still measures 1240 here.
  */
-function StateDot({ state }: { readonly state: RowState }): React.JSX.Element {
-  if (state === 'draft') {
-    return (
-      <HStack
-        width="var(--spacing-1-5)"
-        height="var(--spacing-1-5)"
-        aria-label="Draft"
-        role="img"
-        style={{
-          flex: 'none',
-          borderRadius: 'var(--radius-full)',
-          border: '1px solid var(--color-border-emphasized)',
-        }}
-      >
-        {null}
-      </HStack>
-    );
-  }
-  switch (state) {
-    case 'overdue':
-      return <StatusDot variant="error" label="Overdue" />;
-    case 'due-soon':
-      return <StatusDot variant="warning" label="Due this week" />;
-    case 'paid':
-      return <StatusDot variant="success" label="Paid" />;
-    case 'void':
-      return <StatusDot variant="neutral" label="Void" />;
-    case 'later':
-      return <StatusDot variant="accent" label="Open" />;
-  }
+function useMeasuredWidth(): [React.RefObject<HTMLDivElement | null>, number] {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element === null) return;
+    // Measure once synchronously: the observer's first callback lands after a
+    // frame, and a first paint at the narrowest tier followed by a jump to the
+    // widest is a visible flash of the wrong layout.
+    setWidth(element.getBoundingClientRect().width);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry === undefined) return;
+      setWidth(entry.contentRect.width);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  return [ref, width];
 }
 
 export function InvoiceList(): React.JSX.Element {
@@ -275,26 +305,30 @@ export function InvoiceList(): React.JSX.Element {
   const [search, setSearch] = useState('');
   const [filters, setFilters] = useState<readonly PowerSearchFilter[]>([]);
   const [segment, setSegment] = useState<ListSegment>('all');
+  const [sort, setSort] = useState<SortKey>(DEFAULT_SORT);
   const [isFilterBarOpen, setIsFilterBarOpen] = useState(false);
-  const [isBreakdownOpen, setIsBreakdownOpen] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [openTile, setOpenTile] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  const [rawSelected, setRawSelected] = useState<ReadonlySet<string>>(new Set());
 
   const [invoices, setInvoices] = useState<Invoice[] | null>(null);
   const [clients, setClients] = useState<Client[]>([]);
   const [error, setError] = useState<string | null>(null);
-
-  const [pane, setPane] = useState<InvoiceWithItems | null>(null);
-  const [paneClientInvoices, setPaneClientInvoices] = useState<readonly Invoice[] | null>(null);
-  const [paneError, setPaneError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [isActing, setIsActing] = useState(false);
 
   const searchRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
+
+  const [cardRef, contentWidth] = useMeasuredWidth();
+  const layout = useMemo(() => listLayoutAt(contentWidth), [contentWidth]);
 
   // Every load takes a ticket; only the newest one is allowed to write state.
   // Paging is several awaits long, so a load started by an earlier search term
   // can finish after a later one and would otherwise overwrite it.
   const loadTicket = useRef(0);
-  const paneTicket = useRef(0);
 
   const today = todayIso();
 
@@ -340,6 +374,12 @@ export function InvoiceList(): React.JSX.Element {
     return () => window.clearTimeout(handle);
   }, [search, filters, load]);
 
+  // Any change to what is being looked at sends the reader back to page one;
+  // staying on page 5 of a set that now has two pages shows an empty card.
+  useEffect(() => {
+    setPage(1);
+  }, [search, filters, segment, sort, pageSize]);
+
   const clientNames = useMemo(
     () => new Map(clients.map((client) => [client.id, client.name])),
     [clients],
@@ -353,85 +393,64 @@ export function InvoiceList(): React.JSX.Element {
     };
   }, [clients]);
 
-  /** The whole matching set, before the segment narrows it. */
+  /** The whole matching set, before the status tab narrows it. */
   const matching = useMemo(
     () => applyClientFilters(invoices ?? [], filters),
     [invoices, filters],
   );
 
   const counts = useMemo(() => countSegments(matching, today), [matching, today]);
+  // The tiles describe the filtered set, not the tab — the point of the tiles
+  // is to tell you which tab to press.
+  const tiles = useMemo(() => buildMoneyTiles(matching, today), [matching, today]);
 
-  const groups = useMemo(
-    () => buildInvoiceGroups({ invoices: matching, clientNames, today, segment }),
-    [matching, clientNames, today, segment],
-  );
+  const rows = useMemo(() => {
+    const inSegment = matching.filter((invoice) =>
+      matchesSegment(rowStateOf(invoice, today), segment),
+    );
+    return sortRows(buildListRows({ invoices: inSegment, clientNames, today }), sort);
+  }, [matching, clientNames, today, segment, sort]);
 
-  const rows = useMemo(() => flattenGroups(groups), [groups]);
+  const pageRows = useMemo(() => pageSlice(rows, page, pageSize), [rows, page, pageSize]);
 
   /**
-   * The row actually on screen. A selection made against an older set — before
-   * a search term, a segment or a status change moved the rows — would
-   * otherwise survive unseen and reappear later, so it is *derived* rather than
-   * corrected after the fact: keep the chosen row while it is still in the
-   * list, fall to the top of the list when it is not.
+   * Selection narrowed to what is on screen. Derived rather than corrected
+   * after the fact: a search term or a status change moves rows out from under
+   * a selection, and a bulk action against an invoice the reader can no longer
+   * see is the worst kind of surprise.
    */
-  const selected = useMemo(() => {
-    if (selectedId !== null && rows.some((row) => row.id === selectedId)) return selectedId;
-    return rows[0]?.id ?? null;
-  }, [rows, selectedId]);
+  const selected = useMemo(
+    () => (layout.hasSelection ? retainVisible(rawSelected, rows) : new Set<string>()),
+    [rawSelected, rows, layout.hasSelection],
+  );
+  const selection = useMemo(() => summariseSelection(selected, rows), [selected, rows]);
 
-  // The pane needs the line items and the client, which the list response does
-  // not carry, plus the client's other invoices for the balance fact. Debounced
-  // because holding `J` would otherwise fire one round trip per keystroke, and
-  // ticketed because those round trips can land out of order.
-  useEffect(() => {
-    const ticket = ++paneTicket.current;
-    const isStale = (): boolean => ticket !== paneTicket.current;
-    const handle = window.setTimeout(() => {
-      if (selected === null) {
-        setPane(null);
-        setPaneClientInvoices(null);
-        setPaneError(null);
-        return;
-      }
-      void (async () => {
-        setPaneError(null);
-        try {
-          const full = await window.api.invoke('invoices:get', { id: selected });
-          if (isStale()) return;
-          if (full === null) {
-            setPane(null);
-            setPaneClientInvoices(null);
-            setPaneError('This invoice no longer exists.');
-            return;
-          }
-          setPane(full);
-          setPaneClientInvoices(null);
-          const siblings = await fetchClientInvoices(full.clientId);
-          if (isStale()) return;
-          setPaneClientInvoices(siblings);
-        } catch (cause) {
-          if (isStale()) return;
-          setPaneError(cause instanceof Error ? cause.message : String(cause));
-        }
-      })();
-    }, 120);
-    return () => {
-      window.clearTimeout(handle);
-    };
-  }, [selected]);
+  /** The row `J`/`K` are parked on. Falls to the top of the page when it leaves. */
+  const cursor = useMemo(() => {
+    if (cursorId !== null && pageRows.some((row) => row.id === cursorId)) return cursorId;
+    return pageRows[0]?.id ?? null;
+  }, [pageRows, cursorId]);
 
   const move = useCallback(
     (delta: number) => {
-      const next = adjacentRowId(rows, selected, delta);
+      const next = adjacentRowId(pageRows, cursor, delta);
       if (next === null) return;
-      setSelectedId(next);
-      rowRefs.current.get(next)?.scrollIntoView({ block: 'nearest' });
+      setCursorId(next);
+      const element = rowRefs.current.get(next);
+      element?.scrollIntoView({ block: 'nearest' });
+      element?.focus();
     },
-    [rows, selected],
+    [pageRows, cursor],
   );
 
-  // `J`/`K` move the selection, `/` focuses the search. Scoped to this page
+  const open = useCallback(
+    (id: string) => {
+      void navigate(id);
+    },
+    [navigate],
+  );
+
+  // `J`/`K` move the cursor, `/` focuses the search. Scoped to this page
   // because the listener lives and dies with it, and inert whenever a text
   // field or a modifier has the keystroke.
   useEffect(() => {
@@ -461,183 +480,143 @@ export function InvoiceList(): React.JSX.Element {
     };
   }, [move]);
 
-  // Any change to what is being looked at sends the reader to the top of the
-  // new list; the selection effect above does that as soon as `rows` changes.
-  const changeSearch = useCallback((term: string) => {
-    setSearch(term);
-  }, []);
   const changeFilters = useCallback((next: readonly PowerSearchFilter[]) => {
     setFilters([...next]);
   }, []);
 
-  const showClientInvoices = useCallback((clientId: string) => {
-    setFilters((current) => [
-      ...current.filter((filter) => filter.field !== FIELD_CLIENT),
-      { field: FIELD_CLIENT, operator: OPERATOR_IS, value: { type: 'enum', value: clientId } },
-    ]);
-    setSegment('all');
-    setIsFilterBarOpen(true);
+  const toggleRow = useCallback((id: string) => {
+    setRawSelected((current) => toggleSelected(current, id));
   }, []);
 
-  /** A status change in the pane has to land in the list's own copy of the row. */
+  const toggleAll = useCallback(
+    (checked: boolean) => {
+      setRawSelected((current) => setSelectedForRows(current, pageRows, checked));
+    },
+    [pageRows],
+  );
+
+  /** A status change has to land in the list's own copy of the row. */
   const applyInvoiceChange = useCallback((updated: Invoice) => {
     setInvoices((current) =>
       current === null
         ? current
         : current.map((invoice) => (invoice.id === updated.id ? { ...invoice, ...updated } : invoice)),
     );
-    setPane((current) => (current === null || current.id !== updated.id ? current : { ...current, ...updated }));
   }, []);
 
-  const outstanding = useMemo(() => summariseTotals(outstandingTotals(matching, today)), [matching, today]);
-  // Led by whatever currency the outstanding line led with: the two figures sit
-  // in one sentence and the second is a slice of the first, so they have to be
-  // the same money to be read against each other at all.
-  const overdue = useMemo(
-    () => summariseTotals(overdueTotals(matching, today), outstanding.leadCurrency),
-    [matching, today, outstanding.leadCurrency],
-  );
-  /**
-   * How many currencies the two headline figures are standing in front of.
-   * Per-currency is the right answer — there is no exchange rate in this app
-   * and never was — but printing all of them inline made the one line that
-   * exists to answer "what do I owe attention to" unreadable. The dominant
-   * currency leads; the rest are one click away.
-   */
-  const extraCurrencies = Math.max(outstanding.extraCurrencies, overdue.extraCurrencies);
-  const breakdownLabel = extraCurrencyLabel(extraCurrencies);
-  const position = rowPosition(rows, selected);
+  const markSelectedPaid = useCallback(async () => {
+    setIsActing(true);
+    setActionError(null);
+    try {
+      for (const id of selected) {
+        const updated = await window.api.invoke('invoices:setStatus', { id, status: 'paid' });
+        applyInvoiceChange(updated);
+      }
+      setRawSelected(new Set());
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setIsActing(false);
+    }
+  }, [selected, applyInvoiceChange]);
+
+  const exportSelected = useCallback(async () => {
+    const [id] = [...selected];
+    if (id === undefined) return;
+    setIsActing(true);
+    setActionError(null);
+    try {
+      await window.api.invoke('invoices:exportPdf', { id });
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setIsActing(false);
+    }
+  }, [selected]);
+
   const hasActiveFilters = filters.length > 0 || search.trim() !== '' || segment !== 'all';
+  const headerLine =
+    invoices === null
+      ? 'Loading…'
+      : `${String(matching.length)} in this workspace`;
 
   return (
-    <VStack height="100%" gap={0}>
-      <VStack
-        gap={3}
-        paddingInline={SHELL_GUTTER_STEP}
-        paddingBlock={4}
-        style={{ borderBlockEnd: '1px solid var(--color-border)' }}
-      >
-        <HStack justify="between" align="center" gap={4} wrap="wrap">
-          <HStack gap={3} align="center" wrap="wrap">
-            <Heading level={1}>Invoices</Heading>
-            {invoices === null ? null : (
-              <VStack gap={1}>
-                <HStack gap={1} align="center" wrap="wrap">
-                  <Text type="supporting" hasTabularNumbers>
-                    {outstanding.lead === ''
-                      ? 'Nothing outstanding'
-                      : `${outstanding.lead} outstanding`}
-                  </Text>
-                  {overdue.lead === '' ? null : (
-                    <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
-                      {`· ${overdue.lead} overdue`}
-                    </Text>
-                  )}
-                  {breakdownLabel === null ? null : (
-                    <Button
-                      label={isBreakdownOpen ? 'Hide currencies' : breakdownLabel}
-                      variant="ghost"
-                      size="sm"
-                      aria-expanded={isBreakdownOpen}
-                      onClick={() => {
-                        setIsBreakdownOpen((open) => !open);
-                      }}
-                    />
-                  )}
-                </HStack>
-                {isBreakdownOpen ? (
-                  <VStack gap={0.5}>
-                    {outstanding.full === '' ? null : (
-                      <Text type="supporting" hasTabularNumbers>
-                        {`Outstanding ${outstanding.full}`}
-                      </Text>
-                    )}
-                    {overdue.full === '' ? null : (
-                      <Text type="supporting" hasTabularNumbers style={{ color: 'var(--color-error)' }}>
-                        {`Overdue ${overdue.full}`}
-                      </Text>
-                    )}
-                  </VStack>
-                ) : null}
-              </VStack>
-            )}
-          </HStack>
-          <Button
-            label="New invoice"
-            variant="primary"
-            onClick={() => {
-              void navigate('new');
-            }}
-          />
-        </HStack>
-
-        {/* PowerSearch keeps the filter vocabulary — status, client, issued
-            range, amount, invoice number — and still builds the backend
-            request. It is one click away rather than always on screen, because
-            the two filters used every day earned the permanent chrome. */}
-        {isFilterBarOpen || filters.length > 0 ? (
-          <HStack gap={2} align="start">
-            <StackItem size="fill">
-              <PowerSearch
-                label="Filter invoices"
-                config={config}
-                components={SEARCH_COMPONENTS}
-                filters={filters}
-                onChange={changeFilters}
-                placeholder="Add filter"
-                // The built-in clear-all reports itself as a single token
-                // removal, so one click only ever drops one token. Own control,
-                // one click, every token.
-                hasClear={false}
-                endContent={
-                  filters.length > 0 ? (
-                    <Button
-                      label="Clear all"
-                      variant="ghost"
-                      size="sm"
-                      onClick={(event) => {
-                        // The tokenizer wrapper refocuses its input on any
-                        // click inside it; keep the click to this button.
-                        event.stopPropagation();
-                        changeFilters([]);
-                      }}
-                    />
-                  ) : undefined
-                }
-                resultCount={invoices === null ? undefined : matching.length}
-              />
-            </StackItem>
-          </HStack>
-        ) : null}
-      </VStack>
-
+    <Page maxWidth={CONTENT_MAX_WIDTH}>
       {error === null ? null : <Banner status="error" title={error} isDismissable />}
+      {actionError === null ? null : (
+        <Banner
+          status="error"
+          title={actionError}
+          isDismissable
+          onDismiss={() => {
+            setActionError(null);
+          }}
+        />
+      )}
 
-      <StackItem size="fill">
-        <HStack gap={0} height="100%" align="stretch">
-          {/* The list column is ideal-width, not fixed-width. `window.ts` sets a
-              960px minimum window and the side nav takes 224-240 of it, so two
-              rigid columns would give the content region a horizontal
-              scrollbar between 960 and ~1120 and hang the pane's K/J controls
-              off the right edge. The pane is served first down to its own
-              floor and the list gives up the difference —
-              `listColumnWidthAt` in ./listGrouping is the same rule as a
-              number, with the tests. */}
-          <VStack
-            gap={0}
-            style={{
-              flex: 'none',
-              inlineSize: listColumnWidthCss(),
-              borderInlineEnd: '1px solid var(--color-border)',
-            }}
-          >
-            <VStack
-              gap={2}
-              paddingInline={3}
-              paddingBlock={2}
-              style={{ borderBlockEnd: '1px solid var(--color-border)' }}
-            >
-              <HStack gap={2} align="center">
+      {/* The card is the whole screen: header, tiles, tabs, table and footer
+          are sections of it separated by 1px rules, not free-floating blocks.
+          `overflow: hidden` is what lets the 16px radius clip the recessed
+          footer and header strips. */}
+      <VStack
+        ref={cardRef}
+        gap={0}
+        style={{
+          border: CARD_BORDER,
+          borderRadius: 'var(--radius-container)',
+          overflow: 'hidden',
+          background: 'var(--color-background-surface)',
+        }}
+      >
+        <VStack
+          gap={4}
+          paddingInline={6}
+          paddingBlock={5}
+          style={{ borderBlockEnd: CARD_BORDER }}
+        >
+          <HStack justify="between" align="start" gap={4} wrap="wrap">
+            <VStack gap={1}>
+              {/* The page's only h1. The design draws it at 20px/600, which is
+                  what `Heading level={1}` is here — the level is the document
+                  outline, not a font size. */}
+              <Heading level={1}>Invoices</Heading>
+              <Text type="supporting" hasTabularNumbers>
+                {headerLine}
+              </Text>
+            </VStack>
+            <Button
+              label="New invoice"
+              variant="primary"
+              onClick={() => {
+                void navigate('new');
+              }}
+            />
+          </HStack>
+
+          <MoneyTiles
+            tiles={tiles}
+            columns={layout.tileColumns}
+            openKey={openTile}
+            onToggle={setOpenTile}
+          />
+        </VStack>
+
+        <VStack
+          gap={3}
+          paddingInline={6}
+          paddingBlock={3}
+          style={{ borderBlockEnd: CARD_BORDER }}
+        >
+          <HStack justify="between" align="center" gap={3} wrap="wrap">
+            <StatusTabs
+              value={segment}
+              counts={counts}
+              onChange={(next) => {
+                setSegment(next);
+              }}
+            />
+            <HStack gap={2} align="center" wrap="wrap">
+              <HStack gap={1} align="center" width={230}>
                 <StackItem size="fill">
                   <TextInput
                     ref={searchRef}
@@ -648,232 +627,708 @@ export function InvoiceList(): React.JSX.Element {
                     startIcon="search"
                     hasClear
                     value={search}
-                    onChange={changeSearch}
+                    onChange={setSearch}
                   />
                 </StackItem>
                 <Kbd keys="/" />
-                <Button
-                  label={filters.length > 0 ? `Filters ${String(filters.length)}` : 'Filters'}
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setIsFilterBarOpen((open) => !open);
+              </HStack>
+              {/* The dashed border is the design's mark for an empty slot: this
+                  is the "add a filter" affordance, not a filter. */}
+              <Button
+                label={filters.length > 0 ? `Filter ${String(filters.length)}` : '+ Filter'}
+                variant="ghost"
+                size="sm"
+                aria-expanded={isFilterBarOpen || filters.length > 0}
+                style={{ borderStyle: 'dashed', borderWidth: 'var(--border-width)' }}
+                onClick={() => {
+                  setIsFilterBarOpen((current) => !current);
+                }}
+              />
+              <Selector
+                label="Sort invoices"
+                isLabelHidden
+                size="sm"
+                value={sort}
+                options={SORT_OPTIONS.map((option) => ({
+                  value: option.key,
+                  label: option.label,
+                }))}
+                onChange={(value) => {
+                  setSort(value as SortKey);
+                }}
+              />
+            </HStack>
+          </HStack>
+
+          {/* PowerSearch keeps the filter vocabulary — status, client, issued
+              range, amount, invoice number — and still builds the backend
+              request. It is one click behind `+ Filter` rather than always on
+              screen, because the tabs and the search box are the two filters
+              that earned permanent chrome. */}
+          {isFilterBarOpen || filters.length > 0 ? (
+            <PowerSearch
+              label="Filter invoices"
+              config={config}
+              components={SEARCH_COMPONENTS}
+              filters={filters}
+              onChange={changeFilters}
+              placeholder="Add filter"
+              // The built-in clear-all reports itself as a single token
+              // removal, so one click only ever drops one token. Own control,
+              // one click, every token.
+              hasClear={false}
+              endContent={
+                filters.length > 0 ? (
+                  <Button
+                    label="Clear all"
+                    variant="ghost"
+                    size="sm"
+                    onClick={(event) => {
+                      // The tokenizer wrapper refocuses its input on any click
+                      // inside it; keep the click to this button.
+                      event.stopPropagation();
+                      changeFilters([]);
+                    }}
+                  />
+                ) : undefined
+              }
+              resultCount={invoices === null ? undefined : matching.length}
+            />
+          ) : null}
+        </VStack>
+
+        {invoices === null ? (
+          <VStack gap={2} align="center" padding={8}>
+            <Spinner size="lg" label="Loading invoices" />
+          </VStack>
+        ) : rows.length === 0 ? (
+          <VStack padding={6}>
+            <EmptyState
+              title={hasActiveFilters ? 'Nothing here' : 'No invoices yet'}
+              description={
+                hasActiveFilters
+                  ? 'Widen the search, the tab, or the filter tokens.'
+                  : 'Create your first invoice to get started.'
+              }
+              headingLevel={2}
+            />
+          </VStack>
+        ) : (
+          <>
+            <ColumnHeader
+              columns={layout.columns}
+              template={layout.gridTemplateColumns}
+              selectAll={selectAllValue(selected, pageRows)}
+              onSelectAll={toggleAll}
+            />
+            <VStack
+              gap={0}
+              isScrollable
+              style={{ maxBlockSize: ROW_LIST_MAX_HEIGHT, scrollbarGutter: 'stable' }}
+            >
+              {pageRows.map((row, index) => (
+                <InvoiceRow
+                  key={row.id}
+                  row={row}
+                  columns={layout.columns}
+                  template={layout.gridTemplateColumns}
+                  showsStatusDate={layout.showsStatusDate}
+                  isSelected={selected.has(row.id)}
+                  isCursor={row.id === cursor}
+                  isLast={index === pageRows.length - 1}
+                  onOpen={open}
+                  onToggle={toggleRow}
+                  onFocus={setCursorId}
+                  registerRef={(id, element) => {
+                    if (element === null) rowRefs.current.delete(id);
+                    else rowRefs.current.set(id, element);
                   }}
                 />
-              </HStack>
-              <SegmentedControl
-                label="Invoice state"
-                size="sm"
-                layout="fill"
-                value={segment}
-                onChange={(value) => {
-                  setSegment(value as ListSegment);
-                }}
-              >
-                {LIST_SEGMENTS.map((item) => (
-                  <SegmentedControlItem
-                    key={item.key}
-                    value={item.key}
-                    label={`${item.label} ${String(counts[item.key])}`}
-                  />
-                ))}
-              </SegmentedControl>
+              ))}
             </VStack>
 
-            <StackItem size="fill" isScrollable>
-              {invoices === null ? (
-                <VStack gap={2} align="center" padding={6}>
-                  <Spinner size="lg" label="Loading invoices" />
-                </VStack>
-              ) : rows.length === 0 ? (
-                <VStack padding={4}>
-                  <EmptyState
-                    title={hasActiveFilters ? 'Nothing here' : 'No invoices yet'}
-                    description={
-                      hasActiveFilters
-                        ? 'Widen the search, the segment, or the filter tokens.'
-                        : 'Create your first invoice to get started.'
-                    }
-                    headingLevel={2}
-                  />
-                </VStack>
-              ) : (
-                <VStack gap={0}>
-                  {groups.map((group) => {
-                    const header = groupHeaderParts(group);
-                    const isOverdueGroup = group.key === 'overdue';
-                    return (
-                    <VStack key={group.key} gap={0}>
-                      <HStack
-                        gap={1}
-                        align="center"
-                        paddingInline={3}
-                        paddingBlock={1}
-                        style={{
-                          position: 'sticky',
-                          insetBlockStart: 0,
-                          zIndex: 1,
-                          // Opaque in both cases — a sticky header the rows read
-                          // through is unreadable. The overdue one is the same
-                          // barely-warm mix the pane's banner uses, not the
-                          // theme's 20%-alpha red wash, which over a white
-                          // surface composites into a flat pink slab.
-                          background: isOverdueGroup
-                            ? toneColours('error').wash
-                            : 'var(--color-background-surface)',
-                          borderBlockEnd: '1px solid var(--color-border)',
-                        }}
-                      >
-                        <Text
-                          type="supporting"
-                          weight="semibold"
-                          maxLines={1}
-                          hasTabularNumbers
-                          style={{
-                            textTransform: 'uppercase',
-                            letterSpacing: '0.06em',
-                            color: isOverdueGroup
-                              ? 'var(--color-text-red)'
-                              : 'var(--color-text-secondary)',
-                          }}
-                        >
-                          {header.label}
-                        </Text>
-                        {header.more === null ? null : (
-                          <Text
-                            type="supporting"
-                            maxLines={1}
-                            color="secondary"
-                            style={{ textTransform: 'uppercase', letterSpacing: '0.06em' }}
-                          >
-                            {header.more}
-                          </Text>
-                        )}
-                      </HStack>
-                      {group.rows.map((row) => (
-                        <InvoiceListRow
-                          key={row.id}
-                          row={row}
-                          isSelected={row.id === selected}
-                          onSelect={setSelectedId}
-                          registerRef={(id, element) => {
-                            if (element === null) rowRefs.current.delete(id);
-                            else rowRefs.current.set(id, element);
-                          }}
-                        />
-                      ))}
-                    </VStack>
-                    );
-                  })}
-                </VStack>
-              )}
-            </StackItem>
-          </VStack>
+            <HStack
+              justify="between"
+              align="center"
+              gap={3}
+              wrap="wrap"
+              paddingInline={6}
+              paddingBlock={3}
+              style={{
+                borderBlockStart: CARD_BORDER,
+                background: 'var(--color-background-muted)',
+              }}
+            >
+              <Text type="supporting" hasTabularNumbers>
+                {footerSummary(rows.length, page, pageSize, sort)}
+              </Text>
+              <HStack gap={2} align="center">
+                <Text type="supporting">Rows</Text>
+                <Selector
+                  label="Rows per page"
+                  isLabelHidden
+                  size="sm"
+                  value={String(pageSize)}
+                  options={PAGE_SIZE_OPTIONS.map((option) => ({
+                    value: String(option),
+                    label: String(option),
+                  }))}
+                  onChange={(value) => {
+                    const next = Number(value);
+                    if (Number.isFinite(next) && next > 0) setPageSize(next);
+                  }}
+                />
+                <Pagination
+                  page={page}
+                  onChange={setPage}
+                  totalItems={rows.length}
+                  pageSize={pageSize}
+                  variant="compact"
+                  size="sm"
+                />
+              </HStack>
+            </HStack>
 
-          {/* `min-inline-size: 0` is what lets the pane actually shrink: a flex
-              item defaults to `auto`, so the line-item table's fixed columns
-              were setting a floor the whole content region had to obey. */}
-          <StackItem size="fill" style={{ minInlineSize: 0 }}>
-            {paneError !== null ? (
-              <VStack padding={5}>
-                <Banner status="error" title={paneError} />
-              </VStack>
-            ) : pane === null ? (
-              <VStack gap={2} align="center" justify="center" height="100%" padding={6}>
-                {rows.length === 0 ? (
-                  <Text type="supporting">Select an invoice to see it here.</Text>
-                ) : (
-                  <Spinner size="lg" label="Loading invoice" />
-                )}
-              </VStack>
-            ) : (
-              <InvoicePane
-                invoice={pane}
-                clientInvoices={paneClientInvoices}
-                today={today}
-                headingLevel={2}
-                position={position === null ? null : { index: position, total: rows.length }}
-                onPrevious={() => {
-                  move(-1);
+            {selection.count === 0 ? null : (
+              <BulkBar
+                selection={selection}
+                isBusy={isActing}
+                onMarkPaid={() => void markSelectedPaid()}
+                onExport={() => void exportSelected()}
+                onClear={() => {
+                  setRawSelected(new Set());
                 }}
-                onNext={() => {
-                  move(1);
-                }}
-                onShowClientInvoices={() => {
-                  showClientInvoices(pane.clientId);
-                }}
-                onOpenInTab={() => {
-                  void navigate(pane.id);
-                }}
-                onInvoiceChanged={applyInvoiceChange}
               />
             )}
-          </StackItem>
-        </HStack>
-      </StackItem>
+          </>
+        )}
+      </VStack>
+    </Page>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Money tiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Four figures before a single row. The overdue tile is the only coloured one,
+ * exactly as the design has it — one tinted surface among four reads as an
+ * alarm, four read as decoration.
+ *
+ * A tile with more than one currency behind it gets a disclosure rather than a
+ * converted total, because this app has no exchange rate.
+ */
+function MoneyTiles({
+  tiles,
+  columns,
+  openKey,
+  onToggle,
+}: {
+  readonly tiles: readonly MoneyTile[];
+  readonly columns: 1 | 2 | 4;
+  readonly openKey: string | null;
+  readonly onToggle: (key: string | null) => void;
+}): React.JSX.Element {
+  return (
+    <Grid columns={columns} gap={2}>
+      {tiles.map((tile) => {
+        const tone = tile.tone === 'error' ? toneColours('error') : null;
+        const extra = extraCurrencyLabel(tile.extraCurrencies);
+        const isOpen = openKey === tile.key;
+        return (
+          <VStack
+            key={tile.key}
+            gap={1}
+            paddingInline={4}
+            paddingBlock={3}
+            style={{
+              border: `1px solid ${tone === null ? 'var(--color-border)' : tone.border}`,
+              borderRadius: 'var(--radius-container)',
+              background: tone === null ? 'var(--color-background-muted)' : tone.wash,
+            }}
+          >
+            <Text
+              type="supporting"
+              weight="medium"
+              style={tone === null ? undefined : { color: tone.text }}
+            >
+              {tile.label}
+            </Text>
+            <Text
+              as="span"
+              size="xl"
+              weight="semibold"
+              hasTabularNumbers
+              style={tone === null ? undefined : { color: tone.text }}
+            >
+              {tile.figure}
+            </Text>
+            <Text type="supporting" hasTabularNumbers maxLines={1}>
+              {tile.detail}
+            </Text>
+            {extra === null ? null : (
+              <Button
+                label={isOpen ? 'Hide currencies' : extra}
+                variant="ghost"
+                size="sm"
+                aria-expanded={isOpen}
+                onClick={() => {
+                  onToggle(isOpen ? null : tile.key);
+                }}
+              />
+            )}
+            {isOpen ? (
+              <Text type="supporting" hasTabularNumbers>
+                {tile.full}
+              </Text>
+            ) : null}
+          </VStack>
+        );
+      })}
+    </Grid>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Status tabs
+// ---------------------------------------------------------------------------
+
+/**
+ * The five status tabs with their counts, in one inset track.
+ *
+ * Not `SegmentedControl`: that control lays its segments out in a single
+ * non-wrapping row, and the brief is that all five stay *reachable* at every
+ * width rather than being clipped by whatever the container gives them. This
+ * track wraps. Each segment is a real `<button>` with `aria-pressed`, so
+ * keyboard and screen-reader access survive the swap.
+ */
+function StatusTabs({
+  value,
+  counts,
+  onChange,
+}: {
+  readonly value: ListSegment;
+  readonly counts: Record<ListSegment, number>;
+  readonly onChange: (segment: ListSegment) => void;
+}): React.JSX.Element {
+  return (
+    <HStack
+      gap={0.5}
+      wrap="wrap"
+      align="center"
+      padding={0.5}
+      aria-label="Invoice status"
+      role="group"
+      style={{
+        border: CARD_BORDER,
+        borderRadius: 'var(--radius-element)',
+        background: 'var(--color-background-muted)',
+      }}
+    >
+      {LIST_SEGMENTS.map((item) => (
+        <Button
+          key={item.key}
+          size="sm"
+          variant={item.key === value ? 'secondary' : 'ghost'}
+          aria-pressed={item.key === value}
+          label={`${item.label} ${String(counts[item.key])}`}
+          onClick={() => {
+            onChange(item.key);
+          }}
+        />
+      ))}
+    </HStack>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The table
+// ---------------------------------------------------------------------------
+
+const COLUMN_LABELS: Record<ListColumnKey, string> = {
+  select: '',
+  client: 'Client',
+  invoice: 'Invoice',
+  status: 'Status & due',
+  issued: 'Issued',
+  total: 'Total',
+  menu: '',
+};
+
+/** Which columns are right-aligned, per the design. */
+const END_ALIGNED: ReadonlySet<ListColumnKey> = new Set<ListColumnKey>(['issued', 'total']);
+
+/**
+ * `VStack` renders a flex container; the table needs a grid, and the template
+ * is computed per width so it cannot be a static `xstyle`. One shared style
+ * factory keeps the header strip and every row on the exact same tracks — the
+ * failure mode of a hand-built table is a header that drifts a pixel off its
+ * body.
+ */
+function gridStyle(template: string): React.CSSProperties {
+  return {
+    display: 'grid',
+    gridTemplateColumns: template,
+    columnGap: COLUMN_GAP,
+    alignItems: 'center',
+  };
+}
+
+function ColumnHeader({
+  columns,
+  template,
+  selectAll,
+  onSelectAll,
+}: {
+  readonly columns: readonly ListColumnKey[];
+  readonly template: string;
+  readonly selectAll: boolean | 'indeterminate';
+  readonly onSelectAll: (checked: boolean) => void;
+}): React.JSX.Element {
+  return (
+    <VStack
+      gap={0}
+      paddingInline={6}
+      paddingBlock={2}
+      style={{
+        ...gridStyle(template),
+        borderBlockEnd: CARD_BORDER,
+        background: 'var(--color-background-muted)',
+      }}
+    >
+      {columns.map((column) =>
+        column === 'select' ? (
+          <CheckboxInput
+            key={column}
+            label="Select every invoice on this page"
+            isLabelHidden
+            size="sm"
+            value={selectAll}
+            onChange={onSelectAll}
+          />
+        ) : (
+          <Text
+            key={column}
+            type="supporting"
+            size="sm"
+            weight="medium"
+            maxLines={1}
+            justify={END_ALIGNED.has(column) ? 'end' : 'start'}
+            style={{ textTransform: 'uppercase', letterSpacing: '0.04em' }}
+          >
+            {COLUMN_LABELS[column]}
+          </Text>
+        ),
+      )}
+    </VStack>
+  );
+}
+
+/** The 6px status dot. A draft is a hollow ring — the absence of a state. */
+function StateDot({
+  tone,
+  isHollow,
+}: {
+  readonly tone: RowTone;
+  readonly isHollow: boolean;
+}): React.JSX.Element {
+  const colours = toneColours(tone);
+  return (
+    <VStack
+      gap={0}
+      width="var(--spacing-1-5)"
+      height="var(--spacing-1-5)"
+      style={{
+        flex: 'none',
+        borderRadius: 'var(--radius-full)',
+        background: isHollow ? 'transparent' : colours.accent,
+        border: isHollow ? '1px solid var(--color-border-emphasized)' : undefined,
+      }}
+    >
+      {null}
     </VStack>
   );
 }
 
 /**
- * Two lines and an amount. The row *is* the link — there is no `Open` button —
- * and selection is a rail in the foreground colour plus a wash, so it reads as
- * "you are here" rather than as another status colour.
+ * One ~48px row. The whole row is the click target — there is no `Open` button,
+ * per the designer: *"the row is the target, hover reveals ⋯."*
+ *
+ * It is a `role="link"` with a keyboard handler rather than a `<button>`,
+ * because a row contains a checkbox and a menu button and nesting those inside
+ * a `<button>` is invalid HTML. Both stop propagation so ticking a box does not
+ * also navigate.
  */
-function InvoiceListRow({
+function InvoiceRow({
   row,
+  columns,
+  template,
+  showsStatusDate,
   isSelected,
-  onSelect,
+  isCursor,
+  isLast,
+  onOpen,
+  onToggle,
+  onFocus,
   registerRef,
 }: {
   readonly row: ListRow;
+  readonly columns: readonly ListColumnKey[];
+  readonly template: string;
+  readonly showsStatusDate: boolean;
   readonly isSelected: boolean;
-  readonly onSelect: (id: string) => void;
+  readonly isCursor: boolean;
+  readonly isLast: boolean;
+  readonly onOpen: (id: string) => void;
+  readonly onToggle: (id: string) => void;
+  readonly onFocus: (id: string) => void;
   readonly registerRef: (id: string, element: HTMLElement | null) => void;
 }): React.JSX.Element {
+  const tone = toneColours(row.tone);
+  const isOverdue = row.state === 'overdue';
+
+  const cell = (column: ListColumnKey): React.JSX.Element => {
+    switch (column) {
+      case 'select':
+        return (
+          <VStack
+            key={column}
+            gap={0}
+            onClick={(event: React.MouseEvent) => {
+              event.stopPropagation();
+            }}
+          >
+            <CheckboxInput
+              label={`Select ${row.invoice.number}`}
+              isLabelHidden
+              size="sm"
+              value={isSelected}
+              onChange={() => {
+                onToggle(row.id);
+              }}
+            />
+          </VStack>
+        );
+      case 'client':
+        return (
+          <HStack key={column} gap={2} align="center" style={{ minInlineSize: 0 }}>
+            <VStack
+              gap={0}
+              align="center"
+              justify="center"
+              width={MONOGRAM_SIZE}
+              height={MONOGRAM_SIZE}
+              style={{
+                flex: 'none',
+                borderRadius: MONOGRAM_RADIUS,
+                background: tone.chip,
+              }}
+            >
+              <Text as="span" size="xsm" weight="semibold" style={{ color: tone.text }}>
+                {row.monogram}
+              </Text>
+            </VStack>
+            <StackItem size="fill">
+              <Text maxLines={1} color={row.isMuted ? 'secondary' : 'primary'}>
+                {row.clientName}
+              </Text>
+            </StackItem>
+          </HStack>
+        );
+      case 'invoice':
+        return (
+          <Text key={column} type="code" size="sm" color="secondary" maxLines={1}>
+            {row.invoice.number}
+          </Text>
+        );
+      case 'status':
+        return (
+          <HStack key={column} gap={1.5} align="center" style={{ minInlineSize: 0 }}>
+            <StateDot tone={row.tone} isHollow={row.isDotHollow} />
+            <Text
+              type="supporting"
+              maxLines={1}
+              color={isOverdue ? 'inherit' : row.isMuted ? 'secondary' : 'primary'}
+              style={isOverdue ? { color: tone.text } : undefined}
+            >
+              {row.statusLabel}
+            </Text>
+            {row.statusDate === null || !showsStatusDate ? null : (
+              <Text type="supporting" maxLines={1} hasTabularNumbers>
+                {`· ${row.statusDate}`}
+              </Text>
+            )}
+          </HStack>
+        );
+      case 'issued':
+        return (
+          <Text key={column} type="supporting" hasTabularNumbers justify="end" maxLines={1}>
+            {row.issued}
+          </Text>
+        );
+      case 'total':
+        return (
+          <Text
+            key={column}
+            hasTabularNumbers
+            justify="end"
+            maxLines={1}
+            weight={row.isMuted ? 'normal' : 'semibold'}
+            color={row.isMuted ? 'secondary' : 'primary'}
+          >
+            {row.amount}
+          </Text>
+        );
+      case 'menu':
+        return (
+          <VStack
+            key={column}
+            gap={0}
+            onClick={(event: React.MouseEvent) => {
+              event.stopPropagation();
+            }}
+          >
+            <MoreMenu
+              label={`Actions for ${row.invoice.number}`}
+              size="sm"
+              items={[
+                { label: 'Open', onClick: () => { onOpen(row.id); } },
+                {
+                  label: 'Edit',
+                  onClick: () => {
+                    onOpen(`${row.id}/edit`);
+                  },
+                },
+              ]}
+            />
+          </VStack>
+        );
+    }
+  };
+
   return (
-    <Item
-      ref={(element) => {
+    <VStack
+      ref={(element: HTMLDivElement | null) => {
         registerRef(row.id, element);
       }}
-      density="compact"
-      align="center"
-      isSelected={isSelected}
-      aria-current={isSelected ? 'true' : undefined}
+      gap={0}
+      paddingInline={6}
+      paddingBlock={2}
+      role="link"
+      tabIndex={0}
+      aria-label={`${row.clientName}, ${row.invoice.number}, ${row.statusLabel}, ${row.amount}`}
       onClick={() => {
-        onSelect(row.id);
+        onOpen(row.id);
+      }}
+      onFocus={() => {
+        onFocus(row.id);
+      }}
+      onKeyDown={(event: React.KeyboardEvent) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        // Let the checkbox and the menu button keep their own keys.
+        if (event.target !== event.currentTarget) return;
+        event.preventDefault();
+        onOpen(row.id);
       }}
       style={{
-        borderInlineStart: `${RAIL_WIDTH} solid ${
-          isSelected ? 'var(--color-text-primary)' : 'transparent'
-        }`,
-        borderBlockEnd: '1px solid var(--color-border)',
-        background: isSelected ? 'var(--color-overlay-pressed)' : undefined,
+        ...gridStyle(template),
+        cursor: 'pointer',
+        borderBlockEnd: isLast ? undefined : CARD_BORDER,
+        // Overdue rows carry a faint tint so they are findable while scrolling;
+        // the cursor's own wash sits on top of it.
+        background: isCursor
+          ? 'var(--color-overlay-pressed)'
+          : isOverdue
+            ? tone.wash
+            : undefined,
       }}
-      startContent={<StateDot state={row.state} />}
-      label={
-        <Text maxLines={1} color={row.isMuted ? 'secondary' : 'primary'}>
-          {row.clientName}
+    >
+      {columns.map(cell)}
+    </VStack>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Bulk action bar
+// ---------------------------------------------------------------------------
+
+/**
+ * The strip below the pager, on an accent-tinted surface, that appears only
+ * when the selection is non-empty.
+ *
+ * `Send reminder` is in the design and is not here: nothing in the frozen IPC
+ * contract sends anything to a client, and a button that does nothing is worse
+ * than an absent one. `Export` is `invoices:exportPdf`, which puts a save
+ * dialog on screen per invoice, so it is offered for exactly one selected row.
+ */
+function BulkBar({
+  selection,
+  isBusy,
+  onMarkPaid,
+  onExport,
+  onClear,
+}: {
+  readonly selection: ReturnType<typeof summariseSelection>;
+  readonly isBusy: boolean;
+  readonly onMarkPaid: () => void;
+  readonly onExport: () => void;
+  readonly onClear: () => void;
+}): React.JSX.Element {
+  const tone = toneColours('accent');
+  const extra = extraCurrencyLabel(selection.extraCurrencies);
+  return (
+    <HStack
+      justify="between"
+      align="center"
+      gap={3}
+      wrap="wrap"
+      paddingInline={6}
+      paddingBlock={3}
+      role="region"
+      aria-label="Bulk actions"
+      style={{ borderBlockStart: `1px solid ${tone.border}`, background: tone.wash }}
+    >
+      <HStack gap={2} align="center" wrap="wrap">
+        <Text as="span" weight="semibold" style={{ color: tone.text }}>
+          {selection.label}
         </Text>
-      }
-      description={
-        <Text
-          type="supporting"
-          maxLines={1}
-          style={row.state === 'overdue' ? { color: 'var(--color-error)' } : undefined}
-        >
-          {row.secondary}
-        </Text>
-      }
-      endContent={
-        <Text
-          hasTabularNumbers
-          weight={row.isMuted ? 'normal' : 'semibold'}
-          color={row.isMuted ? 'secondary' : 'primary'}
-        >
-          {row.amount}
-        </Text>
-      }
-    />
+        {selection.amount === '' ? null : (
+          <Text as="span" hasTabularNumbers color="secondary">
+            {extra === null ? selection.amount : `${selection.amount} (${extra})`}
+          </Text>
+        )}
+      </HStack>
+      <HStack gap={2} align="center" wrap="wrap">
+        <Button
+          label="Mark paid"
+          variant="ghost"
+          size="sm"
+          // `Button` has no `disabledMessage`, and AGENTS.md forbids wrapping a
+          // disabled control in `Tooltip` (it swallows the hover events), so the
+          // reason rides in the accessible name.
+          isDisabled={!selection.canMarkPaid || isBusy}
+          aria-label={
+            selection.canMarkPaid
+              ? undefined
+              : 'Mark paid — only issued, unsettled invoices can be marked paid'
+          }
+          onClick={onMarkPaid}
+        />
+        <Button
+          label="Export PDF"
+          variant="ghost"
+          size="sm"
+          isDisabled={!selection.canExport || isBusy}
+          aria-label={
+            selection.canExport
+              ? undefined
+              : 'Export PDF — writes one file at a time, so select a single invoice'
+          }
+          onClick={onExport}
+        />
+        <Button label="Clear" variant="ghost" size="sm" isDisabled={isBusy} onClick={onClear} />
+      </HStack>
+    </HStack>
   );
 }

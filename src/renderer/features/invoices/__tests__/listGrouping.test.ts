@@ -3,27 +3,16 @@ import { describe, expect, it } from 'vitest';
 import type { Invoice } from '../../../../shared/types';
 import { INVOICE_STATUSES } from '../../../../shared/types';
 import {
-  GROUP_ORDER,
-  LIST_COLUMN_MIN_WIDTH,
-  LIST_COLUMN_WIDTH,
-  PANE_MIN_WIDTH,
   adjacentRowId,
-  buildInvoiceGroups,
   countOpenInvoices,
   countSegments,
   extraCurrencyLabel,
-  flattenGroups,
   formatCurrencyTotals,
   formatMoneyRounded,
-  groupHeaderParts,
-  groupOf,
   isOpenState,
-  listColumnWidthAt,
-  listColumnWidthCss,
   matchesSegment,
   outstandingTotals,
   overdueTotals,
-  relativeTiming,
   rowPosition,
   rowStateOf,
   shortDate,
@@ -31,6 +20,15 @@ import {
   summariseTotals,
 } from '../listGrouping';
 import type { ListSegment, RowState } from '../listGrouping';
+
+const ROW_STATES: readonly RowState[] = [
+  'overdue',
+  'due-soon',
+  'later',
+  'draft',
+  'paid',
+  'void',
+];
 
 const TODAY = '2026-07-29';
 
@@ -54,11 +52,6 @@ function makeInvoice(overrides: Partial<Invoice> = {}): Invoice {
     ...overrides,
   };
 }
-
-const NAMES = new Map([
-  ['c1', 'Halloway & Finch LLP'],
-  ['c2', 'Northwind Analytics'],
-]);
 
 describe('shortDate', () => {
   it('drops the year when it is the year on screen', () => {
@@ -105,52 +98,8 @@ describe('rowStateOf', () => {
 
   it('covers every status in INVOICE_STATUSES', () => {
     for (const status of INVOICE_STATUSES) {
-      const state = rowStateOf(makeInvoice({ status }), TODAY);
-      expect(GROUP_ORDER).toContain(groupOf(state));
+      expect(ROW_STATES).toContain(rowStateOf(makeInvoice({ status }), TODAY));
     }
-  });
-});
-
-describe('relativeTiming', () => {
-  it('counts the days late rather than naming the status', () => {
-    const invoice = makeInvoice({ dueDate: '2026-06-25' });
-    expect(relativeTiming(invoice, 'overdue', TODAY)).toBe('34 days late');
-  });
-
-  it('singularises one day', () => {
-    expect(relativeTiming(makeInvoice({ dueDate: '2026-07-28' }), 'overdue', TODAY)).toBe('1 day late');
-    expect(relativeTiming(makeInvoice({ dueDate: '2026-07-30' }), 'due-soon', TODAY)).toBe('due tomorrow');
-  });
-
-  it('says today rather than "in 0 days"', () => {
-    expect(relativeTiming(makeInvoice({ dueDate: TODAY }), 'due-soon', TODAY)).toBe('due today');
-  });
-
-  it('counts forward for the rest of the week', () => {
-    expect(relativeTiming(makeInvoice({ dueDate: '2026-07-31' }), 'due-soon', TODAY)).toBe('due in 2 days');
-  });
-
-  it('dates anything further out', () => {
-    expect(relativeTiming(makeInvoice({ dueDate: '2026-08-18' }), 'later', TODAY)).toBe('due 18 Aug');
-  });
-
-  it('dates a draft by when it was last edited', () => {
-    const invoice = makeInvoice({ status: 'draft', updatedAt: '2026-07-25T18:00:00.000Z' });
-    expect(relativeTiming(invoice, 'draft', TODAY)).toBe('edited 25 Jul');
-  });
-
-  it('dates a paid invoice by when the money arrived', () => {
-    const invoice = makeInvoice({ status: 'paid', paidAt: '2026-07-24T10:00:00.000Z' });
-    expect(relativeTiming(invoice, 'paid', TODAY)).toBe('paid 24 Jul');
-  });
-
-  it('says only "paid" when nothing recorded the date', () => {
-    expect(relativeTiming(makeInvoice({ status: 'paid' }), 'paid', TODAY)).toBe('paid');
-  });
-
-  it('does not invent a negative day count for a stored overdue that is not due yet', () => {
-    const invoice = makeInvoice({ status: 'overdue', dueDate: '2026-09-01' });
-    expect(relativeTiming(invoice, 'overdue', TODAY)).toBe('marked overdue');
   });
 });
 
@@ -232,114 +181,14 @@ describe('matchesSegment / countSegments', () => {
       ],
       TODAY,
     );
-    expect(counts).toEqual({ all: 5, overdue: 1, sent: 2, drafts: 1 });
-  });
-});
-
-describe('buildInvoiceGroups', () => {
-  const invoices = [
-    makeInvoice({ id: 'a', number: 'INV-0051', dueDate: '2026-06-25', totalCents: 1_800_000 }),
-    makeInvoice({ id: 'b', number: 'INV-0060', dueDate: '2026-07-31', clientId: 'c2' }),
-    makeInvoice({ id: 'c', number: 'INV-0063', dueDate: '2026-08-18' }),
-    makeInvoice({ id: 'd', number: 'INV-0066', status: 'draft', updatedAt: '2026-07-25T09:00:00.000Z' }),
-    makeInvoice({ id: 'e', number: 'INV-0065', status: 'paid', paidAt: '2026-07-24T09:00:00.000Z' }),
-    makeInvoice({ id: 'f', number: 'INV-0002', status: 'void' }),
-  ];
-
-  it('orders the groups by urgency and drops the empty ones', () => {
-    const groups = buildInvoiceGroups({ invoices, clientNames: NAMES, today: TODAY, segment: 'all' });
-    expect(groups.map((group) => group.key)).toEqual([
-      'overdue',
-      'due-soon',
-      'later',
-      'drafts',
-      'paid',
-      'void',
-    ]);
-
-    const onlyDrafts = buildInvoiceGroups({
-      invoices,
-      clientNames: NAMES,
-      today: TODAY,
-      segment: 'drafts',
-    });
-    expect(onlyDrafts.map((group) => group.key)).toEqual(['drafts']);
-  });
-
-  it('builds the second line out of the number and the relative time', () => {
-    const [overdue] = buildInvoiceGroups({
-      invoices,
-      clientNames: NAMES,
-      today: TODAY,
-      segment: 'all',
-    });
-    expect(overdue?.rows[0]?.secondary).toBe('INV-0051 · 34 days late');
-    expect(overdue?.rows[0]?.clientName).toBe('Halloway & Finch LLP');
-    expect(overdue?.rows[0]?.amount).toBe('$18,000.00');
-  });
-
-  it('mutes settled and unissued rows and leaves open ones at full contrast', () => {
-    const groups = buildInvoiceGroups({ invoices, clientNames: NAMES, today: TODAY, segment: 'all' });
-    const byId = new Map(flattenGroups(groups).map((row) => [row.id, row.isMuted]));
-    expect(byId.get('a')).toBe(false);
-    expect(byId.get('d')).toBe(true);
-    expect(byId.get('e')).toBe(true);
-    expect(byId.get('f')).toBe(true);
-  });
-
-  it('carries a per-currency sum on every group but paid', () => {
-    const groups = buildInvoiceGroups({ invoices, clientNames: NAMES, today: TODAY, segment: 'all' });
-    const overdue = groups.find((group) => group.key === 'overdue');
-    const paid = groups.find((group) => group.key === 'paid');
-    expect(overdue?.totals).toEqual([{ currency: 'USD', cents: 1_800_000 }]);
-    expect(groupHeaderParts(overdue!).label).toBe('Overdue · $18,000');
-    // Money that has arrived is not a figure you are chasing.
-    expect(paid?.totals).toEqual([]);
-    expect(groupHeaderParts(paid!).label).toBe('Paid');
-  });
-
-  it('sorts open groups by due date and settled groups newest first', () => {
-    const groups = buildInvoiceGroups({
-      invoices: [
-        makeInvoice({ id: 'late', number: 'INV-0002', dueDate: '2026-05-01' }),
-        makeInvoice({ id: 'later', number: 'INV-0001', dueDate: '2026-06-01' }),
-        makeInvoice({ id: 'newDraft', number: 'INV-0003', status: 'draft', updatedAt: '2026-07-28T09:00:00.000Z' }),
-        makeInvoice({ id: 'oldDraft', number: 'INV-0004', status: 'draft', updatedAt: '2026-07-01T09:00:00.000Z' }),
-      ],
-      clientNames: NAMES,
-      today: TODAY,
-      segment: 'all',
-    });
-    expect(groups[0]?.rows.map((row) => row.id)).toEqual(['late', 'later']);
-    expect(groups[1]?.rows.map((row) => row.id)).toEqual(['newDraft', 'oldDraft']);
-  });
-
-  it('falls back to the client id when no name was joined in', () => {
-    const groups = buildInvoiceGroups({
-      invoices: [makeInvoice({ clientId: 'unknown' })],
-      clientNames: new Map(),
-      today: TODAY,
-      segment: 'all',
-    });
-    expect(groups[0]?.rows[0]?.clientName).toBe('unknown');
+    expect(counts).toEqual({ all: 5, overdue: 1, sent: 2, drafts: 1, paid: 1 });
   });
 });
 
 describe('adjacentRowId / rowPosition', () => {
-  const rows = flattenGroups(
-    buildInvoiceGroups({
-      invoices: [
-        makeInvoice({ id: 'a', number: 'INV-1', dueDate: '2026-05-01' }),
-        makeInvoice({ id: 'b', number: 'INV-2', dueDate: '2026-05-02' }),
-        makeInvoice({ id: 'c', number: 'INV-3', dueDate: '2026-05-03' }),
-      ],
-      clientNames: NAMES,
-      today: TODAY,
-      segment: 'all',
-    }),
-  );
+  const rows = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
 
-  it('walks the flattened list across group boundaries', () => {
+  it('walks the list one row at a time', () => {
     expect(adjacentRowId(rows, 'a', 1)).toBe('b');
     expect(adjacentRowId(rows, 'b', -1)).toBe('a');
   });
@@ -484,58 +333,5 @@ describe('extraCurrencyLabel / summariseTotals', () => {
 
   it('falls back to the largest when the asked-for currency is not in the set', () => {
     expect(summariseTotals([{ currency: 'EUR', cents: 100_000 }], 'GBP').lead).toBe('€1,000');
-  });
-});
-
-describe('groupHeaderParts', () => {
-  it('splits the caption into the figure and the count of the rest', () => {
-    const groups = buildInvoiceGroups({
-      invoices: [
-        makeInvoice({ id: 'a', status: 'draft', currency: 'USD', totalCents: 7_330_800 }),
-        makeInvoice({ id: 'b', status: 'draft', currency: 'EUR', totalCents: 4_949_900 }),
-        makeInvoice({ id: 'c', status: 'draft', currency: 'GBP', totalCents: 100_000 }),
-      ],
-      clientNames: NAMES,
-      today: TODAY,
-      segment: 'all',
-    });
-    const drafts = groups.find((group) => group.key === 'drafts');
-    expect(groupHeaderParts(drafts!)).toEqual({
-      label: 'Drafts · $73,308',
-      more: '+2 currencies',
-    });
-  });
-});
-
-describe('listColumnWidthAt / listColumnWidthCss', () => {
-  it('gives the list its ideal width once the pane is comfortable', () => {
-    expect(listColumnWidthAt(1184)).toBe(LIST_COLUMN_WIDTH);
-  });
-
-  it('takes width off the list before the pane goes under its floor', () => {
-    expect(listColumnWidthAt(LIST_COLUMN_WIDTH + PANE_MIN_WIDTH)).toBe(LIST_COLUMN_WIDTH);
-    expect(listColumnWidthAt(700)).toBe(700 - PANE_MIN_WIDTH);
-  });
-
-  it('never squeezes the list past the point where a row stops reading', () => {
-    expect(listColumnWidthAt(600)).toBe(LIST_COLUMN_MIN_WIDTH);
-    expect(listColumnWidthAt(0)).toBe(LIST_COLUMN_MIN_WIDTH);
-  });
-
-  it('fits the app’s own minimum window', () => {
-    // src/main/window.ts: minWidth 960, less the side nav at its 224px minimum
-    // and its 240px default. Both have to leave the pane its floor.
-    for (const nav of [224, 240]) {
-      const available = 960 - nav;
-      expect(listColumnWidthAt(available) + PANE_MIN_WIDTH).toBeLessThanOrEqual(available);
-    }
-  });
-
-  it('hands the stylesheet the same three numbers', () => {
-    const css = listColumnWidthCss();
-    expect(css).toContain(`${String(LIST_COLUMN_MIN_WIDTH)}px`);
-    expect(css).toContain(`${String(PANE_MIN_WIDTH)}px`);
-    expect(css).toContain(`${String(LIST_COLUMN_WIDTH)}px`);
-    expect(css.startsWith('clamp(')).toBe(true);
   });
 });
