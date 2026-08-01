@@ -271,6 +271,19 @@ describe('supportFacts', () => {
     expect(byLabel['Download size']).toBe('5.03 GB');
   });
 
+  it('does not claim a unified-memory machine has zero memory', () => {
+    // `totalSystemMemoryBytes` is 0 by design when there is no discrete GPU:
+    // RAM is not counted separately because it *is* the VRAM pool. The "of X"
+    // clause has nothing true to say, so it is dropped rather than printed.
+    const facts = supportFacts(
+      support({ breakdown: breakdown({ totalSystemMemoryBytes: 0, usableTotalMemoryBytes: 16 * GIB }) }),
+    );
+    const byLabel = Object.fromEntries(facts.map((fact) => [fact.label, fact.value]));
+
+    expect(byLabel['Usable memory']).toBe('16.00 GiB usable, 2.00 GiB held back');
+    expect(byLabel['Usable memory']).not.toContain('of 0.00 GiB');
+  });
+
   it('says unknown rather than inventing an architecture or a ceiling', () => {
     const facts = supportFacts(support({ architecture: null, maxContextLength: null }));
     const byLabel = Object.fromEntries(facts.map((fact) => [fact.label, fact.value]));

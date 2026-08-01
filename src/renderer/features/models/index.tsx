@@ -190,6 +190,13 @@ export function ModelsPage(): React.JSX.Element {
    * the check moves to mount. `ensureSupport` is idempotent per key and main
    * caches the answer, so this costs one 4 MB header read per curated build,
    * once.
+   *
+   * Cancelled on unmount. A curated check is a 4 MB range read that can outlive
+   * a navigation by seconds, and every one of them ends in a state setter. The
+   * fan-out stays parallel — six sequential range reads would be a visibly
+   * slower first paint — so the cancellation lives one level down, in
+   * `useModels`: it tracks its own mount and drops every result that lands after
+   * the page is gone. Nothing to undo here, so this effect has no teardown.
    */
   const { catalog, ensureSupport } = models;
   useEffect(() => {
@@ -301,10 +308,17 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
     [models.catalog, models.hfRepo, models.discovery],
   );
 
-  // A sweep still in flight is part of what a re-check is waiting on: its
-  // verdicts land in the same cache, so the button must not read "done" while
-  // one is outstanding.
-  const isRechecking =
+  /**
+   * Only a re-check in progress disables the re-check button.
+   *
+   * `isLoading` renders `aria-disabled="true"`, so anything folded into it is a
+   * moment the button cannot be pressed. Round two folded a Hub sweep in so the
+   * chip would show movement, and the result was that `Re-check` was unusable
+   * for the whole of a search — the one activity most likely to make someone
+   * want it. "Something is moving" is a display concern; it belongs on the dot,
+   * not on the button.
+   */
+  const isBusy =
     models.isSystemLoading || models.isDiscovering || Object.keys(models.checking).length > 0;
 
   return (
@@ -318,13 +332,15 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
       }}
     >
       <StatusDot
-        variant={models.isSystemLoading ? 'accent' : detected ? 'success' : 'warning'}
+        variant={isBusy ? 'accent' : detected ? 'success' : 'warning'}
         label={
           models.isSystemLoading
             ? 'Detecting this machine'
-            : detected
-              ? 'Hardware detected'
-              : 'Hardware detection failed'
+            : isBusy
+              ? 'Checking models against this machine'
+              : detected
+                ? 'Hardware detected'
+                : 'Hardware detection failed'
         }
       />
       <Text type="supporting" hasTabularNumbers>
@@ -334,7 +350,7 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
         label="Re-check"
         size="sm"
         variant="ghost"
-        isLoading={isRechecking}
+        isLoading={models.isRechecking}
         onClick={() => {
           void models.recheck(targets);
         }}
@@ -408,7 +424,14 @@ function RecommendationHero({
     const empty = heroEmptyCopy(
       {
         catalogCount: models.catalog.length,
-        isMachineDetected: models.system !== null,
+        // Detection can succeed and still fail to read the memory figure, and
+        // memory is the only number a verdict is computed from — so a profile
+        // with `totalRamBytes: null` is not a machine we can judge against.
+        // Treating it as detected made the all-grey hero say "nothing has been
+        // checked yet", which points at Re-check as the remedy when re-checking
+        // will produce exactly the same grey. The browse banner and the
+        // diagnostics readout already draw this line; the hero now does too.
+        isMachineDetected: models.system !== null && models.system.totalRamBytes !== null,
         tooBig: checks.tooBig,
         checkFailed: checks.checkFailed,
         unchecked: checks.unchecked,

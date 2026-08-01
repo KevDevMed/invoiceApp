@@ -249,8 +249,16 @@ export function supportFacts(support: VariantSupportView | null): SupportFact[] 
     },
     { label: 'Total needed', value: formatGiB(breakdown.totalRequiredBytes) },
     {
+      // `totalSystemMemoryBytes` is deliberately 0 on a unified-memory machine:
+      // there is no discrete GPU, so RAM is not counted separately — it *is* the
+      // VRAM pool, and the VRAM row below carries the real total. Printing the
+      // "of X" clause anyway read `usable 12.00 GiB of 0.00 GiB`, which is not a
+      // rounding wart but a flat falsehood on every Apple Silicon Mac.
       label: 'Usable memory',
-      value: `${formatGiB(breakdown.usableTotalMemoryBytes)} of ${formatGiB(breakdown.totalSystemMemoryBytes)}, ${formatGiB(breakdown.reserveBytes)} held back`,
+      value:
+        breakdown.totalSystemMemoryBytes > 0
+          ? `${formatGiB(breakdown.usableTotalMemoryBytes)} of ${formatGiB(breakdown.totalSystemMemoryBytes)}, ${formatGiB(breakdown.reserveBytes)} held back`
+          : `${formatGiB(breakdown.usableTotalMemoryBytes)} usable, ${formatGiB(breakdown.reserveBytes)} held back`,
     },
     {
       label: 'VRAM',

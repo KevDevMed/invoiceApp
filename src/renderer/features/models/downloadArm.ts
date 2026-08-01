@@ -97,11 +97,18 @@ export function cancelArm(state: ArmState, token: number): ArmState {
  * If a terminal event for that id already arrived after this arm was created,
  * it *was* this request's — consume it now rather than waiting for a second one
  * that is never coming. `shouldLoad` is true only for `ready`.
+ *
+ * `now` is the same clock `noteTerminal` stamps with, and it is what enforces
+ * `TERMINAL_MEMORY_MS` on this side. Without it the TTL was written down but
+ * never applied on attach: only the *next* terminal event pruned the map, so a
+ * download whose invoke took longer than a minute to resolve could consume a
+ * terminal that had already aged out of the window it was kept for.
  */
 export function attachModelId(
   state: ArmState,
   token: number,
   modelId: string,
+  now: number,
 ): { readonly state: ArmState; readonly shouldLoad: boolean } {
   const arm = state.pending.get(token);
   if (!arm) return { state, shouldLoad: false };
@@ -113,7 +120,15 @@ export function attachModelId(
   if (seen && seen.at >= arm.startedAt) {
     const terminals = new Map(state.terminals);
     terminals.delete(modelId);
-    return { state: { ...state, pending, terminals }, shouldLoad: seen.status === 'ready' };
+    // Inside the window it is this request's last word. Outside it, the request
+    // is simply over: the transfer already ended, so no second terminal event is
+    // coming, and arming the id anyway would leave a dangling arm for the next
+    // plain `Download` of that model to trip over.
+    const fresh = now - seen.at <= TERMINAL_MEMORY_MS;
+    return {
+      state: { ...state, pending, terminals },
+      shouldLoad: fresh && seen.status === 'ready',
+    };
   }
 
   const arms = new Map(state.arms);

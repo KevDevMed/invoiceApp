@@ -51,11 +51,12 @@ function discovered(overrides: Partial<DiscoveredVariantView> = {}): DiscoveredV
   };
 }
 
-const nothingFresh = (): boolean => false;
+/** Nothing newer has written any key, i.e. this fold is the latest word. */
+const nothingNewer = (): boolean => false;
 
 describe('foldDiscoveryVerdicts', () => {
   it('caches a real verdict and marks the key answered', () => {
-    const fold = foldDiscoveryVerdicts([discovered()], nothingFresh);
+    const fold = foldDiscoveryVerdicts([discovered()], nothingNewer);
 
     expect(Object.keys(fold.apply)).toEqual(['a/Foo-GGUF/foo.gguf']);
     expect(fold.answered).toEqual(['a/Foo-GGUF/foo.gguf']);
@@ -63,7 +64,7 @@ describe('foldDiscoveryVerdicts', () => {
   });
 
   it('clears a key the sweep had no verdict for, and does not mark it answered', () => {
-    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingFresh);
+    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingNewer);
 
     expect(fold.apply).toEqual({});
     expect(fold.answered).toEqual([]);
@@ -73,7 +74,7 @@ describe('foldDiscoveryVerdicts', () => {
   it('treats a failed check the same as no check at all', () => {
     const fold = foldDiscoveryVerdicts(
       [discovered({ support: support({ error: 'range request refused' }) })],
-      nothingFresh,
+      nothingNewer,
     );
 
     expect(fold.apply).toEqual({});
@@ -81,7 +82,42 @@ describe('foldDiscoveryVerdicts', () => {
     expect(fold.clear).toEqual(['a/Foo-GGUF/foo.gguf']);
   });
 
-  it('leaves a verdict the current machine reading already produced', () => {
+  it('clears a key the current machine reading already answered', () => {
+    // Round two spared this case, reasoning that both answers were founded on
+    // the same machine reading. They were — but the sweep is saying it could not
+    // verify the key, and that is evidence about the key. Sparing it left a
+    // stale colour on the row *and* marked it answered, so nothing would look
+    // again and there was no way back.
+    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingNewer);
+
+    expect(fold.clear).toEqual(['a/Foo-GGUF/foo.gguf']);
+    expect(fold.answered).toEqual([]);
+  });
+
+  it('leaves a row re-checkable after clearing it', () => {
+    // `answered` is what marks a key as needing no lazy check. A cleared key
+    // must not be in it, or the row loses its `Check` affordance for good.
+    const fold = foldDiscoveryVerdicts(
+      [discovered({ support: support({ error: 'gated repo' }) })],
+      nothingNewer,
+    );
+
+    expect(fold.answered).not.toContain('a/Foo-GGUF/foo.gguf');
+    expect(fold.clear).toContain('a/Foo-GGUF/foo.gguf');
+  });
+
+  it('does not overwrite a key some later producer already wrote', () => {
+    // The apply half of the same ordering race the clear half was guarded
+    // against: a slow sweep's perfectly valid verdict is still the older one.
+    const fold = foldDiscoveryVerdicts([discovered()], (key) => key === 'a/Foo-GGUF/foo.gguf');
+
+    expect(fold.apply).toEqual({});
+    expect(fold.answered).toEqual([]);
+    expect(fold.clear).toEqual([]);
+    expect(foldIsEmpty(fold)).toBe(true);
+  });
+
+  it('does not clear a key some later producer already wrote', () => {
     const fold = foldDiscoveryVerdicts(
       [discovered({ support: null })],
       (key) => key === 'a/Foo-GGUF/foo.gguf',
@@ -91,21 +127,31 @@ describe('foldDiscoveryVerdicts', () => {
     expect(fold.answered).toEqual([]);
   });
 
+  it('still folds the keys a later producer has not touched', () => {
+    const fold = foldDiscoveryVerdicts(
+      [discovered(), discovered({ repo: 'b/Bar-GGUF', filename: 'bar.gguf', support: null })],
+      (key) => key === 'a/Foo-GGUF/foo.gguf',
+    );
+
+    expect(Object.keys(fold.apply)).toEqual([]);
+    expect(fold.clear).toEqual(['b/Bar-GGUF/bar.gguf']);
+  });
+
   it('has nothing to do with an empty sweep', () => {
-    expect(foldIsEmpty(foldDiscoveryVerdicts([], nothingFresh))).toBe(true);
+    expect(foldIsEmpty(foldDiscoveryVerdicts([], nothingNewer))).toBe(true);
   });
 });
 
 describe('applyDiscoveryFold', () => {
   it('drops a stale verdict rather than leaving it in place', () => {
     const before = { 'a/Foo-GGUF/foo.gguf': support({ breakdown: support().breakdown }) };
-    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingFresh);
+    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingNewer);
 
     expect(applyDiscoveryFold(before, fold)).toEqual({});
   });
 
   it('writes the verdicts the sweep did produce', () => {
-    const fold = foldDiscoveryVerdicts([discovered()], nothingFresh);
+    const fold = foldDiscoveryVerdicts([discovered()], nothingNewer);
     const after = applyDiscoveryFold({}, fold);
 
     expect(after['a/Foo-GGUF/foo.gguf']?.breakdown.verdict).toBe('GREEN');
@@ -114,7 +160,7 @@ describe('applyDiscoveryFold', () => {
   it('never clears a key the same fold wrote', () => {
     const fold = foldDiscoveryVerdicts(
       [discovered(), discovered({ support: null })],
-      nothingFresh,
+      nothingNewer,
     );
     const after = applyDiscoveryFold({}, fold);
 
@@ -123,7 +169,7 @@ describe('applyDiscoveryFold', () => {
 
   it('leaves other keys alone', () => {
     const other = support({ repo: 'b/Bar-GGUF', filename: 'bar.gguf' });
-    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingFresh);
+    const fold = foldDiscoveryVerdicts([discovered({ support: null })], nothingNewer);
 
     expect(Object.keys(applyDiscoveryFold({ 'b/Bar-GGUF/bar.gguf': other }, fold))).toEqual([
       'b/Bar-GGUF/bar.gguf',

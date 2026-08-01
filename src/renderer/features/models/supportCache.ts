@@ -46,16 +46,22 @@ export interface DiscoveryFold {
 /**
  * Split a sweep's results into those three buckets.
  *
- * `isFresh` reports whether a key was already checked — or is being checked —
- * under the *current* generation. Such a key is not cleared: it is founded on
- * the same machine reading this sweep was, so dropping it would throw away a
- * good answer to fix a staleness problem it does not have. Main budgets its
- * header reads, so a curated row that checked itself on mount and then turns up
- * in a search main had no budget left for is the ordinary case, not the corner.
+ * `isSuperseded` reports whether some *later* producer has already written or
+ * cleared that key. Ordering is the only thing that decides who wins, and it
+ * applies to both halves: a valid verdict from an older sweep must not overwrite
+ * a newer one, and neither must an older sweep's clear. Round two guarded only
+ * the clear path, which left the overwrite half of the same race open.
+ *
+ * What it deliberately does *not* do any more is spare a key because the current
+ * machine reading already answered it. That narrowing meant a result carrying no
+ * usable verdict left the previous verdict alive *and* marked the row answered,
+ * so the row lost its `Check` affordance with a stale colour still on it and
+ * there was no way back. A sweep that says it could not verify a key is evidence
+ * about that key: the cached verdict goes and the row stays re-checkable.
  */
 export function foldDiscoveryVerdicts(
   models: readonly DiscoveredVariantView[],
-  isFresh: (key: string) => boolean,
+  isSuperseded: (key: string) => boolean,
 ): DiscoveryFold {
   const apply: Record<string, VariantSupportView> = {};
   const clear: string[] = [];
@@ -63,13 +69,14 @@ export function foldDiscoveryVerdicts(
 
   for (const model of models) {
     const key = variantKey(model.repo, model.filename);
+    if (isSuperseded(key)) continue;
     const support = model.support;
     if (support !== null && support.error === null) {
       apply[key] = support;
       answered.push(key);
       continue;
     }
-    if (!isFresh(key) && !clear.includes(key)) clear.push(key);
+    if (!clear.includes(key)) clear.push(key);
   }
 
   return { apply, clear, answered };

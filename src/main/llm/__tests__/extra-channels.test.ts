@@ -14,6 +14,7 @@ import {
   CheckSupportRequest,
   HfLookupRequest,
   SmokeTestRequest,
+  SystemInfoRequest,
   opOf,
 } from '../extra-channels';
 
@@ -63,6 +64,22 @@ describe('opOf', () => {
 });
 
 describe('per-op schemas', () => {
+  it('validates systemInfo, with refresh optional', () => {
+    // The field `Re-check` needs to ask for a fresh hardware probe rather than
+    // main's process-lifetime cache. Optional, so every caller written before it
+    // existed still parses and still means "the cached reading".
+    expect(SystemInfoRequest.parse({ op: 'systemInfo' })).toEqual({ op: 'systemInfo' });
+    expect(SystemInfoRequest.parse({ op: 'systemInfo' }).refresh).toBeUndefined();
+    expect(SystemInfoRequest.parse({ op: 'systemInfo', refresh: true }).refresh).toBe(true);
+    expect(SystemInfoRequest.parse({ op: 'systemInfo', refresh: false }).refresh).toBe(false);
+    expect(() => SystemInfoRequest.parse({ op: 'systemInfo', refresh: 'yes' })).toThrowError();
+    // And it still rides the envelope, which is how it reaches main at all.
+    expect(CatalogRequestSchema.parse({ op: 'systemInfo', refresh: true })).toMatchObject({
+      op: 'systemInfo',
+      refresh: true,
+    });
+  });
+
   it('validates checkSupport', () => {
     expect(
       CheckSupportRequest.parse({ op: 'checkSupport', repo: 'a/b', filename: 'm.gguf' }),
