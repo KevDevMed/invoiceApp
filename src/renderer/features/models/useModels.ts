@@ -523,7 +523,16 @@ export function useModels(): ModelsState {
       setIsDiscovering(true);
       setDiscoveryError(null);
       try {
-        const result = await discoverModelsCall({ query });
+        // INV-4: `refresh` because main's per-variant verdict cache carries no
+        // reference to the hardware profile its entries were computed against.
+        // A check that was in flight across a `Re-check` still writes its stale
+        // answer into that cache, and a sweep asking politely is served it —
+        // whereupon a model that does not fit folds in as non-RED and downloads
+        // without the confirmation. The renderer cannot fence another process's
+        // cache, so it declines to accept anything that cache might have served.
+        // The durable fix is versioning main's cache against the profile, filed
+        // as INV-4; when that lands, drop this flag and the header reads it costs.
+        const result = await discoverModelsCall({ query, refresh: true });
         // A newer search, or a `Clear results`, has spoken since. Its rows are
         // what the user is looking at; these are a stale answer to a stale query.
         if (!isCurrent()) return;

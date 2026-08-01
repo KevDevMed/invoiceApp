@@ -236,6 +236,7 @@ export interface DiscoverArgs {
   readonly maxRepos?: number;
   readonly maxVariantsPerRepo?: number;
   readonly maxChecks?: number;
+  /** Bypass main's per-variant verdict cache for every check the sweep runs. */
   readonly refresh?: boolean;
 }
 
