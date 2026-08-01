@@ -22,7 +22,10 @@ import type {
 } from '@astryxdesign/core/PowerSearch';
 
 import type { Invoice, InvoiceStatus } from '../../../shared/types';
+import { daysBetween } from './detail';
 import { STATUS_OPTIONS } from './format';
+import type { ColumnFilterPredicate, ListColumnKey } from './listColumns';
+import { isOpenState, matchesSegment, rowStateOf } from './listGrouping';
 
 // ---------------------------------------------------------------------------
 // Field and operator keys — the single source of truth shared by the config,
@@ -289,7 +292,188 @@ export function applyClientFilters(
 }
 
 // ---------------------------------------------------------------------------
+// Column-menu filter chips
+// ---------------------------------------------------------------------------
+
+/**
+ * One filter applied from a column header menu.
+ *
+ * The design stores chips as rendered strings (`'STATUS: Overdue only'`). This
+ * stores the decision instead: which column it came from, which predicate it
+ * means, and the reader's input where the option asked for one. The label is
+ * derived (./columnMenu), so two chips are the same chip when they mean the
+ * same thing rather than when they happen to print the same.
+ */
+export interface FilterChip {
+  readonly columnKey: ListColumnKey;
+  readonly predicate: ColumnFilterPredicate;
+  /** The ellipsis options' second step. Absent for options that commit on click. */
+  readonly value?: string;
+}
+
+/**
+ * What a chip needs beyond the invoice itself: the client-name join (the row
+ * carries a `clientId`, the reader typed a name) and the set of clients with
+ * something open (a set-level fact no per-invoice predicate can see).
+ */
+export interface ChipContext {
+  readonly today: string;
+  readonly clientNames: ReadonlyMap<string, string>;
+  readonly openClientIds: ReadonlySet<string>;
+}
+
+/** En dash. Both range inputs canonicalise to `from – to` with this between. */
+const RANGE_SEPARATOR = '–';
+
+/** `1000 – 5000` -> `['1000', '5000']`. Null when it is not a pair. */
+export function parseRangeValue(value: string): readonly [string, string] | null {
+  const parts = value.split(RANGE_SEPARATOR).map((part) => part.trim());
+  const [from, to] = parts;
+  if (parts.length !== 2 || from === undefined || to === undefined) return null;
+  if (from === '' || to === '') return null;
+  return [from, to];
+}
+
+/** `from` and `to` joined the one way every range chip stores them. */
+export function formatRangeValue(from: string, to: string): string {
+  return `${from.trim()} ${RANGE_SEPARATOR} ${to.trim()}`;
+}
+
+/** Clients with at least one invoice still owed. Feeds `client-has-open-balance`. */
+export function openClientIdsOf(
+  invoices: readonly Invoice[],
+  today: string,
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const invoice of invoices) {
+    if (isOpenState(rowStateOf(invoice, today))) ids.add(invoice.clientId);
+  }
+  return ids;
+}
+
+/** Which calendar quarter an ISO date's month falls in: 1-4. */
+function quarterOf(iso: string): number {
+  return Math.floor((Number(iso.slice(5, 7)) - 1) / 3) + 1;
+}
+
+function containsFold(haystack: string, needle: string): boolean {
+  return haystack.toLowerCase().includes(needle.toLowerCase());
+}
+
+/**
+ * The thresholds behind `Over 10,000` / `Under 1,000`, in integer minor units.
+ * Compared against `totalCents` with no currency check — the same knowingly
+ * rate-less comparison the existing Amount filter and `total-desc` make, and
+ * the reason the labels carry no currency symbol.
+ */
+const OVER_THRESHOLD_CENTS = 1_000_000;
+const UNDER_THRESHOLD_CENTS = 100_000;
+
+/**
+ * True when the invoice satisfies one chip.
+ *
+ * A chip whose option needed a value and does not have one matches everything
+ * rather than nothing: a half-built filter should not empty the screen. The
+ * input step never commits such a chip, so this is a guard, not a path.
+ */
+export function matchesChip(invoice: Invoice, chip: FilterChip, context: ChipContext): boolean {
+  const clientName = context.clientNames.get(invoice.clientId) ?? invoice.clientId;
+  const state = rowStateOf(invoice, context.today);
+  const value = chip.value?.trim() ?? '';
+
+  switch (chip.predicate) {
+    case 'client-contains':
+      return value === '' || containsFold(clientName, value);
+    case 'client-any-of': {
+      const wanted = value
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => part !== '');
+      return wanted.length === 0 || wanted.some((part) => containsFold(clientName, part));
+    }
+    case 'client-has-open-balance':
+      return context.openClientIds.has(invoice.clientId);
+    case 'number-contains':
+      return value === '' || containsFold(invoice.number, value);
+
+    case 'status-open':
+      return isOpenState(state);
+    case 'status-overdue':
+      return state === 'overdue';
+    case 'status-due-soon':
+      return state === 'due-soon';
+    case 'status-sent':
+      // The same reading the Sent tab uses: issued, still open, not yet late.
+      return matchesSegment(state, 'sent');
+    case 'status-draft':
+      return state === 'draft';
+    case 'status-paid':
+      return state === 'paid';
+
+    case 'issued-this-month':
+      return invoice.issueDate.slice(0, 7) === context.today.slice(0, 7);
+    case 'issued-last-30-days': {
+      const age = daysBetween(invoice.issueDate, context.today);
+      return age !== null && age >= 0 && age <= 30;
+    }
+    case 'issued-this-quarter':
+      return (
+        invoice.issueDate.slice(0, 4) === context.today.slice(0, 4) &&
+        quarterOf(invoice.issueDate) === quarterOf(context.today)
+      );
+    case 'issued-range': {
+      const range = parseRangeValue(value);
+      if (range === null) return true;
+      const [from, to] = range;
+      return invoice.issueDate >= from && invoice.issueDate <= to;
+    }
+
+    case 'total-over':
+      return invoice.totalCents > OVER_THRESHOLD_CENTS;
+    case 'total-under':
+      return invoice.totalCents < UNDER_THRESHOLD_CENTS;
+    case 'total-between': {
+      const range = parseRangeValue(value);
+      if (range === null) return true;
+      const from = Math.round(Number(range[0]) * 100);
+      const to = Math.round(Number(range[1]) * 100);
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return true;
+      return invoice.totalCents >= from && invoice.totalCents <= to;
+    }
+    case 'total-currency':
+      return value === '' || invoice.currency === value.toUpperCase();
+  }
+}
+
+/**
+ * Every chip ANDed, preserving order and never mutating the input.
+ *
+ * Applied in the renderer rather than pushed into `toListRequest`: the backend
+ * understands a *stored* status, and every status chip here is date-derived
+ * (`rowStateOf` re-reads a sent invoice against the clock), so narrowing
+ * server-side would silently drop invoices that went late overnight. The view
+ * already holds the complete matching set, which is what makes that safe — the
+ * same reason the amount and invoice-number filters are client-side.
+ */
+export function applyChips(
+  invoices: readonly Invoice[],
+  chips: readonly FilterChip[],
+  context: ChipContext,
+): Invoice[] {
+  if (chips.length === 0) return [...invoices];
+  return invoices.filter((invoice) =>
+    chips.every((chip) => matchesChip(invoice, chip, context)),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sorting
+//
+// **Not the list's sorter.** `InvoiceList` sorts `ListRow`s with `sortRows` /
+// `SortState` from ./listRows; these seven keys order raw `Invoice`s and are
+// used by other hosts. The two unions overlap in name only (`issued-desc`
+// exists in both with different companions), so importing the wrong one
+// typechecks and silently sorts by something else.
 // ---------------------------------------------------------------------------
 
 export type InvoiceSortKey =

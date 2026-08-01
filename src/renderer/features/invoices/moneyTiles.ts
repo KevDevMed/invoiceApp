@@ -18,7 +18,8 @@
  */
 
 import type { Invoice } from '../../../shared/types';
-import { daysPastDue } from './detail';
+import { daysBetween, daysPastDue } from './detail';
+import type { ColumnFilterPredicate } from './listColumns';
 import {
   isOpenState,
   rowStateOf,
@@ -34,8 +35,14 @@ export interface MoneyTile {
   readonly label: string;
   /** The lead per-currency figure, or an em dash when the bucket is empty. */
   readonly figure: string;
-  /** `6 invoices · oldest 34 days`. Never empty — says so when it is zero. */
+  /**
+   * The sub-line under the figure. Forward-looking rather than a restatement of
+   * the count, which now sits in the tile's header row: `next: Halcyon, Fri`,
+   * `never sent · oldest 12d`. Never empty — it says so when it is zero.
+   */
   readonly detail: string;
+  /** The count as the header row prints it: `31 invoices`, or a bare `4`. */
+  readonly headerCount: string;
   /** How many currencies `figure` is standing in front of. */
   readonly extraCurrencies: number;
   /** Every currency joined — what the disclosure shows. */
@@ -44,10 +51,22 @@ export interface MoneyTile {
   readonly count: number;
   /** Only `overdue` is toned; the design colours exactly one tile. */
   readonly tone: 'neutral' | 'error';
+  /**
+   * The filter a click on this tile applies. A tile is a filter shortcut, and
+   * it produces the same chip the matching column-menu option would — a tile
+   * that reached a state no menu offers would be a state the reader cannot
+   * reproduce or undo by hand.
+   */
+  readonly predicate: ColumnFilterPredicate;
 }
 
 /** The empty figure. An em dash, not `$0` — nothing is not zero of something. */
 const NO_FIGURE = '—';
+
+/** Past this, an overdue invoice has stopped being late and started being a problem. */
+const STALE_OVERDUE_DAYS = 30;
+
+const WEEKDAYS_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function plural(count: number, unit: string): string {
   return `${String(count)} ${unit}${count === 1 ? '' : 's'}`;
@@ -55,6 +74,48 @@ function plural(count: number, unit: string): string {
 
 function invoiceCount(count: number): string {
   return plural(count, 'invoice');
+}
+
+/**
+ * `Fri` for an ISO date. Built through `Date.UTC` from the parsed parts rather
+ * than `new Date(iso)` so the weekday is the one on the calendar, not the one
+ * the runner's timezone shifts a midnight-UTC instant into.
+ */
+function weekdayOf(iso: string): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!match) return null;
+  const [, year, month, day] = match;
+  const stamp = Date.UTC(Number(year), Number(month) - 1, Number(day));
+  return WEEKDAYS_SHORT[new Date(stamp).getUTCDay()] ?? null;
+}
+
+/**
+ * `next: Halcyon, Fri` — who and when the soonest of a bucket is due. The one
+ * fact a reader acts on next, in place of a count they can already see in the
+ * header row. Falls back to the count when no name has been joined yet.
+ */
+function nextDueDetail(
+  bucket: readonly Invoice[],
+  clientNames: ReadonlyMap<string, string>,
+): string {
+  const soonest = bucket.reduce<Invoice | null>(
+    (best, invoice) => (best === null || invoice.dueDate < best.dueDate ? invoice : best),
+    null,
+  );
+  if (soonest === null) return invoiceCount(bucket.length);
+  const name = clientNames.get(soonest.clientId);
+  const day = weekdayOf(soonest.dueDate);
+  if (name === undefined || day === null) return invoiceCount(bucket.length);
+  return `next: ${name}, ${day}`;
+}
+
+/** `never sent · oldest 12d` — how long the stalest draft has been sitting. */
+function draftDetail(drafts: readonly Invoice[], today: string): string {
+  const oldest = drafts.reduce((worst, invoice) => {
+    const age = daysBetween(invoice.issueDate, today);
+    return age === null ? worst : Math.max(worst, age);
+  }, 0);
+  return oldest <= 0 ? 'never sent' : `never sent · oldest ${String(oldest)}d`;
 }
 
 /** Which tile, if any, an invoice's state feeds. Paid and void feed none. */
@@ -74,7 +135,11 @@ function tileOf(state: RowState): MoneyTileKey | null {
  * same reason the old header line was: four figures side by side that are not
  * the same money read as a breakdown of each other when they are not.
  */
-export function buildMoneyTiles(invoices: readonly Invoice[], today: string): MoneyTile[] {
+export function buildMoneyTiles(
+  invoices: readonly Invoice[],
+  today: string,
+  clientNames: ReadonlyMap<string, string> = new Map(),
+): MoneyTile[] {
   const open: Invoice[] = [];
   const overdue: Invoice[] = [];
   const dueSoon: Invoice[] = [];
@@ -107,29 +172,47 @@ export function buildMoneyTiles(invoices: readonly Invoice[], today: string): Mo
     0,
   );
 
+  /**
+   * How many are past `STALE_OVERDUE_DAYS`. The design's third overdue fact is
+   * `4 past a reminder`; this app sends nothing and tracks no reminders (the
+   * bulk bar says so too), so the fact that is actually true stands in its
+   * place — same shape, same purpose, no invented history.
+   */
+  const stale = overdue.filter(
+    (invoice) => daysPastDue(invoice.dueDate, today) > STALE_OVERDUE_DAYS,
+  ).length;
+
   const overdueDetail =
     overdue.length === 0
       ? 'Nothing overdue'
-      : oldest === 0
-        ? invoiceCount(overdue.length)
-        : `${invoiceCount(overdue.length)} · oldest ${plural(oldest, 'day')}`;
+      : [
+          invoiceCount(overdue.length),
+          oldest === 0 ? null : `oldest ${plural(oldest, 'day')}`,
+          stale === 0 ? null : `${String(stale)} over ${String(STALE_OVERDUE_DAYS)} days`,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(' · ');
 
   const tile = (
     key: MoneyTileKey,
     label: string,
     bucket: readonly Invoice[],
     detail: string,
+    headerCount: string,
     tone: 'neutral' | 'error',
+    predicate: ColumnFilterPredicate,
     summary = summariseTotals(sumByCurrency(bucket), lead),
   ): MoneyTile => ({
     key,
     label,
     figure: summary.lead === '' ? NO_FIGURE : summary.lead,
     detail,
+    headerCount,
     extraCurrencies: summary.extraCurrencies,
     full: summary.full,
     count: bucket.length,
     tone,
+    predicate,
   });
 
   return [
@@ -138,23 +221,37 @@ export function buildMoneyTiles(invoices: readonly Invoice[], today: string): Mo
       'Outstanding',
       open,
       open.length === 0 ? 'Nothing outstanding' : invoiceCount(open.length),
+      invoiceCount(open.length),
       'neutral',
+      'status-open',
       outstandingSummary,
     ),
-    tile('overdue', 'Overdue', overdue, overdueDetail, 'error'),
+    tile(
+      'overdue',
+      'Overdue',
+      overdue,
+      overdueDetail,
+      String(overdue.length),
+      'error',
+      'status-overdue',
+    ),
     tile(
       'due-soon',
       'Due in 7 days',
       dueSoon,
-      dueSoon.length === 0 ? 'Nothing due this week' : invoiceCount(dueSoon.length),
+      dueSoon.length === 0 ? 'Nothing due this week' : nextDueDetail(dueSoon, clientNames),
+      String(dueSoon.length),
       'neutral',
+      'status-due-soon',
     ),
     tile(
       'drafts',
       'Drafts',
       drafts,
-      drafts.length === 0 ? 'No drafts' : `${String(drafts.length)} never sent`,
+      drafts.length === 0 ? 'No drafts' : draftDetail(drafts, today),
+      String(drafts.length),
       'neutral',
+      'status-draft',
     ),
   ];
 }

@@ -24,8 +24,13 @@ import {
   OPERATOR_EQUALS,
   OPERATOR_IS,
   SORT_OPTIONS,
+  applyChips,
   applyClientFilters,
   buildInvoiceSearchConfig,
+  formatRangeValue,
+  matchesChip,
+  openClientIdsOf,
+  parseRangeValue,
   matchesClientFilters,
   resolveDateRange,
   sortInvoices,
@@ -33,6 +38,8 @@ import {
 } from '../filters';
 
 const NOW = new Date('2026-07-27T12:00:00.000Z');
+/** The same instant as a calendar date, for the chip predicates. */
+const TODAY = '2026-07-27';
 
 function invoice(patch: Partial<Invoice> = {}): Invoice {
   return {
@@ -352,5 +359,177 @@ describe('sortInvoices', () => {
       expect(sortInvoices(rows, option.value)).toHaveLength(rows.length);
       expect(option.label.length).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Column-menu chips
+// ---------------------------------------------------------------------------
+
+describe('range values', () => {
+  it('round-trips a pair through one canonical form', () => {
+    expect(parseRangeValue(formatRangeValue('1000', '5000'))).toEqual(['1000', '5000']);
+    expect(formatRangeValue(' 2026-01-01 ', '2026-03-31 ')).toBe('2026-01-01 – 2026-03-31');
+  });
+
+  it('refuses anything that is not a pair', () => {
+    expect(parseRangeValue('1000')).toBe(null);
+    expect(parseRangeValue('1000 – ')).toBe(null);
+    expect(parseRangeValue('1 – 2 – 3')).toBe(null);
+  });
+});
+
+describe('openClientIdsOf', () => {
+  it('names only the clients with something still owed', () => {
+    const ids = openClientIdsOf(
+      [
+        invoice({ id: 'a', clientId: 'c1', status: 'sent', dueDate: '2026-08-01' }),
+        invoice({ id: 'b', clientId: 'c2', status: 'paid' }),
+        invoice({ id: 'c', clientId: 'c3', status: 'draft' }),
+      ],
+      TODAY,
+    );
+    expect([...ids]).toEqual(['c1']);
+  });
+});
+
+describe('matchesChip', () => {
+  const NAMES = new Map([
+    ['c1', 'Halcyon Systems'],
+    ['c2', 'Northwind Analytics'],
+  ]);
+  const context = {
+    today: TODAY,
+    clientNames: NAMES,
+    openClientIds: new Set(['c1']),
+  };
+  const match = (
+    predicate: Parameters<typeof matchesChip>[1]['predicate'],
+    patch: Partial<Invoice> = {},
+    value?: string,
+  ): boolean =>
+    matchesChip(invoice(patch), { columnKey: 'status', predicate, value }, context);
+
+  it('matches a client name case-insensitively', () => {
+    expect(match('client-contains', { clientId: 'c1' }, 'halcyon')).toBe(true);
+    expect(match('client-contains', { clientId: 'c2' }, 'halcyon')).toBe(false);
+  });
+
+  it('matches any of a comma-separated list of clients', () => {
+    expect(match('client-any-of', { clientId: 'c2' }, 'Halcyon, Northwind')).toBe(true);
+    expect(match('client-any-of', { clientId: 'c2' }, 'Halcyon, Acme')).toBe(false);
+  });
+
+  it('reads "has open balance" off the set-level fact, not off the row', () => {
+    // The paid invoice still matches: its *client* has something open.
+    expect(match('client-has-open-balance', { clientId: 'c1', status: 'paid' })).toBe(true);
+    expect(match('client-has-open-balance', { clientId: 'c2', status: 'sent' })).toBe(false);
+  });
+
+  it('matches an invoice number substring', () => {
+    expect(match('number-contains', { number: 'INV-2026-0042' }, 'inv-2026')).toBe(true);
+    expect(match('number-contains', { number: 'INV-2026-0042' }, '9999')).toBe(false);
+  });
+
+  it('reads status against the clock, not against the stored flag', () => {
+    // Sent, past its due date, never restated: overdue this morning regardless.
+    const late = { status: 'sent' as InvoiceStatus, dueDate: '2026-07-01' };
+    expect(match('status-overdue', late)).toBe(true);
+    expect(match('status-open', late)).toBe(true);
+    expect(match('status-sent', late)).toBe(false);
+  });
+
+  it('separates the status buckets the tiles and the tabs use', () => {
+    expect(match('status-due-soon', { status: 'sent', dueDate: '2026-08-01' })).toBe(true);
+    expect(match('status-sent', { status: 'sent', dueDate: '2026-12-01' })).toBe(true);
+    expect(match('status-draft', { status: 'draft' })).toBe(true);
+    expect(match('status-paid', { status: 'paid' })).toBe(true);
+    expect(match('status-open', { status: 'paid' })).toBe(false);
+    expect(match('status-open', { status: 'draft' })).toBe(false);
+  });
+
+  it('reads the issued windows off the calendar', () => {
+    // TODAY is 2026-07-27.
+    expect(match('issued-this-month', { issueDate: '2026-07-02' })).toBe(true);
+    expect(match('issued-this-month', { issueDate: '2026-06-30' })).toBe(false);
+    expect(match('issued-last-30-days', { issueDate: '2026-07-01' })).toBe(true);
+    expect(match('issued-last-30-days', { issueDate: '2026-05-01' })).toBe(false);
+    // A future issue date is not "the last 30 days".
+    expect(match('issued-last-30-days', { issueDate: '2026-08-01' })).toBe(false);
+    expect(match('issued-this-quarter', { issueDate: '2026-09-30' })).toBe(true);
+    expect(match('issued-this-quarter', { issueDate: '2026-06-30' })).toBe(false);
+    expect(match('issued-this-quarter', { issueDate: '2025-08-01' })).toBe(false);
+  });
+
+  it('matches an inclusive custom issued range', () => {
+    const range = formatRangeValue('2026-01-01', '2026-03-31');
+    expect(match('issued-range', { issueDate: '2026-01-01' }, range)).toBe(true);
+    expect(match('issued-range', { issueDate: '2026-03-31' }, range)).toBe(true);
+    expect(match('issued-range', { issueDate: '2026-04-01' }, range)).toBe(false);
+  });
+
+  it('compares totals as integer cents at the stated thresholds', () => {
+    expect(match('total-over', { totalCents: 1_000_001 })).toBe(true);
+    expect(match('total-over', { totalCents: 1_000_000 })).toBe(false);
+    expect(match('total-under', { totalCents: 99_999 })).toBe(true);
+    expect(match('total-under', { totalCents: 100_000 })).toBe(false);
+  });
+
+  it('matches an inclusive money range, in major units', () => {
+    const range = formatRangeValue('1000', '5000');
+    expect(match('total-between', { totalCents: 100_000 }, range)).toBe(true);
+    expect(match('total-between', { totalCents: 500_000 }, range)).toBe(true);
+    expect(match('total-between', { totalCents: 99_999 }, range)).toBe(false);
+    expect(match('total-between', { totalCents: 500_001 }, range)).toBe(false);
+  });
+
+  it('matches a currency by code, case-insensitively', () => {
+    expect(match('total-currency', { currency: 'EUR' }, 'eur')).toBe(true);
+    expect(match('total-currency', { currency: 'USD' }, 'EUR')).toBe(false);
+  });
+
+  it('matches everything rather than nothing when a value is missing', () => {
+    // A half-built filter must not empty the screen. The input step never
+    // commits one, so this is a guard rather than a path.
+    expect(match('client-contains', { clientId: 'c2' })).toBe(true);
+    expect(match('total-between', { totalCents: 1 }, 'not a range')).toBe(true);
+    expect(match('issued-range', { issueDate: '2020-01-01' }, '')).toBe(true);
+  });
+});
+
+describe('applyChips', () => {
+  const context = {
+    today: TODAY,
+    clientNames: new Map([['c1', 'Halcyon']]),
+    openClientIds: new Set<string>(),
+  };
+  const invoices = [
+    invoice({ id: 'a', status: 'draft', totalCents: 50_000 }),
+    invoice({ id: 'b', status: 'sent', dueDate: '2026-07-01', totalCents: 2_000_000 }),
+    invoice({ id: 'c', status: 'paid', totalCents: 2_000_000 }),
+  ];
+
+  it('returns a copy of the list when there is nothing to apply', () => {
+    const result = applyChips(invoices, [], context);
+    expect(result.map((item) => item.id)).toEqual(['a', 'b', 'c']);
+    expect(result).not.toBe(invoices);
+  });
+
+  it('ANDs every chip and preserves order', () => {
+    const result = applyChips(
+      invoices,
+      [
+        { columnKey: 'status', predicate: 'status-open' },
+        { columnKey: 'total', predicate: 'total-over' },
+      ],
+      context,
+    );
+    expect(result.map((item) => item.id)).toEqual(['b']);
+  });
+
+  it('does not mutate its input', () => {
+    const before = invoices.map((item) => item.id);
+    applyChips(invoices, [{ columnKey: 'status', predicate: 'status-paid' }], context);
+    expect(invoices.map((item) => item.id)).toEqual(before);
   });
 });

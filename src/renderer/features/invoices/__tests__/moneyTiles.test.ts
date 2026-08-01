@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Invoice } from '../../../../shared/types';
+import { COLUMNS } from '../listColumns';
 import { buildMoneyTiles } from '../moneyTiles';
 import type { MoneyTile, MoneyTileKey } from '../moneyTiles';
 
@@ -86,8 +87,20 @@ describe('buildMoneyTiles', () => {
       ],
       TODAY,
     );
-    expect(byKey(tiles, 'overdue').detail).toBe('2 invoices · oldest 34 days');
+    expect(byKey(tiles, 'overdue').detail).toBe(
+      '2 invoices · oldest 34 days · 1 over 30 days',
+    );
     expect(byKey(tiles, 'overdue').count).toBe(2);
+  });
+
+  it('carries three overdue facts, and drops the third when none is stale', () => {
+    // The design's third fact is `4 past a reminder`; this app sends no
+    // reminders, so the count past 30 days stands in its place.
+    const tiles = buildMoneyTiles(
+      [makeInvoice({ id: 'a', dueDate: '2026-07-11' })], // 18 days late
+      TODAY,
+    );
+    expect(byKey(tiles, 'overdue').detail).toBe('1 invoice · oldest 18 days');
   });
 
   it('drops the oldest clause for an invoice only flagged overdue', () => {
@@ -109,7 +122,8 @@ describe('buildMoneyTiles', () => {
 
   it('counts drafts as never sent and keeps them out of outstanding', () => {
     const tiles = buildMoneyTiles([makeInvoice({ status: 'draft' })], TODAY);
-    expect(byKey(tiles, 'drafts').detail).toBe('1 never sent');
+    expect(byKey(tiles, 'drafts').detail).toBe('never sent · oldest 64d');
+    expect(byKey(tiles, 'drafts').headerCount).toBe('1');
     expect(byKey(tiles, 'drafts').figure).toBe('$1,000');
     expect(byKey(tiles, 'outstanding').count).toBe(0);
     expect(byKey(tiles, 'outstanding').figure).toBe('—');
@@ -173,5 +187,60 @@ describe('buildMoneyTiles', () => {
       TODAY,
     );
     expect(byKey(tiles, 'outstanding').figure).toBe('$50,215');
+  });
+
+  it('puts the count in the header row, not in the sub-line', () => {
+    const tiles = buildMoneyTiles(
+      [
+        makeInvoice({ id: 'a', dueDate: '2026-09-30' }),
+        makeInvoice({ id: 'b', dueDate: '2026-09-30' }),
+        makeInvoice({ id: 'c', status: 'draft' }),
+      ],
+      TODAY,
+    );
+    expect(byKey(tiles, 'outstanding').headerCount).toBe('2 invoices');
+    expect(byKey(tiles, 'overdue').headerCount).toBe('0');
+    expect(byKey(tiles, 'due-soon').headerCount).toBe('0');
+    expect(byKey(tiles, 'drafts').headerCount).toBe('1');
+  });
+
+  it('gives the due-soon tile the next invoice rather than a repeat of the count', () => {
+    const tiles = buildMoneyTiles(
+      [
+        makeInvoice({ id: 'a', clientId: 'c1', dueDate: '2026-08-02' }), // a Sunday
+        makeInvoice({ id: 'b', clientId: 'c2', dueDate: '2026-07-31' }), // a Friday
+      ],
+      TODAY,
+      new Map([
+        ['c1', 'Halcyon'],
+        ['c2', 'Northwind'],
+      ]),
+    );
+    expect(byKey(tiles, 'due-soon').detail).toBe('next: Northwind, Fri');
+  });
+
+  it('falls back to the count when no client name has been joined yet', () => {
+    const tiles = buildMoneyTiles([makeInvoice({ dueDate: '2026-08-02' })], TODAY);
+    expect(byKey(tiles, 'due-soon').detail).toBe('1 invoice');
+  });
+
+  it('gives each tile the filter a click on it applies', () => {
+    const tiles = buildMoneyTiles([], TODAY);
+    expect(tiles.map((tile) => tile.predicate)).toEqual([
+      'status-open',
+      'status-overdue',
+      'status-due-soon',
+      'status-draft',
+    ]);
+  });
+
+  it('names every tile predicate as a real option on the STATUS & DUE menu', () => {
+    // A tile that reached a filter no menu offers would be a state the reader
+    // could not reproduce, or undo, by hand.
+    const status = COLUMNS.find((column) => column.key === 'status');
+    const offered = new Set(status?.filterOptions.map((option) => option.predicate));
+    for (const tile of buildMoneyTiles([], TODAY)) {
+      expect(offered.has(tile.predicate), tile.key).toBe(true);
+    }
   });
 });

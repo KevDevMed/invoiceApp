@@ -3,10 +3,11 @@
  * attention to* before it shows a single row.
  *
  * The shape, top to bottom, is the design's: card header, four money tiles,
- * status tabs with counts beside the search and sort controls, a column header
- * strip, a dense ~48px row list that scrolls *inside* the card so the page
- * never grows, a footer pager, and a bulk action bar that appears only when
- * rows are selected.
+ * status tabs with counts beside the search box and a read-only sort pill, the
+ * chip bar for whatever the column menus have filtered by, a column header
+ * strip where each header is its own sort + filter menu, a dense ~48px row list
+ * that scrolls *inside* the card so the page never grows, a footer pager, and a
+ * bulk action bar that appears only when rows are selected.
  *
  * Three things this file deliberately does not do:
  *
@@ -17,7 +18,9 @@
  *     authored width.
  *   - **It does not decide anything testable.** Which columns survive the
  *     available width (./listColumns), what the tiles say (./moneyTiles), how a
- *     row phrases its status and draws its monogram (./listRows), and what the
+ *     row phrases its status and draws its monogram (./listRows), what a header
+ *     menu shows and what a chip means (./columnMenu, ./filters), how the
+ *     currency bar and its pager are built (./currencyBreakdown), and what the
  *     bulk bar permits (./listSelection) are all pure modules with tests,
  *     because the vitest project is `environment: 'node'` and never mounts a
  *     component.
@@ -36,7 +39,7 @@ import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import { CheckboxInput } from '@astryxdesign/core/CheckboxInput';
 import { EmptyState } from '@astryxdesign/core/EmptyState';
-import { Grid } from '@astryxdesign/core/Grid';
+import { Divider } from '@astryxdesign/core/Divider';
 import { Heading } from '@astryxdesign/core/Heading';
 import { Icon } from '@astryxdesign/core/Icon';
 import { Kbd } from '@astryxdesign/core/Kbd';
@@ -66,31 +69,65 @@ import {
   FIELD_ISSUED,
   FIELD_NUMBER,
   FIELD_STATUS,
+  applyChips,
   applyClientFilters,
   buildInvoiceSearchConfig,
+  openClientIdsOf,
   toListRequest,
 } from './filters';
+import type { ChipContext, FilterChip } from './filters';
 import {
   LIST_SEGMENTS,
   adjacentRowId,
   countSegments,
   extraCurrencyLabel,
+  isOpenState,
   matchesSegment,
   rowStateOf,
 } from './listGrouping';
 import type { ListSegment } from './listGrouping';
-import { listLayoutAt } from './listColumns';
-import type { ListColumnKey } from './listColumns';
+import { columnDef, listLayoutAt } from './listColumns';
+import type {
+  ColumnFilterPredicate,
+  ListColumnDef,
+  ListColumnKey,
+  ListFilterOption,
+  SortColumnKey,
+} from './listColumns';
+import {
+  EMPTY_DRAFT,
+  addChip,
+  arrowRotation,
+  buildChip,
+  chevronRotation,
+  chipKey,
+  chipLabel,
+  inputFieldLabels,
+  isSortChoiceActive,
+  menuAnchor,
+  removeChip,
+  sortLabelsFor,
+  sortPillLabel,
+  toggleMenu,
+  validateFilterInput,
+} from './columnMenu';
+import type { FilterInputDraft } from './columnMenu';
+import {
+  buildCurrencyBreakdown,
+  currencyPageAt,
+  stepCurrencyPage,
+} from './currencyBreakdown';
+import type { CurrencyBreakdown } from './currencyBreakdown';
 import { buildMoneyTiles } from './moneyTiles';
 import type { MoneyTile } from './moneyTiles';
 import {
   DEFAULT_SORT,
-  SORT_OPTIONS,
   buildListRows,
   footerSummary,
+  nextSortState,
   sortRows,
 } from './listRows';
-import type { ListRow, RowTone, SortKey } from './listRows';
+import type { ListRow, RowTone, SortDirection, SortState } from './listRows';
 import {
   retainVisible,
   selectAllValue,
@@ -156,6 +193,56 @@ function HashIcon(props: React.SVGProps<SVGSVGElement>): React.JSX.Element {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} {...props}>
       <path d="M9.5 4.75 7.75 19.25M16.25 4.75 14.5 19.25M4.75 9h14.5M4.25 15h14.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/**
+ * The sort arrow, at the design's 9x10. It points up for ascending and is
+ * flipped for descending by a transform on its wrapper, so the direction is one
+ * value read in one place and the arrow can never disagree with the label that
+ * set it.
+ */
+function SortArrowIcon(): React.JSX.Element {
+  return (
+    <svg width="9" height="10" viewBox="0 0 9 10" fill="none" aria-hidden="true" focusable="false">
+      <path
+        d="M4.5 9.2V1.3M1.4 4.2 4.5 1 7.6 4.2"
+        stroke="currentColor"
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** The 8x5 disclosure chevron the design puts on every header and on the pill. */
+function ChevronIcon(): React.JSX.Element {
+  return (
+    <svg width="8" height="5" viewBox="0 0 8 5" fill="none" aria-hidden="true" focusable="false">
+      <path
+        d="M1 1.2 4 4 7 1.2"
+        stroke="currentColor"
+        strokeWidth={1.3}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** The 5x8 pager chevrons. `back` flips the same path rather than duplicating it. */
+function PagerChevronIcon({ isBack }: { readonly isBack: boolean }): React.JSX.Element {
+  return (
+    <svg width="5" height="8" viewBox="0 0 5 8" fill="none" aria-hidden="true" focusable="false">
+      <path
+        d={isBack ? 'M3.8 1 1 4l2.8 3' : 'M1.2 1 4 4 1.2 7'}
+        stroke="currentColor"
+        strokeWidth={1.3}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
@@ -305,9 +392,18 @@ export function InvoiceList(): React.JSX.Element {
   const [search, setSearch] = useState('');
   const [filters, setFilters] = useState<readonly PowerSearchFilter[]>([]);
   const [segment, setSegment] = useState<ListSegment>('all');
-  const [sort, setSort] = useState<SortKey>(DEFAULT_SORT);
+  const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
   const [isFilterBarOpen, setIsFilterBarOpen] = useState(false);
-  const [openTile, setOpenTile] = useState<string | null>(null);
+  /**
+   * The column-menu filters, as structured chips. Session-local like every
+   * other piece of state on this screen: the design never mentions persistence,
+   * and the SideNav double-persist bug (CLAUDE.md) is this repo's standing
+   * warning against adding storage casually.
+   */
+  const [chips, setChips] = useState<readonly FilterChip[]>([]);
+  const [openMenu, setOpenMenu] = useState<SortColumnKey | null>(null);
+  /** First index of the Outstanding tile's three-up currency window. */
+  const [currencyIndex, setCurrencyIndex] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [cursorId, setCursorId] = useState<string | null>(null);
@@ -378,7 +474,7 @@ export function InvoiceList(): React.JSX.Element {
   // staying on page 5 of a set that now has two pages shows an empty card.
   useEffect(() => {
     setPage(1);
-  }, [search, filters, segment, sort, pageSize]);
+  }, [search, filters, chips, segment, sort, pageSize]);
 
   const clientNames = useMemo(
     () => new Map(clients.map((client) => [client.id, client.name])),
@@ -393,16 +489,51 @@ export function InvoiceList(): React.JSX.Element {
     };
   }, [clients]);
 
-  /** The whole matching set, before the status tab narrows it. */
-  const matching = useMemo(
+  /** Everything the filter-bar tokens match, before the header chips narrow it. */
+  const tokenMatched = useMemo(
     () => applyClientFilters(invoices ?? [], filters),
     [invoices, filters],
+  );
+
+  /**
+   * `Has open balance` is a fact about a *client*, not about the row it is
+   * tested against, so it is resolved once over the set the chips are about to
+   * narrow rather than per invoice.
+   */
+  const chipContext: ChipContext = useMemo(
+    () => ({
+      today,
+      clientNames,
+      openClientIds: openClientIdsOf(tokenMatched, today),
+    }),
+    [today, clientNames, tokenMatched],
+  );
+
+  /** The whole matching set, before the status tab narrows it. */
+  const matching = useMemo(
+    () => applyChips(tokenMatched, chips, chipContext),
+    [tokenMatched, chips, chipContext],
   );
 
   const counts = useMemo(() => countSegments(matching, today), [matching, today]);
   // The tiles describe the filtered set, not the tab — the point of the tiles
   // is to tell you which tab to press.
-  const tiles = useMemo(() => buildMoneyTiles(matching, today), [matching, today]);
+  const tiles = useMemo(
+    () => buildMoneyTiles(matching, today, clientNames),
+    [matching, today, clientNames],
+  );
+
+  /**
+   * The Outstanding tile's currency split. Built from the open receivables the
+   * tile's own figure covers, so the bar and the figure are about one set.
+   */
+  const breakdown = useMemo(
+    () =>
+      buildCurrencyBreakdown(
+        matching.filter((invoice) => isOpenState(rowStateOf(invoice, today))),
+      ),
+    [matching, today],
+  );
 
   const rows = useMemo(() => {
     const inSegment = matching.filter((invoice) =>
@@ -484,6 +615,47 @@ export function InvoiceList(): React.JSX.Element {
     setFilters([...next]);
   }, []);
 
+  // One document-level listener closes whichever header menu is open. Every
+  // handler inside a menu stops propagation, so a click that lands on the menu
+  // never reaches this; the listener is torn down with the component.
+  useEffect(() => {
+    if (openMenu === null) return;
+    const close = (): void => {
+      setOpenMenu(null);
+    };
+    document.addEventListener('click', close);
+    return () => {
+      document.removeEventListener('click', close);
+    };
+  }, [openMenu]);
+
+  const applyChip = useCallback((predicate: ColumnFilterPredicate, value?: string) => {
+    setChips((current) => addChip(current, buildChip(predicate, value)));
+    setOpenMenu(null);
+  }, []);
+
+  const chooseSort = useCallback((column: SortColumnKey, direction: SortDirection) => {
+    setSort((current) => nextSortState(current, column, direction));
+    setOpenMenu(null);
+  }, []);
+
+  /**
+   * `Chase all N`: applies the Overdue filter and selects those rows.
+   *
+   * It does not send anything. Nothing in the frozen IPC contract mails a
+   * client — the same reason the bulk bar has no "Send reminder" — so the
+   * button does the part that is real: it puts the reader in front of exactly
+   * the invoices to chase, selected and ready for a bulk action.
+   */
+  const chaseOverdue = useCallback(() => {
+    const overdueIds = matching
+      .filter((invoice) => rowStateOf(invoice, today) === 'overdue')
+      .map((invoice) => invoice.id);
+    setChips((current) => addChip(current, buildChip('status-overdue')));
+    setRawSelected(new Set(overdueIds));
+    setOpenMenu(null);
+  }, [matching, today]);
+
   const toggleRow = useCallback((id: string) => {
     setRawSelected((current) => toggleSelected(current, id));
   }, []);
@@ -534,11 +706,27 @@ export function InvoiceList(): React.JSX.Element {
     }
   }, [selected]);
 
-  const hasActiveFilters = filters.length > 0 || search.trim() !== '' || segment !== 'all';
+  const hasActiveFilters =
+    filters.length > 0 || chips.length > 0 || search.trim() !== '' || segment !== 'all';
+
+  /**
+   * The subtitle leads with the number that needs acting on, not the inventory
+   * count — the design's own change.
+   *
+   * What it does **not** say is the design's `USD equiv.`: there is no exchange
+   * rate anywhere in this app, so a claim that every tile is one currency's
+   * worth would be false. The currency *count* is true and is what the bar
+   * above it is a picture of, so that is what rides here — and a
+   * single-currency workspace says nothing at all rather than "1 currency".
+   */
+  const chasingCount = tiles.find((tile) => tile.key === 'overdue')?.count ?? 0;
+  const workspaceCurrencies = new Set(matching.map((invoice) => invoice.currency)).size;
   const headerLine =
     invoices === null
       ? 'Loading…'
-      : `${String(matching.length)} in this workspace`;
+      : `${String(chasingCount)} ${chasingCount === 1 ? 'invoice needs' : 'invoices need'} chasing today${
+          workspaceCurrencies > 1 ? ` · ${String(workspaceCurrencies)} currencies` : ''
+        }`;
 
   return (
     <Page maxWidth={CONTENT_MAX_WIDTH}>
@@ -596,8 +784,11 @@ export function InvoiceList(): React.JSX.Element {
           <MoneyTiles
             tiles={tiles}
             columns={layout.tileColumns}
-            openKey={openTile}
-            onToggle={setOpenTile}
+            breakdown={breakdown}
+            currencyIndex={currencyIndex}
+            onCurrencyIndex={setCurrencyIndex}
+            onApply={applyChip}
+            onChase={chaseOverdue}
           />
         </VStack>
 
@@ -644,19 +835,7 @@ export function InvoiceList(): React.JSX.Element {
                   setIsFilterBarOpen((current) => !current);
                 }}
               />
-              <Selector
-                label="Sort invoices"
-                isLabelHidden
-                size="sm"
-                value={sort}
-                options={SORT_OPTIONS.map((option) => ({
-                  value: option.key,
-                  label: option.label,
-                }))}
-                onChange={(value) => {
-                  setSort(value as SortKey);
-                }}
-              />
+              <SortPill sort={sort} />
             </HStack>
           </HStack>
 
@@ -697,6 +876,21 @@ export function InvoiceList(): React.JSX.Element {
           ) : null}
         </VStack>
 
+        {/* The chip bar exists only while it has something in it, and it sits
+            outside the loading/empty branch on purpose: a filter that emptied
+            the list is exactly the one the reader needs to be able to remove. */}
+        {chips.length === 0 ? null : (
+          <FilterChipBar
+            chips={chips}
+            onRemove={(key) => {
+              setChips((current) => removeChip(current, key));
+            }}
+            onClear={() => {
+              setChips([]);
+            }}
+          />
+        )}
+
         {invoices === null ? (
           <VStack gap={2} align="center" padding={8}>
             <Spinner size="lg" label="Loading invoices" />
@@ -720,6 +914,16 @@ export function InvoiceList(): React.JSX.Element {
               template={layout.gridTemplateColumns}
               selectAll={selectAllValue(selected, pageRows)}
               onSelectAll={toggleAll}
+              sort={sort}
+              openMenu={openMenu}
+              onToggleMenu={(column) => {
+                setOpenMenu((current) => toggleMenu(current, column));
+              }}
+              onCloseMenu={() => {
+                setOpenMenu(null);
+              }}
+              onSort={chooseSort}
+              onApply={applyChip}
             />
             <VStack
               gap={0}
@@ -812,81 +1016,351 @@ export function InvoiceList(): React.JSX.Element {
 // ---------------------------------------------------------------------------
 
 /**
+ * The tile grid. Outstanding gets the widest track because it is the only tile
+ * carrying a bar and a pager; the rest step down from there. Structural
+ * fractions, straight from the design — no spacing token expresses `1.55fr`.
+ */
+const TILE_TEMPLATES: Record<1 | 2 | 4, string> = {
+  4: '1.55fr 1.15fr 1fr 1fr',
+  2: '1fr 1fr',
+  1: '1fr',
+};
+
+/** The proportion bar's height and a segment's floor width, both from the design. */
+const BAR_HEIGHT = '4px';
+const BAR_MIN_SEGMENT = '10px';
+
+/**
  * Four figures before a single row. The overdue tile is the only coloured one,
  * exactly as the design has it — one tinted surface among four reads as an
  * alarm, four read as decoration.
  *
- * A tile with more than one currency behind it gets a disclosure rather than a
- * converted total, because this app has no exchange rate.
+ * Every tile is a filter shortcut: clicking it applies the filter it describes,
+ * producing the same chip the matching column-menu option would. It is a
+ * `role="button"` rather than a `<button>` because the Overdue tile contains
+ * the `Chase all N` button and the Outstanding tile contains two pager buttons,
+ * and nesting a button inside a button is invalid HTML — the same reasoning the
+ * row already uses for `role="link"`.
+ *
+ * A tile with more than one currency behind it says how many rather than
+ * converting: this app has no exchange rate.
  */
 function MoneyTiles({
   tiles,
   columns,
-  openKey,
-  onToggle,
+  breakdown,
+  currencyIndex,
+  onCurrencyIndex,
+  onApply,
+  onChase,
 }: {
   readonly tiles: readonly MoneyTile[];
   readonly columns: 1 | 2 | 4;
-  readonly openKey: string | null;
-  readonly onToggle: (key: string | null) => void;
+  readonly breakdown: CurrencyBreakdown;
+  readonly currencyIndex: number;
+  readonly onCurrencyIndex: (index: number) => void;
+  readonly onApply: (predicate: ColumnFilterPredicate) => void;
+  readonly onChase: () => void;
 }): React.JSX.Element {
   return (
-    <Grid columns={columns} gap={2}>
+    <VStack
+      gap={0}
+      style={{
+        display: 'grid',
+        gridTemplateColumns: TILE_TEMPLATES[columns],
+        gap: 'var(--spacing-2)',
+        alignItems: 'stretch',
+      }}
+    >
       {tiles.map((tile) => {
         const tone = tile.tone === 'error' ? toneColours('error') : null;
         const extra = extraCurrencyLabel(tile.extraCurrencies);
-        const isOpen = openKey === tile.key;
+        const isLead = tile.key === 'outstanding' || tile.key === 'overdue';
+        const showsBreakdown = tile.key === 'outstanding' && breakdown.hasBreakdown;
         return (
           <VStack
             key={tile.key}
-            gap={1}
+            gap={showsBreakdown ? 1.5 : 1}
             paddingInline={4}
             paddingBlock={3}
+            role="button"
+            tabIndex={0}
+            aria-label={`Filter by ${tile.label}`}
+            onClick={() => {
+              onApply(tile.predicate);
+            }}
+            onKeyDown={(event: React.KeyboardEvent) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              if (event.target !== event.currentTarget) return;
+              event.preventDefault();
+              onApply(tile.predicate);
+            }}
             style={{
               border: `1px solid ${tone === null ? 'var(--color-border)' : tone.border}`,
               borderRadius: 'var(--radius-container)',
               background: tone === null ? 'var(--color-background-muted)' : tone.wash,
+              cursor: 'pointer',
             }}
           >
-            <Text
-              type="supporting"
-              weight="medium"
-              style={tone === null ? undefined : { color: tone.text }}
-            >
-              {tile.label}
-            </Text>
+            <HStack justify="between" align="center" gap={2}>
+              <Text
+                type="supporting"
+                weight={tone === null ? 'medium' : 'semibold'}
+                style={tone === null ? undefined : { color: tone.text }}
+              >
+                {tile.label}
+              </Text>
+              {tile.key === 'overdue' ? (
+                <Button
+                  label={`Chase all ${String(tile.count)}`}
+                  variant="secondary"
+                  size="sm"
+                  isDisabled={tile.count === 0}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onChase();
+                  }}
+                />
+              ) : (
+                <Text type="code" size="xsm" color="secondary" hasTabularNumbers>
+                  {tile.headerCount}
+                </Text>
+              )}
+            </HStack>
+
             <Text
               as="span"
-              size="xl"
+              size={isLead ? '2xl' : 'xl'}
               weight="semibold"
               hasTabularNumbers
               style={tone === null ? undefined : { color: tone.text }}
             >
               {tile.figure}
             </Text>
-            <Text type="supporting" hasTabularNumbers maxLines={1}>
-              {tile.detail}
-            </Text>
-            {extra === null ? null : (
-              <Button
-                label={isOpen ? 'Hide currencies' : extra}
-                variant="ghost"
-                size="sm"
-                aria-expanded={isOpen}
-                onClick={() => {
-                  onToggle(isOpen ? null : tile.key);
-                }}
+
+            {showsBreakdown ? (
+              <CurrencyBar
+                breakdown={breakdown}
+                index={currencyIndex}
+                onIndex={onCurrencyIndex}
               />
-            )}
-            {isOpen ? (
-              <Text type="supporting" hasTabularNumbers>
-                {tile.full}
+            ) : (
+              <Text type="supporting" hasTabularNumbers maxLines={1}>
+                {tile.detail}
               </Text>
-            ) : null}
+            )}
+
+            {extra === null || showsBreakdown ? null : (
+              <Text type="supporting" hasTabularNumbers maxLines={1}>
+                {extra}
+              </Text>
+            )}
           </VStack>
         );
       })}
-    </Grid>
+    </VStack>
+  );
+}
+
+/**
+ * The Outstanding tile's proportion bar and currency pager.
+ *
+ * The bar's widths are shares of the invoice *count*, not of value: a count is
+ * the only quantity comparable across currencies without a rate (see
+ * ./currencyBreakdown). The pager prints each currency's own total beside its
+ * code, and both buttons stop propagation so paging never fires the tile's own
+ * click-to-filter.
+ */
+function CurrencyBar({
+  breakdown,
+  index,
+  onIndex,
+}: {
+  readonly breakdown: CurrencyBreakdown;
+  readonly index: number;
+  readonly onIndex: (next: number) => void;
+}): React.JSX.Element {
+  const page = currencyPageAt(breakdown.segments, index);
+  return (
+    <VStack gap={1.5}>
+      <HStack
+        gap={0.5}
+        align="stretch"
+        aria-hidden="true"
+        style={{ blockSize: BAR_HEIGHT }}
+      >
+        {breakdown.segments.map((segment) => (
+          <VStack
+            key={segment.currency}
+            gap={0}
+            style={{
+              flex: `${String(Math.round(segment.share * 1000))} 1 0`,
+              minInlineSize: BAR_MIN_SEGMENT,
+              borderRadius: 'var(--radius-full)',
+              background: toneColours('accent').accent,
+              opacity: segment.opacity,
+            }}
+          >
+            {null}
+          </VStack>
+        ))}
+      </HStack>
+
+      <HStack
+        gap={2}
+        align="center"
+        role="group"
+        aria-label="Outstanding by currency"
+        onClick={(event: React.MouseEvent) => {
+          event.stopPropagation();
+        }}
+      >
+        <Button
+          label="Previous currencies"
+          variant="ghost"
+          size="sm"
+          isIconOnly
+          icon={<PagerChevronIcon isBack />}
+          isDisabled={!page.canPrevious}
+          onClick={(event) => {
+            event.stopPropagation();
+            onIndex(stepCurrencyPage(breakdown.segments, index, -1));
+          }}
+        />
+        <StackItem size="fill">
+          <HStack gap={3} align="center" style={{ overflow: 'hidden' }}>
+            {page.entries.map((segment) => (
+              <Text
+                key={segment.currency}
+                type="code"
+                size="xsm"
+                color="secondary"
+                hasTabularNumbers
+                style={{ whiteSpace: 'nowrap' }}
+              >
+                {`${segment.currency} ${segment.amount}`}
+              </Text>
+            ))}
+          </HStack>
+        </StackItem>
+        <Button
+          label="More currencies"
+          variant="ghost"
+          size="sm"
+          isIconOnly
+          icon={<PagerChevronIcon isBack={false} />}
+          isDisabled={!page.canNext}
+          onClick={(event) => {
+            event.stopPropagation();
+            onIndex(stepCurrencyPage(breakdown.segments, index, 1));
+          }}
+        />
+      </HStack>
+    </VStack>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The read-only sort pill
+// ---------------------------------------------------------------------------
+
+/**
+ * The toolbar's old sort dropdown, now a read-out.
+ *
+ * Sorting moved onto the column headers, so a second control that could set it
+ * would be a second source of truth. This is the same arrow the active header
+ * shows, rotating with the direction, plus the column's name — and it is not
+ * focusable, because there is nothing here to operate.
+ */
+function SortPill({ sort }: { readonly sort: SortState }): React.JSX.Element {
+  return (
+    <HStack
+      gap={1.5}
+      align="center"
+      paddingInline={3}
+      paddingBlock={2}
+      role="status"
+      style={{
+        border: CARD_BORDER,
+        borderRadius: 'var(--radius-element)',
+        background: 'var(--color-background-muted)',
+      }}
+    >
+      <HStack
+        gap={0}
+        align="center"
+        style={{
+          color: toneColours('accent').accent,
+          transform: arrowRotation(sort.direction),
+          transition: 'transform 140ms ease',
+        }}
+      >
+        <SortArrowIcon />
+      </HStack>
+      <Text type="supporting" color="secondary">
+        Sorted:
+      </Text>
+      <Text type="supporting" color="primary">
+        {sortPillLabel(sort.column)}
+      </Text>
+      <HStack gap={0} align="center" style={{ opacity: 0.5 }}>
+        <ChevronIcon />
+      </HStack>
+    </HStack>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Filter chips
+// ---------------------------------------------------------------------------
+
+/**
+ * The chip bar, directly above the header row.
+ *
+ * A chip prints a label derived from its structured identity, which is also
+ * what decides whether it is a duplicate — the design's flat strings could not
+ * tell `TOTAL: Between 1,000 – 5,000` from the same range typed without commas.
+ */
+function FilterChipBar({
+  chips,
+  onRemove,
+  onClear,
+}: {
+  readonly chips: readonly FilterChip[];
+  readonly onRemove: (key: string) => void;
+  readonly onClear: () => void;
+}): React.JSX.Element {
+  return (
+    <HStack
+      gap={2}
+      align="center"
+      wrap="wrap"
+      paddingInline={6}
+      paddingBlock={2}
+      role="group"
+      aria-label="Active column filters"
+      style={{
+        borderBlockEnd: CARD_BORDER,
+        background: 'var(--color-background-muted)',
+      }}
+    >
+      <Text type="code" size="xsm" color="secondary" style={{ letterSpacing: '0.06em' }}>
+        FILTERS
+      </Text>
+      {chips.map((chip) => {
+        const key = chipKey(chip);
+        return (
+          <Token
+            key={key}
+            label={chipLabel(chip)}
+            onRemove={() => {
+              onRemove(key);
+            }}
+          />
+        );
+      })}
+      <Button label="Clear all" variant="ghost" size="sm" onClick={onClear} />
+    </HStack>
   );
 }
 
@@ -946,19 +1420,6 @@ function StatusTabs({
 // The table
 // ---------------------------------------------------------------------------
 
-const COLUMN_LABELS: Record<ListColumnKey, string> = {
-  select: '',
-  client: 'Client',
-  invoice: 'Invoice',
-  status: 'Status & due',
-  issued: 'Issued',
-  total: 'Total',
-  menu: '',
-};
-
-/** Which columns are right-aligned, per the design. */
-const END_ALIGNED: ReadonlySet<ListColumnKey> = new Set<ListColumnKey>(['issued', 'total']);
-
 /**
  * `VStack` renders a flex container; the table needs a grid, and the template
  * is computed per width so it cannot be a static `xstyle`. One shared style
@@ -975,52 +1436,435 @@ function gridStyle(template: string): React.CSSProperties {
   };
 }
 
+/** The design's `top:26px` drop and `min-width:206px` menu. Structural. */
+const MENU_TOP = '26px';
+const MENU_MIN_WIDTH = '206px';
+/** The design's 4px radio dot. */
+const RADIO_DOT = '4px';
+
+/**
+ * The header strip: one sort + filter menu per column.
+ *
+ * The ARIA is this file's own — the mock has none. Each header is a real
+ * `<button>` with `aria-haspopup="menu"` and `aria-expanded`, and the cell
+ * around it is a `columnheader` carrying `aria-sort`, which is only valid
+ * inside a row inside a table. So the strip is a one-row `table`; the data rows
+ * below stay `role="link"` (the row is the click target, and it contains a
+ * checkbox and a menu button, so it cannot be a cell tree without losing that).
+ * A partial table is the honest description of a header strip that really is
+ * one row of column headers.
+ */
 function ColumnHeader({
   columns,
   template,
   selectAll,
   onSelectAll,
+  sort,
+  openMenu,
+  onToggleMenu,
+  onCloseMenu,
+  onSort,
+  onApply,
 }: {
   readonly columns: readonly ListColumnKey[];
   readonly template: string;
   readonly selectAll: boolean | 'indeterminate';
   readonly onSelectAll: (checked: boolean) => void;
+  readonly sort: SortState;
+  readonly openMenu: SortColumnKey | null;
+  readonly onToggleMenu: (column: SortColumnKey) => void;
+  readonly onCloseMenu: () => void;
+  readonly onSort: (column: SortColumnKey, direction: SortDirection) => void;
+  readonly onApply: (predicate: ColumnFilterPredicate, value?: string) => void;
 }): React.JSX.Element {
   return (
     <VStack
       gap={0}
+      role="table"
+      aria-label="Invoice columns"
       paddingInline={6}
       paddingBlock={2}
       style={{
-        ...gridStyle(template),
         borderBlockEnd: CARD_BORDER,
         background: 'var(--color-background-muted)',
+        // The menus drop out of this strip and must paint over the rows below.
+        position: 'relative',
+        zIndex: 5,
       }}
     >
-      {columns.map((column) =>
-        column === 'select' ? (
-          <CheckboxInput
-            key={column}
-            label="Select every invoice on this page"
-            isLabelHidden
-            size="sm"
-            value={selectAll}
-            onChange={onSelectAll}
-          />
-        ) : (
+      <VStack gap={0} role="row" style={gridStyle(template)}>
+        {columns.map((column) => {
+          const definition = columnDef(column);
+          if (column === 'select') {
+            return (
+              <VStack key={column} gap={0} role="columnheader">
+                <CheckboxInput
+                  label="Select every invoice on this page"
+                  isLabelHidden
+                  size="sm"
+                  value={selectAll}
+                  onChange={onSelectAll}
+                />
+              </VStack>
+            );
+          }
+          if (!definition.sortable) {
+            return (
+              <VStack key={column} gap={0} role="columnheader" aria-label="Row actions">
+                {null}
+              </VStack>
+            );
+          }
+          return (
+            <ColumnHeaderCell
+              key={column}
+              definition={definition}
+              sort={sort}
+              isOpen={openMenu === definition.key}
+              onToggle={onToggleMenu}
+              onClose={onCloseMenu}
+              onSort={onSort}
+              onApply={onApply}
+            />
+          );
+        })}
+      </VStack>
+    </VStack>
+  );
+}
+
+/**
+ * One header cell: the label, the arrow the active column alone shows, the
+ * chevron every column shows, and the menu that drops from it.
+ *
+ * Focus returns to the button when the menu closes, whichever way it closed —
+ * a menu that leaves focus on a removed node drops the reader back to the top
+ * of the document.
+ */
+function ColumnHeaderCell({
+  definition,
+  sort,
+  isOpen,
+  onToggle,
+  onClose,
+  onSort,
+  onApply,
+}: {
+  readonly definition: ListColumnDef;
+  readonly sort: SortState;
+  readonly isOpen: boolean;
+  readonly onToggle: (column: SortColumnKey) => void;
+  readonly onClose: () => void;
+  readonly onSort: (column: SortColumnKey, direction: SortDirection) => void;
+  readonly onApply: (predicate: ColumnFilterPredicate, value?: string) => void;
+}): React.JSX.Element {
+  const column = definition.key as SortColumnKey;
+  const isActive = sort.column === column;
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const wasOpen = useRef(false);
+
+  useEffect(() => {
+    if (wasOpen.current && !isOpen) buttonRef.current?.focus();
+    wasOpen.current = isOpen;
+  }, [isOpen]);
+
+  return (
+    <VStack
+      gap={0}
+      role="columnheader"
+      aria-sort={isActive ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+      style={{
+        position: 'relative',
+        minInlineSize: 0,
+        alignItems: definition.align === 'end' ? 'flex-end' : 'flex-start',
+      }}
+    >
+      <Button
+        ref={buttonRef}
+        label={`${definition.label}, sort and filter`}
+        variant="ghost"
+        size="sm"
+        aria-haspopup="menu"
+        aria-expanded={isOpen}
+        onClick={(event) => {
+          // Keep this click away from the document listener that closes menus,
+          // or opening one would immediately close it again.
+          event.stopPropagation();
+          onToggle(column);
+        }}
+        style={{ paddingInline: 'var(--spacing-1)', maxInlineSize: '100%' }}
+        endContent={
+          <HStack
+            gap={0}
+            align="center"
+            style={{
+              opacity: 0.5,
+              transform: chevronRotation(isOpen),
+              transition: 'transform 140ms ease',
+            }}
+          >
+            <ChevronIcon />
+          </HStack>
+        }
+      >
+        <HStack gap={1} align="center" style={{ minInlineSize: 0 }}>
           <Text
-            key={column}
             type="supporting"
             size="sm"
             weight="medium"
             maxLines={1}
-            justify={END_ALIGNED.has(column) ? 'end' : 'start'}
-            style={{ textTransform: 'uppercase', letterSpacing: '0.04em' }}
+            color={isActive ? 'primary' : 'secondary'}
+            style={{ letterSpacing: '0.04em' }}
           >
-            {COLUMN_LABELS[column]}
+            {definition.label}
           </Text>
-        ),
+          {/* Only the active column carries an arrow — an arrow on every header
+              says nothing about which one the list is actually in. */}
+          {isActive ? (
+            <HStack
+              gap={0}
+              align="center"
+              style={{
+                flex: 'none',
+                color: toneColours('accent').accent,
+                transform: arrowRotation(sort.direction),
+                transition: 'transform 140ms ease',
+              }}
+            >
+              <SortArrowIcon />
+            </HStack>
+          ) : null}
+        </HStack>
+      </Button>
+
+      {isOpen ? (
+        <ColumnMenu
+          definition={definition}
+          sort={sort}
+          onSort={onSort}
+          onApply={onApply}
+          onClose={onClose}
+        />
+      ) : null}
+    </VStack>
+  );
+}
+
+/**
+ * The menu itself: a SORT section of two radio rows, a divider, and a FILTER
+ * section of one row per option.
+ *
+ * Choosing an ellipsis option swaps this body in place for an input step rather
+ * than opening a second floating surface. Astryx's `usePopover` traps focus
+ * unconditionally (CLAUDE.md), so a popover inside a popover would leave the
+ * reader unable to Tab out of either; one surface has one focus context.
+ */
+function ColumnMenu({
+  definition,
+  sort,
+  onSort,
+  onApply,
+  onClose,
+}: {
+  readonly definition: ListColumnDef;
+  readonly sort: SortState;
+  readonly onSort: (column: SortColumnKey, direction: SortDirection) => void;
+  readonly onApply: (predicate: ColumnFilterPredicate, value?: string) => void;
+  readonly onClose: () => void;
+}): React.JSX.Element {
+  const column = definition.key as SortColumnKey;
+  const anchor = menuAnchor(definition.align);
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const [pending, setPending] = useState<ListFilterOption | null>(null);
+  const [draft, setDraft] = useState<FilterInputDraft>(EMPTY_DRAFT);
+
+  // Opening a menu with the mouse should still land the keyboard inside it.
+  useEffect(() => {
+    const first = surfaceRef.current?.querySelector('button');
+    first?.focus();
+  }, [pending]);
+
+  const items = (): HTMLButtonElement[] =>
+    [...(surfaceRef.current?.querySelectorAll('button') ?? [])] as HTMLButtonElement[];
+
+  const onKeyDown = (event: React.KeyboardEvent): void => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    const all = items();
+    const here = all.indexOf(document.activeElement as HTMLButtonElement);
+    if (all.length === 0) return;
+    event.preventDefault();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    const next = here === -1 ? 0 : (here + step + all.length) % all.length;
+    all[next]?.focus();
+  };
+
+  const commit = (option: ListFilterOption): void => {
+    if (option.input === 'none') {
+      onApply(option.predicate);
+      return;
+    }
+    setDraft(EMPTY_DRAFT);
+    setPending(option);
+  };
+
+  const result = pending === null ? null : validateFilterInput(pending.input, draft);
+  const fields = pending === null ? [] : inputFieldLabels(pending.input);
+
+  return (
+    <VStack
+      ref={surfaceRef}
+      gap={0}
+      padding={1}
+      role="menu"
+      aria-label={`${definition.label} sort and filter`}
+      onClick={(event: React.MouseEvent) => {
+        event.stopPropagation();
+      }}
+      onKeyDown={onKeyDown}
+      style={{
+        position: 'absolute',
+        insetBlockStart: MENU_TOP,
+        insetInlineStart: anchor.insetInlineStart,
+        insetInlineEnd: anchor.insetInlineEnd,
+        minInlineSize: MENU_MIN_WIDTH,
+        background: 'var(--color-background-surface)',
+        border: '1px solid var(--color-border-emphasized)',
+        borderRadius: 'var(--radius-container)',
+        boxShadow: 'var(--shadow-lg, 0 18px 44px rgba(0,0,0,0.35))',
+        zIndex: 40,
+        letterSpacing: 0,
+        cursor: 'default',
+      }}
+    >
+      {pending === null ? (
+        <>
+          <MenuSectionLabel>SORT</MenuSectionLabel>
+          {sortLabelsFor(definition.kind).map((choice) => (
+            <Button
+              key={choice.direction}
+              label={choice.label}
+              variant="ghost"
+              size="sm"
+              role="menuitemradio"
+              aria-checked={isSortChoiceActive(sort, column, choice.direction)}
+              width="100%"
+              // A menu row reads down a left edge; `Button` centres its content
+              // by default, which turns the list into a ragged column.
+              style={{ justifyContent: 'flex-start' }}
+              icon={
+                <VStack
+                  gap={0}
+                  width={RADIO_DOT}
+                  height={RADIO_DOT}
+                  style={{
+                    flex: 'none',
+                    borderRadius: 'var(--radius-full)',
+                    background: isSortChoiceActive(sort, column, choice.direction)
+                      ? toneColours('accent').accent
+                      : 'transparent',
+                  }}
+                >
+                  {null}
+                </VStack>
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                onSort(column, choice.direction);
+              }}
+            />
+          ))}
+          {definition.filterOptions.length === 0 ? null : (
+            <>
+              <VStack paddingBlock={1} paddingInline={0.5}>
+                <Divider />
+              </VStack>
+              <MenuSectionLabel>FILTER</MenuSectionLabel>
+              {definition.filterOptions.map((option) => (
+                <Button
+                  key={option.predicate}
+                  label={option.label}
+                  variant="ghost"
+                  size="sm"
+                  role="menuitem"
+                  width="100%"
+                  style={{ justifyContent: 'flex-start' }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    commit(option);
+                  }}
+                />
+              ))}
+            </>
+          )}
+        </>
+      ) : (
+        <VStack gap={2} padding={2}>
+          <Text type="supporting" weight="medium">
+            {pending.label.replace('…', '')}
+          </Text>
+          {fields.map((field, index) => (
+            <TextInput
+              key={field}
+              label={field}
+              size="sm"
+              value={index === 0 ? draft.from : draft.to}
+              onChange={(value) => {
+                setDraft((current) =>
+                  index === 0 ? { ...current, from: value } : { ...current, to: value },
+                );
+              }}
+            />
+          ))}
+          {result === null || result.error === null ? null : (
+            <Text type="supporting" color="secondary">
+              {result.error}
+            </Text>
+          )}
+          <HStack gap={2} justify="end">
+            <Button
+              label="Cancel"
+              variant="ghost"
+              size="sm"
+              onClick={(event) => {
+                event.stopPropagation();
+                setPending(null);
+              }}
+            />
+            <Button
+              label="Apply"
+              variant="primary"
+              size="sm"
+              isDisabled={result === null || !result.isValid}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (result === null || !result.isValid) return;
+                onApply(pending.predicate, result.value);
+              }}
+            />
+          </HStack>
+        </VStack>
       )}
+    </VStack>
+  );
+}
+
+/** `SORT` / `FILTER` — the menu's two monospace section headings. */
+function MenuSectionLabel({
+  children,
+}: {
+  readonly children: string;
+}): React.JSX.Element {
+  return (
+    <VStack paddingInline={2} paddingBlock={1}>
+      <Text type="code" size="2xs" color="secondary" style={{ letterSpacing: '0.06em' }}>
+        {children}
+      </Text>
     </VStack>
   );
 }

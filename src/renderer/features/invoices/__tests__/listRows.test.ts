@@ -3,16 +3,25 @@ import { describe, expect, it } from 'vitest';
 import type { Invoice } from '../../../../shared/types';
 import {
   DEFAULT_SORT,
-  SORT_OPTIONS,
+  SORT_LABELS,
   buildListRows,
   footerSummary,
   issuedLabel,
   monogram,
+  nextSortState,
   sortRows,
+  sortSentence,
   statusPhrase,
   toneOf,
 } from '../listRows';
-import type { SortKey } from '../listRows';
+import type { SortDirection, SortState } from '../listRows';
+import { COLUMNS, SORTABLE_COLUMNS } from '../listColumns';
+import type { ListColumnKind, SortColumnKey } from '../listColumns';
+
+/** Terse constructor so a test reads as `by('total', 'desc')`. */
+function by(column: SortColumnKey, direction: SortDirection): SortState {
+  return { column, direction };
+}
 
 const TODAY = '2026-07-29';
 
@@ -224,6 +233,112 @@ describe('buildListRows', () => {
   });
 });
 
+
+describe('SORT_LABELS', () => {
+  it('gives every column kind exactly two choices', () => {
+    const kinds: readonly ListColumnKind[] = ['num', 'date', 'status', 'text'];
+    for (const kind of kinds) {
+      expect(SORT_LABELS[kind], kind).toHaveLength(2);
+    }
+  });
+
+  it('carries the design labels verbatim, with their true directions', () => {
+    expect(SORT_LABELS.num).toEqual([
+      { label: 'Largest first', direction: 'desc' },
+      { label: 'Smallest first', direction: 'asc' },
+    ]);
+    expect(SORT_LABELS.date).toEqual([
+      { label: 'Newest first', direction: 'desc' },
+      { label: 'Oldest first', direction: 'asc' },
+    ]);
+    expect(SORT_LABELS.status).toEqual([
+      { label: 'Most overdue first', direction: 'asc' },
+      { label: 'Furthest due first', direction: 'desc' },
+    ]);
+    expect(SORT_LABELS.text).toEqual([
+      { label: 'A → Z', direction: 'asc' },
+      { label: 'Z → A', direction: 'desc' },
+    ]);
+  });
+
+  it('never assumes the first option is ascending', () => {
+    // The trap the design warns about: three of the four kinds lead with a
+    // direction that is not `asc`.
+    expect(SORT_LABELS.num[0]?.direction).toBe('desc');
+    expect(SORT_LABELS.date[0]?.direction).toBe('desc');
+    expect(SORT_LABELS.status[0]?.direction).toBe('asc');
+    expect(SORT_LABELS.text[0]?.direction).toBe('asc');
+  });
+
+  it('offers each direction exactly once per kind', () => {
+    for (const choices of Object.values(SORT_LABELS)) {
+      expect(new Set(choices.map((choice) => choice.direction)).size).toBe(2);
+    }
+  });
+});
+
+describe('the arrow never contradicts the label', () => {
+  // The whole point of pairing a label with a direction: sorting by a label
+  // whose words mean "biggest at the top" must actually put the biggest row
+  // first, whichever way the arrow ends up pointing.
+  const probe = buildListRows({
+    invoices: [
+      makeInvoice({ id: 'small', number: 'INV-0001', clientId: 'c2', dueDate: '2026-09-01', issueDate: '2026-05-01', totalCents: 100 }),
+      makeInvoice({ id: 'big', number: 'INV-0002', clientId: 'c1', dueDate: '2026-06-01', issueDate: '2026-08-01', totalCents: 900 }),
+    ],
+    clientNames: NAMES,
+    today: TODAY,
+  });
+
+  const first = (sort: SortState): string | undefined => sortRows(probe, sort)[0]?.id;
+
+  it('puts the largest total first for "Largest first" and the smallest for "Smallest first"', () => {
+    const [largest, smallest] = SORT_LABELS.num;
+    expect(largest?.label).toBe('Largest first');
+    expect(first(by('total', largest?.direction ?? 'asc'))).toBe('big');
+    expect(first(by('total', smallest?.direction ?? 'asc'))).toBe('small');
+  });
+
+  it('puts the newest issue date first for "Newest first" and the oldest for "Oldest first"', () => {
+    const [newest, oldest] = SORT_LABELS.date;
+    expect(first(by('issued', newest?.direction ?? 'asc'))).toBe('big');
+    expect(first(by('issued', oldest?.direction ?? 'asc'))).toBe('small');
+  });
+
+  it('puts the soonest due date first for "Most overdue first" and the latest for "Furthest due first"', () => {
+    const [mostOverdue, furthest] = SORT_LABELS.status;
+    expect(first(by('status', mostOverdue?.direction ?? 'asc'))).toBe('big');
+    expect(first(by('status', furthest?.direction ?? 'asc'))).toBe('small');
+  });
+
+  it('runs A→Z for "A → Z" and Z→A for "Z → A"', () => {
+    const [az, za] = SORT_LABELS.text;
+    // 'Halloway & Finch LLP' (big) sorts before 'Northwind' (small).
+    expect(first(by('client', az?.direction ?? 'asc'))).toBe('big');
+    expect(first(by('client', za?.direction ?? 'asc'))).toBe('small');
+  });
+});
+
+describe('nextSortState', () => {
+  it('takes the column and the direction the chosen label carries', () => {
+    expect(nextSortState(DEFAULT_SORT, 'total', 'desc')).toEqual(by('total', 'desc'));
+    expect(nextSortState(by('total', 'desc'), 'total', 'asc')).toEqual(by('total', 'asc'));
+  });
+
+  it('returns the same object when nothing moved', () => {
+    const current = by('issued', 'desc');
+    expect(nextSortState(current, 'issued', 'desc')).toBe(current);
+  });
+
+  it('reaches every column and direction the column table offers', () => {
+    for (const column of SORTABLE_COLUMNS) {
+      for (const direction of ['asc', 'desc'] as const) {
+        expect(nextSortState(DEFAULT_SORT, column, direction)).toEqual(by(column, direction));
+      }
+    }
+  });
+});
+
 describe('sortRows', () => {
   const rows = buildListRows({
     invoices: [
@@ -235,45 +350,58 @@ describe('sortRows', () => {
     today: TODAY,
   });
 
-  it('defaults to due date ascending — the order the work happens in', () => {
-    expect(DEFAULT_SORT).toBe('due-asc');
-    expect(sortRows(rows, 'due-asc').map((row) => row.id)).toEqual(['b', 'c', 'a']);
+  it('defaults to STATUS & DUE ascending — the order the work happens in', () => {
+    expect(DEFAULT_SORT).toEqual(by('status', 'asc'));
+    expect(sortRows(rows, DEFAULT_SORT).map((row) => row.id)).toEqual(['b', 'c', 'a']);
   });
 
   it('breaks ties on the invoice number so the order never shifts under the cursor', () => {
     // `b` and `c` share a due date; INV-0001 sorts before INV-0002 either way.
-    expect(sortRows(rows, 'due-asc').slice(0, 2).map((row) => row.id)).toEqual(['b', 'c']);
-    expect(sortRows(rows, 'due-desc').slice(1).map((row) => row.id)).toEqual(['b', 'c']);
+    expect(sortRows(rows, by('status', 'asc')).slice(0, 2).map((row) => row.id)).toEqual([
+      'b',
+      'c',
+    ]);
+    expect(sortRows(rows, by('status', 'desc')).slice(1).map((row) => row.id)).toEqual([
+      'b',
+      'c',
+    ]);
   });
 
-  it('sorts the other three ways', () => {
-    expect(sortRows(rows, 'due-desc').map((row) => row.id)).toEqual(['a', 'b', 'c']);
-    expect(sortRows(rows, 'total-desc').map((row) => row.id)).toEqual(['b', 'c', 'a']);
-    expect(sortRows(rows, 'client-asc').map((row) => row.id)).toEqual(['b', 'c', 'a']);
-    expect(sortRows(rows, 'issued-desc').map((row) => row.id)).toEqual(['a', 'c', 'b']);
+  it('sorts by every column, both ways', () => {
+    expect(sortRows(rows, by('status', 'desc')).map((row) => row.id)).toEqual(['a', 'b', 'c']);
+    expect(sortRows(rows, by('total', 'desc')).map((row) => row.id)).toEqual(['b', 'c', 'a']);
+    expect(sortRows(rows, by('total', 'asc')).map((row) => row.id)).toEqual(['a', 'c', 'b']);
+    expect(sortRows(rows, by('client', 'asc')).map((row) => row.id)).toEqual(['b', 'c', 'a']);
+    expect(sortRows(rows, by('client', 'desc')).map((row) => row.id)).toEqual(['a', 'b', 'c']);
+    expect(sortRows(rows, by('issued', 'desc')).map((row) => row.id)).toEqual(['a', 'c', 'b']);
+    expect(sortRows(rows, by('issued', 'asc')).map((row) => row.id)).toEqual(['b', 'c', 'a']);
+    expect(sortRows(rows, by('invoice', 'asc')).map((row) => row.id)).toEqual(['b', 'c', 'a']);
+    expect(sortRows(rows, by('invoice', 'desc')).map((row) => row.id)).toEqual(['a', 'c', 'b']);
   });
 
   it('does not mutate its input', () => {
     const before = rows.map((row) => row.id);
-    sortRows(rows, 'total-desc');
+    sortRows(rows, by('total', 'desc'));
     expect(rows.map((row) => row.id)).toEqual(before);
   });
 
-  it('offers a label for every sort key it accepts', () => {
-    const keys = SORT_OPTIONS.map((option) => option.key);
-    expect(new Set(keys).size).toBe(keys.length);
-    for (const key of keys) {
-      expect(footerSummary(1, 1, 25, key)).toMatch(/^Showing 1 of 1 · sorted by .+/);
+  it('names every column and direction it accepts', () => {
+    for (const column of SORTABLE_COLUMNS) {
+      for (const direction of ['asc', 'desc'] as const) {
+        expect(footerSummary(1, 1, 25, by(column, direction))).toMatch(
+          /^Showing 1 of 1 · sorted by .+/,
+        );
+      }
     }
   });
 
   it('handles a single row and an empty list', () => {
-    expect(sortRows([], 'due-asc')).toEqual([]);
-    expect(sortRows(rows.slice(0, 1), 'client-asc').map((row) => row.id)).toEqual(['a']);
+    expect(sortRows([], DEFAULT_SORT)).toEqual([]);
+    expect(sortRows(rows.slice(0, 1), by('client', 'asc')).map((row) => row.id)).toEqual(['a']);
   });
 });
 
-describe('sortRows — the default sinks settled invoices', () => {
+describe('sortRows — STATUS & DUE sinks settled invoices', () => {
   // Today is 2026-07-29. The settled pair is *older* than everything else, so
   // a pure due-date ascending sort would open the screen on collected money.
   const mixed = buildListRows({
@@ -303,26 +431,26 @@ describe('sortRows — the default sinks settled invoices', () => {
     today: TODAY,
   });
 
-  const order = (key: SortKey): string[] => sortRows(mixed, key).map((row) => row.id);
+  const order = (sort: SortState): string[] => sortRows(mixed, sort).map((row) => row.id);
 
   it('sorts a paid invoice below an overdue one even though it is far older', () => {
-    const ids = order('due-asc');
+    const ids = order(by('status', 'asc'));
     expect(ids.indexOf('overdue')).toBeLessThan(ids.indexOf('paid-2024'));
     expect(ids[0]).toBe('overdue');
   });
 
   it('puts a void invoice in the settled block, not the unsettled one', () => {
-    const ids = order('due-asc');
+    const ids = order(by('status', 'asc'));
     expect(ids.indexOf('void-2024')).toBeGreaterThan(ids.indexOf('later'));
   });
 
   it('keeps drafts in the unsettled block — unsent work is still in play', () => {
-    const ids = order('due-asc');
+    const ids = order(by('status', 'asc'));
     expect(ids.indexOf('draft')).toBeLessThan(ids.indexOf('paid-2024'));
   });
 
   it('still runs due date ascending inside the unsettled block', () => {
-    expect(order('due-asc').slice(0, 5)).toEqual([
+    expect(order(by('status', 'asc')).slice(0, 5)).toEqual([
       'overdue',
       'overdue-2',
       'due-soon',
@@ -332,13 +460,25 @@ describe('sortRows — the default sinks settled invoices', () => {
   });
 
   it('still runs due date ascending inside the settled block', () => {
-    expect(order('due-asc').slice(5)).toEqual(['paid-2024', 'void-2024', 'paid-2025']);
+    expect(order(by('status', 'asc')).slice(5)).toEqual([
+      'paid-2024',
+      'void-2024',
+      'paid-2025',
+    ]);
   });
 
-  it('leaves an explicitly chosen sort literal — settled rows are not sunk', () => {
+  it('sinks settled rows on the column’s other direction too', () => {
+    // "Furthest due first" is still a queue of work; a settled invoice has no
+    // place in one, whichever end of it you read from.
+    const ids = order(by('status', 'desc'));
+    expect(ids.slice(0, 5)).toEqual(['later', 'draft', 'due-soon', 'overdue-2', 'overdue']);
+    expect(ids.slice(5)).toEqual(['paid-2025', 'void-2024', 'paid-2024']);
+  });
+
+  it('leaves every other column literal — settled rows are not sunk', () => {
     // Largest first: every invoice is 100_000 cents, so the tie-break on the
     // number decides, and the settled rows keep their natural places.
-    expect(order('total-desc')).toEqual([
+    expect(order(by('total', 'desc'))).toEqual([
       'paid-2024',
       'void-2024',
       'paid-2025',
@@ -349,15 +489,13 @@ describe('sortRows — the default sinks settled invoices', () => {
       'later',
     ]);
     // Newest issued: same issue date throughout, so again the number decides.
-    expect(order('issued-desc')[0]).toBe('paid-2024');
-    // And due date descending is a choice too, so it stays literal.
-    expect(order('due-desc')[0]).toBe('later');
-    expect(order('due-desc').at(-1)).toBe('paid-2024');
+    expect(order(by('issued', 'desc'))[0]).toBe('paid-2024');
+    expect(order(by('client', 'asc'))[0]).toBe('paid-2024');
   });
 
   it('orders an all-settled list by due date rather than emptying or reversing it', () => {
     const settled = mixed.filter((row) => row.state === 'paid' || row.state === 'void');
-    expect(sortRows(settled, 'due-asc').map((row) => row.id)).toEqual([
+    expect(sortRows(settled, by('status', 'asc')).map((row) => row.id)).toEqual([
       'paid-2024',
       'void-2024',
       'paid-2025',
@@ -367,33 +505,50 @@ describe('sortRows — the default sinks settled invoices', () => {
 
 describe('footerSummary', () => {
   it('reads as the design has it', () => {
-    expect(footerSummary(66, 1, 10, 'due-asc')).toBe(
+    expect(footerSummary(66, 1, 10, DEFAULT_SORT)).toBe(
       'Showing 1-10 of 66 · sorted by due date · open first',
     );
   });
 
   it('clamps a page past the end rather than printing an impossible range', () => {
-    expect(footerSummary(66, 99, 10, 'due-asc')).toBe(
+    expect(footerSummary(66, 99, 10, DEFAULT_SORT)).toBe(
       'Showing 61-66 of 66 · sorted by due date · open first',
     );
   });
 
   it('says so when nothing matches', () => {
-    expect(footerSummary(0, 1, 25, 'due-asc')).toBe('Showing 0 of 0 · sorted by due date · open first');
+    expect(footerSummary(0, 1, 25, DEFAULT_SORT)).toBe(
+      'Showing 0 of 0 · sorted by due date · open first',
+    );
   });
 
   it('names each order in words', () => {
-    const sentences: Record<SortKey, string> = {
-      'due-asc': 'due date · open first',
-      'due-desc': 'due date, latest first',
-      'total-desc': 'total, largest first',
-      'client-asc': 'client',
-      'issued-desc': 'issue date, newest first',
-    };
-    for (const [key, sentence] of Object.entries(sentences)) {
-      expect(footerSummary(5, 1, 25, key as SortKey)).toBe(
-        `Showing 1-5 of 5 · sorted by ${sentence}`,
-      );
+    expect(sortSentence(by('status', 'asc'))).toBe('due date · open first');
+    expect(sortSentence(by('status', 'desc'))).toBe('due date, furthest first · open first');
+    expect(sortSentence(by('client', 'asc'))).toBe('client A–Z');
+    expect(sortSentence(by('client', 'desc'))).toBe('client Z–A');
+    expect(sortSentence(by('invoice', 'asc'))).toBe('invoice number A–Z');
+    expect(sortSentence(by('issued', 'desc'))).toBe('issue date, newest first');
+    expect(sortSentence(by('total', 'desc'))).toBe('total, largest first');
+    expect(footerSummary(5, 1, 25, by('total', 'asc'))).toBe(
+      'Showing 1-5 of 5 · sorted by total, smallest first',
+    );
+  });
+
+  it('keeps the settled-last clause on both STATUS & DUE orders, and only there', () => {
+    // The caption is the only thing that explains why a 2024 paid invoice sits
+    // below a 2026 one; an order that does not sink them must not claim to.
+    for (const column of SORTABLE_COLUMNS) {
+      for (const direction of ['asc', 'desc'] as const) {
+        expect(sortSentence(by(column, direction)).includes('open first')).toBe(
+          column === 'status',
+        );
+      }
     }
+  });
+
+  it('has a sentence for every sortable column in the column table', () => {
+    const sortable = COLUMNS.filter((column) => column.sortable).map((column) => column.key);
+    expect([...SORTABLE_COLUMNS]).toEqual(sortable);
   });
 });
