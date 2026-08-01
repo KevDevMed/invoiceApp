@@ -22,7 +22,24 @@ import { countByFit, fitsMachine } from './modelRows';
 /** Where a row came from. Only `search` earns the neutral `Hugging Face` pill. */
 export type BrowseSource = 'catalog' | 'lookup' | 'search';
 
-export interface BrowseRow {
+/**
+ * What a Hub result carries beyond the file itself.
+ *
+ * The old discovery UI printed all of it and 1a's first cut dropped it. Licence
+ * is the one that actually matters: it is the terms someone is agreeing to by
+ * downloading weights, and a page that offers the download without stating them
+ * is worse than a page with one more muted line. `gated` and `isPrivate` say the
+ * download will fail without a token this app does not hold, and `downloads` is
+ * the only popularity signal on an unfamiliar repo.
+ */
+export interface HubMetadata {
+  readonly license: string | null;
+  readonly gated: boolean;
+  readonly isPrivate: boolean;
+  readonly downloads: number | null;
+}
+
+export interface BrowseRow extends HubMetadata {
   /** `repo/filename` — the same key the verdict cache and the busy flag use. */
   readonly key: string;
   readonly repo: string;
@@ -30,6 +47,8 @@ export interface BrowseRow {
   readonly quant: string | null;
   readonly sizeBytes: number | null;
   readonly description: string | null;
+  /** Main's own one-line justification for a discovered row, if it gave one. */
+  readonly reason: string | null;
   readonly verdict: SupportVerdict;
   readonly source: BrowseSource;
   readonly format: ModelFormat;
@@ -69,15 +88,24 @@ function verdictRank(verdict: SupportVerdict): number {
 }
 
 /** One deduplicated file, before a verdict is attached to it. */
-export interface MergedVariant {
+export interface MergedVariant extends HubMetadata {
   readonly key: string;
   readonly repo: string;
   readonly filename: string;
   readonly quant: string | null;
   readonly sizeBytes: number | null;
   readonly description: string | null;
+  readonly reason: string | null;
   readonly source: BrowseSource;
 }
+
+/** No repo-level facts at all — what a curated entry knows about itself. */
+const NO_HUB_METADATA: HubMetadata = {
+  license: null,
+  gated: false,
+  isPrivate: false,
+  downloads: null,
+};
 
 /** Everything the merge needs; the verdict lookup is deliberately not part of it. */
 export type MergeInput = Omit<BrowseInput, 'verdictOf'>;
@@ -101,15 +129,8 @@ export function mergeBrowseVariants(input: MergeInput): MergedVariant[] {
   const variants: MergedVariant[] = [];
   const seen = new Set<string>();
 
-  const push = (
-    repo: string,
-    filename: string,
-    quant: string | null,
-    sizeBytes: number | null,
-    description: string | null,
-    source: BrowseSource,
-  ): void => {
-    const key = variantKey(repo, filename);
+  const push = (variant: Omit<MergedVariant, 'key'>): void => {
+    const key = variantKey(variant.repo, variant.filename);
     if (seen.has(key)) return;
     seen.add(key);
     const curated = catalogByKey.get(key);
@@ -122,32 +143,63 @@ export function mergeBrowseVariants(input: MergeInput): MergedVariant[] {
             quant: curated.quant,
             sizeBytes: curated.sizeBytes,
             description: curated.description,
+            // The curated description already carries the licence, and main's
+            // ranking note is about a search this row is no longer part of.
+            reason: null,
+            ...NO_HUB_METADATA,
             source: 'catalog',
           }
-        : { key, repo, filename, quant, sizeBytes, description, source },
+        : { key, ...variant },
     );
   };
 
   if (input.hfRepo) {
-    for (const variant of input.hfRepo.variants) {
-      push(
-        input.hfRepo.repo,
-        variant.filename,
-        variant.quant,
-        variant.sizeBytes,
-        null,
-        'lookup',
-      );
+    const repo = input.hfRepo;
+    for (const variant of repo.variants) {
+      push({
+        repo: repo.repo,
+        filename: variant.filename,
+        quant: variant.quant,
+        sizeBytes: variant.sizeBytes,
+        description: null,
+        reason: null,
+        license: repo.license,
+        gated: repo.gated,
+        isPrivate: repo.isPrivate,
+        downloads: null,
+        source: 'lookup',
+      });
     }
   }
 
   for (const entry of input.catalog) {
-    push(entry.repo, entry.filename, entry.quant, entry.sizeBytes, entry.description, 'catalog');
+    push({
+      repo: entry.repo,
+      filename: entry.filename,
+      quant: entry.quant,
+      sizeBytes: entry.sizeBytes,
+      description: entry.description,
+      reason: null,
+      ...NO_HUB_METADATA,
+      source: 'catalog',
+    });
   }
 
   if (input.discovery) {
     for (const model of input.discovery.models) {
-      push(model.repo, model.filename, model.quant, model.sizeBytes, model.reason, 'search');
+      push({
+        repo: model.repo,
+        filename: model.filename,
+        quant: model.quant,
+        sizeBytes: model.sizeBytes,
+        description: null,
+        reason: model.reason.trim().length > 0 ? model.reason.trim() : null,
+        license: model.license,
+        gated: model.gated,
+        isPrivate: model.isPrivate,
+        downloads: model.downloads,
+        source: 'search',
+      });
     }
   }
 
@@ -243,6 +295,57 @@ export function browseFooterSentence(
   }
   const showing = `Showing ${visibility.showing}`;
   return clauses.length === 0 ? `${showing}.` : `${showing} — ${clauses.join(', and ')}.`;
+}
+
+export interface BrowseEmptyCopy {
+  readonly title: string;
+  readonly description: string;
+}
+
+/**
+ * What the list says when it has nothing to show, which is never one sentence.
+ *
+ * `Nothing here runs on this machine` while the footer says `12 not checked yet`
+ * is the same conflation of *unknown* with *too big* the hero already had fixed:
+ * the filter hides both, and only one of them is a statement about the machine.
+ * Precedence matches the hero's — an outstanding check beats a bad verdict,
+ * because "nothing fits" needs every other possibility ruled out first.
+ */
+export function browseEmptyCopy(
+  visibility: BrowseVisibility,
+  onlyFits: boolean,
+  totalRows: number,
+  platform: string | null,
+): BrowseEmptyCopy {
+  const machine = platform === 'darwin' ? 'Mac' : 'machine';
+
+  if (!onlyFits || totalRows === 0) {
+    return {
+      title: 'No models to show',
+      description: 'Search by name, or paste a Hugging Face link.',
+    };
+  }
+
+  const { hiddenUnchecked, hiddenTooBig } = visibility;
+
+  if (hiddenUnchecked > 0 && hiddenTooBig === 0) {
+    return {
+      title: 'Nothing here has been checked yet',
+      description: `Nothing has read these models' headers, so whether they run on this ${machine} is still unknown — not a verdict that they are too big. Press Re-check above, or turn the filter off to see them all.`,
+    };
+  }
+
+  if (hiddenUnchecked > 0) {
+    return {
+      title: `Nothing here is known to run on this ${machine}`,
+      description: `${hiddenTooBig} need${hiddenTooBig === 1 ? 's' : ''} more memory than this ${machine} has, and ${hiddenUnchecked} ${hiddenUnchecked === 1 ? 'has' : 'have'} not been checked yet. Turn the filter off to see everything, or search for something smaller.`,
+    };
+  }
+
+  return {
+    title: `Nothing here runs on this ${machine}`,
+    description: 'Turn the filter off to see everything, or search for something smaller.',
+  };
 }
 
 export type ModelQuery =

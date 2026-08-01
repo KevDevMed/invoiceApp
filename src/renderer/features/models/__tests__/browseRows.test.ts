@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  browseEmptyCopy,
   browseFooterSentence,
   buildBrowseRows,
   parseModelQuery,
@@ -226,6 +227,58 @@ describe('buildBrowseRows', () => {
     expect(rows[0]!.quant).toBe('Q4_K_M');
   });
 
+  it('carries the Hub metadata a discovered row is judged on', () => {
+    const rows = buildBrowseRows({
+      catalog: [],
+      hfRepo: null,
+      discovery: discovery([
+        discovered({
+          license: 'apache-2.0',
+          gated: true,
+          isPrivate: false,
+          downloads: 12_345,
+          reason: 'smallest build that fits',
+        }),
+      ]),
+      verdictOf: verdicts({}),
+    });
+
+    expect(rows[0]).toMatchObject({
+      license: 'apache-2.0',
+      gated: true,
+      isPrivate: false,
+      downloads: 12_345,
+      reason: 'smallest build that fits',
+    });
+  });
+
+  it('keeps the licence of a pasted repo on every file in it', () => {
+    const rows = buildBrowseRows({
+      catalog: [],
+      hfRepo: hfRepo({ license: 'llama3.1', gated: true, isPrivate: true }),
+      discovery: null,
+      verdictOf: verdicts({}),
+    });
+
+    expect(rows[0]).toMatchObject({
+      source: 'lookup',
+      license: 'llama3.1',
+      gated: true,
+      isPrivate: true,
+    });
+  });
+
+  it('reports no ranking note when main gave only whitespace', () => {
+    const rows = buildBrowseRows({
+      catalog: [],
+      hfRepo: null,
+      discovery: discovery([discovered({ reason: '   ' })]),
+      verdictOf: verdicts({}),
+    });
+
+    expect(rows[0]!.reason).toBeNull();
+  });
+
   it('is empty when there is nothing anywhere', () => {
     expect(
       buildBrowseRows({ catalog: [], hfRepo: null, discovery: null, verdictOf: verdicts({}) }),
@@ -329,6 +382,62 @@ describe('browseFooterSentence', () => {
     expect(
       browseFooterSentence({ rows: [], showing: 6, hiddenTooBig: 0, hiddenUnchecked: 0 }, 'darwin'),
     ).toBe('Showing 6.');
+  });
+});
+
+describe('browseEmptyCopy', () => {
+  it('never blames the machine for rows nobody has checked', () => {
+    const copy = browseEmptyCopy(
+      { rows: [], showing: 0, hiddenTooBig: 0, hiddenUnchecked: 12 },
+      true,
+      12,
+      'darwin',
+    );
+
+    expect(copy.title).toBe('Nothing here has been checked yet');
+    expect(copy.description).not.toContain('more memory');
+    expect(copy.description).toContain('not a verdict that they are too big');
+    expect(copy.description).toContain('Re-check');
+  });
+
+  it('says both reasons when the filter hid both kinds', () => {
+    const copy = browseEmptyCopy(
+      { rows: [], showing: 0, hiddenTooBig: 3, hiddenUnchecked: 2 },
+      true,
+      5,
+      'linux',
+    );
+
+    expect(copy.title).toBe('Nothing here is known to run on this machine');
+    expect(copy.description).toContain('3 need more memory than this machine has');
+    expect(copy.description).toContain('2 have not been checked yet');
+  });
+
+  it('claims nothing runs here only when every hidden row was checked and failed', () => {
+    const copy = browseEmptyCopy(
+      { rows: [], showing: 0, hiddenTooBig: 4, hiddenUnchecked: 0 },
+      true,
+      4,
+      'darwin',
+    );
+
+    expect(copy.title).toBe('Nothing here runs on this Mac');
+  });
+
+  it('asks for a search when there was nothing to filter in the first place', () => {
+    for (const [onlyFits, total] of [
+      [true, 0],
+      [false, 0],
+      [false, 5],
+    ] as const) {
+      const copy = browseEmptyCopy(
+        { rows: [], showing: 0, hiddenTooBig: 0, hiddenUnchecked: 0 },
+        onlyFits,
+        total,
+        'darwin',
+      );
+      expect(copy.title).toBe('No models to show');
+    }
   });
 });
 

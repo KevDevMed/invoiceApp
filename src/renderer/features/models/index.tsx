@@ -58,6 +58,7 @@ import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { Page, PageHeader } from '../../ui/Page';
 
 import {
+  browseEmptyCopy,
   browseFooterSentence,
   buildBrowseRows,
   parseModelQuery,
@@ -85,12 +86,14 @@ import {
   formatBadgeLabel,
   heroEmptyCopy,
   heroSentence,
+  hubMetadata,
   installedRowSubtitle,
   installedSummary,
   machineChipSummary,
   machineWord,
   modelDisplayName,
   supportFacts,
+  supportFailureSentence,
   supportReason,
 } from './modelCopy';
 import {
@@ -298,7 +301,11 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
     [models.catalog, models.hfRepo, models.discovery],
   );
 
-  const isRechecking = models.isSystemLoading || Object.keys(models.checking).length > 0;
+  // A sweep still in flight is part of what a re-check is waiting on: its
+  // verdicts land in the same cache, so the button must not read "done" while
+  // one is outstanding.
+  const isRechecking =
+    models.isSystemLoading || models.isDiscovering || Object.keys(models.checking).length > 0;
 
   return (
     <HStack
@@ -788,12 +795,7 @@ function BrowseDisclosure({
 
           {visibility.rows.length === 0 && !models.isLoading ? (
             <EmptyState
-              title={onlyFits && rows.length > 0 ? 'Nothing here runs on this machine' : 'No models to show'}
-              description={
-                onlyFits && rows.length > 0
-                  ? 'Turn the filter off to see everything, or search for something smaller.'
-                  : 'Search by name, or paste a Hugging Face link.'
-              }
+              {...browseEmptyCopy(visibility, onlyFits, rows.length, platform)}
               headingLevel={3}
               isCompact
             />
@@ -853,6 +855,8 @@ function BrowseRowView({
   const transfer = transferState(progress, record, row.sizeBytes);
   const isBusy = models.busyId === row.key || (record !== null && models.busyId === record.id);
   const tooltip = fitTooltip(row.verdict, support?.breakdown ?? null, row.format, platform);
+  /** Licence, popularity and access, from whichever source knows them. */
+  const metadata = row.source === 'catalog' ? catalogMetadata(row.description) : hubMetadata(row);
 
   const variant: Variant = {
     repo: row.repo,
@@ -894,15 +898,18 @@ function BrowseRowView({
                 {fitSentence(
                   row.verdict,
                   platform,
-                  row.source === 'catalog' ? catalogGoodFor(row.description) : null,
+                  // The curated note for a curated build, main's own ranking
+                  // note for a Hub result — neither surface had anywhere else
+                  // to say it.
+                  row.source === 'catalog' ? catalogGoodFor(row.description) : row.reason,
                 )}
               </Text>
               <FitHelp label={row.displayName} title={tooltip.title} body={tooltip.body} />
             </HStack>
 
-            {row.source === 'catalog' && catalogMetadata(row.description) ? (
+            {metadata ? (
               <Text type="supporting" display="block">
-                {catalogMetadata(row.description)}
+                {metadata}
               </Text>
             ) : null}
 
@@ -921,12 +928,8 @@ function BrowseRowView({
             {transfer.failure ? (
               <Banner status="error" title="Download failed" description={transfer.failure} />
             ) : null}
-
-            {support?.error ? (
-              <Text type="supporting" display="block">
-                Could not check: {support.error}
-              </Text>
-            ) : null}
+            {/* A failed check states itself in `FitBreakdown` above, where the
+                numbers it could not produce would have been. */}
           </VStack>
         </StackItem>
 
@@ -1002,6 +1005,12 @@ function BrowseRowView({
  * Renders nothing when no check has come back: there would be no numbers behind
  * the disclosure, and an empty one reads as a missing answer rather than an
  * absent question.
+ *
+ * A check that came back *broken* is a third state, and not the same as either.
+ * Its result is shaped like a verdict but its figures are placeholder zeros, so
+ * it says what went wrong in plain text and shows no numbers at all — a
+ * confident `0.00 GiB` from a check that never read the header is exactly the
+ * kind of invented figure this page exists to avoid.
  */
 function FitBreakdown({
   id,
@@ -1011,6 +1020,15 @@ function FitBreakdown({
   readonly id: string;
   readonly support: VariantSupportView | null;
 }): React.JSX.Element | null {
+  const failure = supportFailureSentence(support);
+  if (failure !== null) {
+    return (
+      <Text type="supporting" display="block">
+        {failure}
+      </Text>
+    );
+  }
+
   const facts = supportFacts(support);
   if (facts.length === 0) return null;
   const reason = supportReason(support);

@@ -21,8 +21,11 @@ import {
   machineChipSummary,
   machineWord,
   modelDisplayName,
+  formatCount,
+  hubMetadata,
   modelFormat,
   supportFacts,
+  supportFailureSentence,
   supportReason,
 } from '../modelCopy';
 
@@ -286,6 +289,69 @@ describe('supportFacts', () => {
   it('has nothing to show when no check has come back', () => {
     expect(supportFacts(null)).toEqual([]);
   });
+
+  it('shows no numbers at all for a check that came back broken', () => {
+    // A failed check still carries a fully-shaped breakdown of placeholder
+    // zeros. Rendering it reads as a confident `0.00 GiB`.
+    const failed = support({
+      error: 'range request refused',
+      breakdown: breakdown({
+        modelSizeBytes: 0,
+        kvCacheBytes: 0,
+        totalRequiredBytes: 0,
+        usableTotalMemoryBytes: 0,
+      }),
+    });
+
+    expect(supportFacts(failed)).toEqual([]);
+    expect(supportReason(failed)).toBeNull();
+  });
+});
+
+describe('supportFailureSentence', () => {
+  it('says what went wrong where the numbers would have been', () => {
+    expect(supportFailureSentence(support({ error: 'range request refused' }))).toBe(
+      'This model could not be checked, so there are no numbers to show — range request refused',
+    );
+  });
+
+  it('is silent for a check that worked, and for one that never ran', () => {
+    expect(supportFailureSentence(support())).toBeNull();
+    expect(supportFailureSentence(support({ error: '   ' }))).toBeNull();
+    expect(supportFailureSentence(null)).toBeNull();
+  });
+});
+
+describe('hubMetadata', () => {
+  it('states the licence of a Hub result, because the download is under it', () => {
+    expect(
+      hubMetadata({ license: 'apache-2.0', downloads: 12_345, gated: false, isPrivate: false }),
+    ).toBe('apache-2.0 · 12.3k downloads');
+  });
+
+  it('says so plainly rather than implying a licence it was not told', () => {
+    expect(hubMetadata({ license: null, downloads: null, gated: false, isPrivate: false })).toBe(
+      'Licence not stated',
+    );
+  });
+
+  it('warns that a gated or private repo needs a token this app does not hold', () => {
+    expect(hubMetadata({ license: 'mit', downloads: 0, gated: true, isPrivate: false })).toBe(
+      'mit · gated — needs an access token',
+    );
+    expect(hubMetadata({ license: null, downloads: 3, gated: false, isPrivate: true })).toBe(
+      'Licence not stated · 3 downloads · private — needs an access token',
+    );
+  });
+});
+
+describe('formatCount', () => {
+  it('reads the way a download count is read', () => {
+    expect(formatCount(0)).toBe('0');
+    expect(formatCount(9_999)).toBe('9,999');
+    expect(formatCount(12_345)).toBe('12.3k');
+    expect(formatCount(2_400_000)).toBe('2.4M');
+  });
 });
 
 describe('supportReason', () => {
@@ -366,6 +432,16 @@ describe('heroEmptyCopy', () => {
       expect(copy.title).not.toContain('fits');
       expect(copy.description).not.toContain('more memory than');
     }
+  });
+
+  it('does not claim every check failed when only some of them did', () => {
+    const mixed = heroEmptyCopy({ ...base, checkFailed: 1, tooBig: 5 }, 'darwin');
+    expect(mixed.description).not.toContain('Every compatibility check failed');
+    expect(mixed.description).toContain('1 compatibility check failed');
+    expect(mixed.description).toContain('more memory than this Mac has usable');
+
+    const all = heroEmptyCopy({ ...base, checkFailed: 6 }, 'darwin');
+    expect(all.description).toContain('Every compatibility check failed');
   });
 
   it('says machine rather than Mac off darwin', () => {

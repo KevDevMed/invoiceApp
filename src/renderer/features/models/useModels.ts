@@ -15,6 +15,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { SupportTarget } from './browseRows';
 import {
+  armUse,
+  attachModelId,
+  cancelArm,
+  disarmKey,
+  emptyArmState,
+  noteTerminal,
+  type ArmState,
+} from './downloadArm';
+import {
+  applyDiscoveryFold,
+  foldDiscoveryVerdicts,
+  foldIsEmpty,
+} from './supportCache';
+import {
   checkSupport as checkSupportCall,
   discoverModels as discoverModelsCall,
   fetchCatalog,
@@ -162,10 +176,23 @@ export function useModels(): ModelsState {
   const [lastSmokeTest, setLastSmokeTest] = useState<SmokeTestView | null>(null);
 
   const samples = useRef<Map<string, Sample>>(new Map());
-  /** Keys with a check already requested, so a re-render cannot fire a second one. */
-  const requested = useRef<Set<string>>(new Set());
-  /** Model ids whose download was started by `downloadAndUse` and must be loaded. */
-  const pendingUse = useRef<Set<string>>(new Set());
+  /**
+   * Which machine reading every cached verdict belongs to.
+   *
+   * `recheck` bumps it. Every async producer of `support` captures it on entry
+   * and discards its whole result if it moved while the call was in flight —
+   * see `./supportCache`. This is the one thing standing between an obsolete
+   * verdict and a RED model downloading with no confirmation.
+   */
+  const generation = useRef(0);
+  /**
+   * Key → the generation whose check has been requested or answered for it, so
+   * a re-render cannot fire a second check and a bumped generation
+   * automatically invalidates every entry without clearing anything.
+   */
+  const requested = useRef<Map<string, number>>(new Map());
+  /** `Download & use` arms, keyed to the request that made them. */
+  const useArm = useRef<ArmState>(emptyArmState());
   /** Latest `load`, so the progress subscription can call it without depending on it. */
   const loadRef = useRef<((modelId: string) => Promise<void>) | null>(null);
 
@@ -240,8 +267,9 @@ export function useModels(): ModelsState {
         samples.current.delete(event.modelId);
         // `Download & use` promised two things. Only a transfer that actually
         // finished earns the second one — error, cancelled and paused disarm it.
-        const wasArmed = pendingUse.current.delete(event.modelId);
-        if (wasArmed && event.status === 'ready' && loadRef.current) {
+        const outcome = noteTerminal(useArm.current, event.modelId, event.status, at);
+        useArm.current = outcome.state;
+        if (outcome.shouldLoad && loadRef.current) {
           void loadRef.current(event.modelId); // refreshes on its way out
         } else {
           void refresh();
@@ -269,19 +297,26 @@ export function useModels(): ModelsState {
   );
 
   /**
-   * Check one variant, lazily and at most once.
+   * Check one variant, lazily and at most once per machine reading.
    *
-   * Main caches the answer too; this guard exists so an expanded card that
-   * re-renders does not queue a second range request before the first returns.
+   * Main caches the answer too; the `requested` guard exists so an expanded card
+   * that re-renders does not queue a second range request before the first
+   * returns. It is keyed by generation, so a `Re-check` invalidates it without
+   * having to clear it — and clearing it was itself a race, since a check still
+   * in flight would then be re-requested by the next render.
+   *
+   * The result is dropped outright if the generation moved while the call was
+   * out: it is a statement about a machine reading nobody believes any more.
    */
   const ensureSupport = useCallback(
     async (
       entry: { repo: string; filename: string; sizeBytes: number | null },
       forceRefresh = false,
     ) => {
+      const gen = generation.current;
       const key = variantKey(entry.repo, entry.filename);
-      if (!forceRefresh && requested.current.has(key)) return;
-      requested.current.add(key);
+      if (!forceRefresh && requested.current.get(key) === gen) return;
+      requested.current.set(key, gen);
       setChecking((current) => ({ ...current, [key]: true }));
 
       try {
@@ -291,18 +326,24 @@ export function useModels(): ModelsState {
           sizeBytes: entry.sizeBytes,
           refresh: forceRefresh,
         });
+        if (generation.current !== gen) return;
         setSupport((current) => ({ ...current, [key]: result }));
         // A grey answer is worth retrying later; a real verdict is not.
         if (result.error !== null) requested.current.delete(key);
       } catch (caught) {
+        if (generation.current !== gen) return;
         requested.current.delete(key);
         setError(message(caught));
       } finally {
-        setChecking((current) => {
-          const next = { ...current };
-          delete next[key];
-          return next;
-        });
+        // A stale producer must not clear a flag the current one set; `recheck`
+        // replaces the whole map at the bump, so nothing is stranded LOADING.
+        if (generation.current === gen) {
+          setChecking((current) => {
+            const next = { ...current };
+            delete next[key];
+            return next;
+          });
+        }
       }
     },
     [],
@@ -315,14 +356,25 @@ export function useModels(): ModelsState {
    * is a statement about a machine reading, so the moment that reading is thrown
    * away the verdicts computed from it are unfounded — and one of them is the
    * only thing standing between a RED model and a download with no confirmation.
-   * `requested` goes with it, or `ensureSupport` would refuse to look again.
+   *
+   * Emptying it is not enough on its own, which is what round one got wrong: a
+   * check or a sweep that was already in flight would resolve afterwards and
+   * write the old verdicts straight back. Bumping the generation is what makes
+   * those results unwelcome rather than merely late.
    */
   const recheck = useCallback(
     async (targets: readonly SupportTarget[]) => {
-      requested.current.clear();
+      generation.current += 1;
       setSupport({});
+      // Marked as in flight before the machine is even probed, so the rows read
+      // LOADING for the whole invalidation rather than flashing through GREY —
+      // which would claim, for a second, that nobody had ever looked.
+      setChecking(
+        Object.fromEntries(
+          targets.map((target) => [variantKey(target.repo, target.filename), true] as const),
+        ),
+      );
       await refreshSystem();
-      // Rows read LOADING while these are in flight, which every surface handles.
       await Promise.all(targets.map((target) => ensureSupport(target, true)));
     },
     [refreshSystem, ensureSupport],
@@ -359,34 +411,63 @@ export function useModels(): ModelsState {
    * Sweep the Hub for models this machine can run.
    *
    * The verdicts that come back are folded into the same `support` map the
-   * catalog rows read, and their keys are marked as requested, so a discovered
+   * catalog rows read, and their keys are marked as answered, so a discovered
    * row that is also in the catalog renders its verdict immediately and does not
    * spend a second range request on a header main has already read.
+   *
+   * Two things the fold is careful about, both of them the round-one blocker in
+   * different clothes:
+   *
+   *   - a result with no usable verdict **clears** that key and does not mark it
+   *     answered. Leaving the old value while claiming the key had been checked
+   *     is what let an obsolete verdict live for ever;
+   *   - if `Re-check` ran while the sweep was out, none of these verdicts are
+   *     about the machine reading now on screen. The rows are still the right
+   *     rows — the search happened, and dropping them would lose work the user
+   *     asked for — but every verdict in them is discarded and the ones main did
+   *     check are re-asked against the current reading.
    */
-  const discover = useCallback(async (query: string) => {
-    setIsDiscovering(true);
-    setDiscoveryError(null);
-    try {
-      const result = await discoverModelsCall({ query });
-      setDiscovery(result);
+  const discover = useCallback(
+    async (query: string) => {
+      const gen = generation.current;
+      setIsDiscovering(true);
+      setDiscoveryError(null);
+      try {
+        const result = await discoverModelsCall({ query });
 
-      const found: Record<string, VariantSupportView> = {};
-      for (const model of result.models) {
-        if (model.support === null || model.support.error !== null) continue;
-        const key = variantKey(model.repo, model.filename);
-        found[key] = model.support;
-        requested.current.add(key);
+        if (generation.current !== gen) {
+          setDiscovery(result);
+          for (const model of result.models) {
+            if (model.support === null) continue;
+            void ensureSupport({
+              repo: model.repo,
+              filename: model.filename,
+              sizeBytes: model.sizeBytes,
+            });
+          }
+          return;
+        }
+
+        setDiscovery(result);
+        const fold = foldDiscoveryVerdicts(
+          result.models,
+          (key) => requested.current.get(key) === gen,
+        );
+        for (const key of fold.answered) requested.current.set(key, gen);
+        for (const key of fold.clear) requested.current.delete(key);
+        if (!foldIsEmpty(fold)) {
+          setSupport((current) => applyDiscoveryFold(current, fold));
+        }
+      } catch (caught) {
+        if (generation.current !== gen) return;
+        setDiscovery(null);
+        setDiscoveryError(message(caught));
+      } finally {
+        setIsDiscovering(false);
       }
-      if (Object.keys(found).length > 0) {
-        setSupport((current) => ({ ...current, ...found }));
-      }
-    } catch (caught) {
-      setDiscovery(null);
-      setDiscoveryError(message(caught));
-    } finally {
-      setIsDiscovering(false);
-    }
-  }, []);
+    },
+    [ensureSupport],
+  );
 
   const clearDiscovery = useCallback(() => {
     setDiscovery(null);
@@ -395,7 +476,11 @@ export function useModels(): ModelsState {
 
   const download = useCallback(
     async (entry: { repo: string; filename: string; quant?: string | null }) => {
-      await run(variantKey(entry.repo, entry.filename), () =>
+      const key = variantKey(entry.repo, entry.filename);
+      // A plain `Download` never loads anything, so it also revokes whatever an
+      // earlier `Download & use` on the same file left armed.
+      useArm.current = disarmKey(useArm.current, key);
+      await run(key, () =>
         window.api.invoke('llm:download', {
           repo: entry.repo,
           filename: entry.filename,
@@ -411,15 +496,27 @@ export function useModels(): ModelsState {
       const key = variantKey(entry.repo, entry.filename);
       setBusyId(key);
       setError(null);
+      // Armed *before* the invoke: a cached or tiny file can report `ready`
+      // before `llm:download` resolves, and an arm that lands afterwards both
+      // misses its own event and is left behind for the next download to trip
+      // over. `attachModelId` picks up an event that arrived in the gap.
+      const armed = armUse(useArm.current, key, Date.now());
+      useArm.current = armed.state;
       try {
         const { modelId } = await window.api.invoke('llm:download', {
           repo: entry.repo,
           filename: entry.filename,
           quant: entry.quant ?? undefined,
         });
-        pendingUse.current.add(modelId);
+        const attached = attachModelId(useArm.current, armed.token, modelId);
+        useArm.current = attached.state;
+        if (attached.shouldLoad && loadRef.current) {
+          await loadRef.current(modelId); // refreshes on its way out
+          return;
+        }
         await refresh();
       } catch (caught) {
+        useArm.current = cancelArm(useArm.current, armed.token);
         setError(message(caught));
       } finally {
         setBusyId(null);

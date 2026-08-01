@@ -232,6 +232,11 @@ export interface SupportFact {
  */
 export function supportFacts(support: VariantSupportView | null): SupportFact[] {
   if (support === null) return [];
+  // A failed check still comes back with a fully-shaped breakdown whose numbers
+  // are placeholder zeros. Printing them turns "we could not look" into a
+  // confident `0.00 GiB`, which is the one thing this disclosure exists to
+  // prevent. `supportFailureSentence` says what actually happened instead.
+  if (support.error !== null) return [];
   const { breakdown } = support;
   const architecture = support.architecture ?? breakdown.kvCache?.architecture ?? null;
   const maxContext = support.maxContextLength ?? breakdown.kvCache?.maxContextLength ?? null;
@@ -265,8 +270,56 @@ export function supportFacts(support: VariantSupportView | null): SupportFact[] 
 
 /** Main's own one-line justification for the verdict, or null when it gave none. */
 export function supportReason(support: VariantSupportView | null): string | null {
-  const reason = support?.breakdown.reason.trim();
-  return reason && reason.length > 0 ? reason : null;
+  if (support === null || support.error !== null) return null;
+  const reason = support.breakdown.reason.trim();
+  return reason.length > 0 ? reason : null;
+}
+
+/**
+ * What to say instead of numbers when the check itself came back broken.
+ *
+ * "No check yet" and "the check failed" are different states with different
+ * remedies — waiting fixes the first and never fixes the second — so the second
+ * one says so, in the same place the numbers would have been.
+ */
+export function supportFailureSentence(support: VariantSupportView | null): string | null {
+  const error = support?.error?.trim();
+  if (!error || error.length === 0) return null;
+  return `This model could not be checked, so there are no numbers to show — ${error}`;
+}
+
+/** `1,234` up to ten thousand, then `12.3k` / `1.2M`. */
+export function formatCount(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return '0';
+  if (value < 10_000) return Math.round(value).toLocaleString('en-US');
+  if (value < 1_000_000) return `${(value / 1_000).toFixed(1)}k`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
+/**
+ * The supporting line under a Hub row: `Apache-2.0 · 1.2M downloads · gated`.
+ *
+ * The counterpart of `catalogMetadata` for the two sources that are not the
+ * curated list. Licence first because it is the only one that changes what
+ * someone is allowed to do with the file; `gated` and `private` last because
+ * they are a warning about the download, and the row also states that it will
+ * need a token it does not have.
+ */
+export function hubMetadata(input: {
+  readonly license: string | null;
+  readonly downloads: number | null;
+  readonly gated: boolean;
+  readonly isPrivate: boolean;
+}): string {
+  const parts: string[] = [];
+  const license = input.license?.trim();
+  parts.push(license && license.length > 0 ? license : 'Licence not stated');
+  if (input.downloads !== null && input.downloads > 0) {
+    parts.push(`${formatCount(input.downloads)} downloads`);
+  }
+  if (input.gated) parts.push('gated — needs an access token');
+  if (input.isPrivate) parts.push('private — needs an access token');
+  return parts.join(' · ');
 }
 
 /**
@@ -339,13 +392,20 @@ export function heroEmptyCopy(input: HeroEmptyInput, platform: string | null): H
         title: 'Nothing has been checked yet',
         description: `Nothing has read these models' headers, so how much memory each needs on this ${machine} is still unknown. Press Re-check above, or check one row at a time below.`,
       };
-    case 'checks-failed':
+    case 'checks-failed': {
+      // "Every check failed" is only true when nothing else came back at all.
+      // With one failure and four RED verdicts it was a plain falsehood, and the
+      // remedy it points at — press Re-check — is right for the failures only.
+      const failed =
+        input.tooBig > 0
+          ? `${input.checkFailed} compatibility check${input.checkFailed === 1 ? '' : 's'} failed, and the rest of the curated list needs more memory than this ${machine} has usable.`
+          : `Every compatibility check failed, so nothing can be recommended yet — this is not a verdict that they are too big.`;
       return {
         reason,
         title: `We could not check these against this ${machine}`,
-        description:
-          'Every compatibility check failed, so nothing can be recommended yet — this is not a verdict that they are too big. Press Re-check above; each row below says what went wrong.',
+        description: `${failed} Press Re-check above; each row below says what went wrong.`,
       };
+    }
     case 'none-fit':
       return {
         reason,
