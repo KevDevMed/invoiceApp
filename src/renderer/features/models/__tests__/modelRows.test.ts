@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { DiscoveredVariantView, LocalModel, SmokeTestView } from '../llmExtra';
 import {
   countByFit,
+  countChecks,
   diskUsageBytes,
   fitsMachine,
   groupDiscovered,
@@ -187,6 +188,33 @@ describe('countByFit', () => {
       tooBig: 1,
       unknown: 2,
     });
+  });
+});
+
+describe('countChecks', () => {
+  it('keeps too-big, failed and never-checked apart', () => {
+    expect(
+      countChecks([
+        { verdict: 'RED', error: null },
+        { verdict: 'GREY', error: 'range request refused' },
+        { verdict: 'GREY', error: null },
+        { verdict: 'LOADING', error: null },
+        { verdict: 'GREEN', error: null },
+        { verdict: 'YELLOW', error: null },
+      ]),
+    ).toEqual({ tooBig: 1, checkFailed: 1, unchecked: 2 });
+  });
+
+  it('counts a failed check as failed even when it reports a verdict', () => {
+    expect(countChecks([{ verdict: 'RED', error: 'header read timed out' }])).toEqual({
+      tooBig: 0,
+      checkFailed: 1,
+      unchecked: 0,
+    });
+  });
+
+  it('counts nothing for an empty catalog', () => {
+    expect(countChecks([])).toEqual({ tooBig: 0, checkFailed: 0, unchecked: 0 });
   });
 });
 

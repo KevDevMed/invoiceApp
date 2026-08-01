@@ -116,6 +116,37 @@ export function countByFit(verdicts: readonly SupportVerdict[]): FitCounts {
   return { fits, tooBig, unknown };
 }
 
+export interface CheckOutcome {
+  readonly verdict: SupportVerdict;
+  /** What the check reported going wrong, or null when it did not fail. */
+  readonly error: string | null;
+}
+
+export interface CheckCounts {
+  readonly tooBig: number;
+  readonly checkFailed: number;
+  readonly unchecked: number;
+}
+
+/**
+ * Split "no verdict" into its causes, which the hero has to word differently.
+ *
+ * The error is read before the verdict: a check that failed comes back GREY, and
+ * counting it as merely unchecked would hide a failure that is not going to fix
+ * itself by waiting.
+ */
+export function countChecks(outcomes: readonly CheckOutcome[]): CheckCounts {
+  let tooBig = 0;
+  let checkFailed = 0;
+  let unchecked = 0;
+  for (const outcome of outcomes) {
+    if (outcome.error !== null) checkFailed += 1;
+    else if (outcome.verdict === 'RED') tooBig += 1;
+    else if (!fitsMachine(outcome.verdict)) unchecked += 1;
+  }
+  return { tooBig, checkFailed, unchecked };
+}
+
 export interface DiscoveredGroup {
   readonly repo: string;
   readonly license: string | null;

@@ -61,6 +61,7 @@ import {
   browseFooterSentence,
   buildBrowseRows,
   parseModelQuery,
+  recheckTargets,
   visibleBrowseRows,
   type BrowseRow,
 } from './browseRows';
@@ -70,24 +71,35 @@ import {
   variantKey,
   type LocalModel,
   type SupportVerdict,
+  type VariantSupportView,
 } from './llmExtra';
 import {
   browseSummary,
   catalogGoodFor,
+  catalogMetadata,
   downloadEtaSentence,
   familyInitial,
   fitFootnote,
   fitSentence,
   fitTooltip,
   formatBadgeLabel,
+  heroEmptyCopy,
   heroSentence,
   installedRowSubtitle,
   installedSummary,
   machineChipSummary,
   machineWord,
   modelDisplayName,
+  supportFacts,
+  supportReason,
 } from './modelCopy';
-import { diskUsageBytes, smokeTestStatus, transferState, verdictStatus } from './modelRows';
+import {
+  countChecks,
+  diskUsageBytes,
+  smokeTestStatus,
+  transferState,
+  verdictStatus,
+} from './modelRows';
 import { recommendModel, type Recommendation } from './recommendation';
 import {
   formatBytes,
@@ -108,13 +120,26 @@ interface Variant {
   readonly description: string | null;
 }
 
+/**
+ * A download waiting on the RED confirmation.
+ *
+ * `andUse` rides along because the hero's button says `Download & use` and the
+ * browse rows' say `Download`: whichever promise was made has to survive the
+ * dialog, or confirming a red hero download would quietly deliver only half of
+ * what the button offered.
+ */
+interface PendingDownload {
+  readonly variant: Variant;
+  readonly andUse: boolean;
+}
+
 /** The context every verdict on this page was computed against — see the footnote. */
 const FIT_CONTEXT_TOKENS = 8192;
 const FIT_RESERVE_BYTES = 2_288_490_189;
 
 export function ModelsPage(): React.JSX.Element {
   const models = useModels();
-  const [pendingRed, setPendingRed] = useState<Variant | null>(null);
+  const [pendingRed, setPendingRed] = useState<PendingDownload | null>(null);
 
   const platform = models.system?.platform ?? null;
   const machine = machineWord(platform);
@@ -144,12 +169,12 @@ export function ModelsPage(): React.JSX.Element {
       : variantKey(recommendation.entry.repo, recommendation.entry.filename);
 
   const startDownload = useCallback(
-    (variant: Variant, verdict: SupportVerdict) => {
+    (variant: Variant, verdict: SupportVerdict, andUse = false) => {
       if (verdict === 'RED') {
-        setPendingRed(variant);
+        setPendingRed({ variant, andUse });
         return;
       }
-      void models.download(variant);
+      void (andUse ? models.downloadAndUse(variant) : models.download(variant));
     },
     [models],
   );
@@ -198,7 +223,7 @@ export function ModelsPage(): React.JSX.Element {
       <VStack
         gap={0}
         style={{
-          border: '1px solid var(--color-border)',
+          border: 'var(--border-width) solid var(--color-border)',
           borderRadius: 'var(--radius-container)',
           overflow: 'hidden',
         }}
@@ -223,16 +248,19 @@ export function ModelsPage(): React.JSX.Element {
         title={`This model looks too big for this ${machine}`}
         description={
           pendingRed
-            ? `${pendingRed.filename} needs more memory than we measured as usable. Expect it to fail to load, or to run so slowly it is unusable — and the download is ${formatBytes(pendingRed.sizeBytes)}. The estimate can be wrong, and it is your machine, so you can go ahead.`
+            ? `${pendingRed.variant.filename} needs more memory than we measured as usable. Expect it to fail to load, or to run so slowly it is unusable — and the download is ${formatBytes(pendingRed.variant.sizeBytes)}. The estimate can be wrong, and it is your machine, so you can go ahead.`
             : ''
         }
         actionLabel="Download anyway"
         actionVariant="destructive"
         cancelLabel="Not now"
         onAction={() => {
-          const variant = pendingRed;
+          const pending = pendingRed;
           setPendingRed(null);
-          if (variant) void models.download(variant);
+          if (!pending) return;
+          void (pending.andUse
+            ? models.downloadAndUse(pending.variant)
+            : models.download(pending.variant));
         }}
       />
     </Page>
@@ -253,13 +281,32 @@ export function ModelsPage(): React.JSX.Element {
 function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.Element {
   const detected = models.system !== null;
 
+  /**
+   * Everything currently on screen, which is what has to be re-checked.
+   *
+   * `Re-check` throws the verdict cache away, so any row it did not re-request
+   * would be stranded at "not checked yet" — including a RED one, whose verdict
+   * is the only thing that puts a confirmation in front of the download.
+   */
+  const targets = useMemo(
+    () =>
+      recheckTargets({
+        catalog: models.catalog,
+        hfRepo: models.hfRepo,
+        discovery: models.discovery,
+      }),
+    [models.catalog, models.hfRepo, models.discovery],
+  );
+
+  const isRechecking = models.isSystemLoading || Object.keys(models.checking).length > 0;
+
   return (
     <HStack
       gap={2}
       align="center"
       paddingInline={2}
       style={{
-        border: '1px solid var(--color-border)',
+        border: 'var(--border-width) solid var(--color-border)',
         borderRadius: 'var(--radius-full)',
       }}
     >
@@ -280,9 +327,9 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
         label="Re-check"
         size="sm"
         variant="ghost"
-        isLoading={models.isSystemLoading}
+        isLoading={isRechecking}
         onClick={() => {
-          void models.refreshSystem();
+          void models.recheck(targets);
         }}
         tooltip="Probe memory and GPUs again, and clear the cached verdicts"
       />
@@ -297,7 +344,7 @@ function MachineChip({ models }: { readonly models: ModelsState }): React.JSX.El
 interface DownloadableProps {
   readonly models: ModelsState;
   readonly localByFile: Map<string, LocalModel>;
-  readonly onDownload: (variant: Variant, verdict: SupportVerdict) => void;
+  readonly onDownload: (variant: Variant, verdict: SupportVerdict, andUse?: boolean) => void;
 }
 
 /**
@@ -330,7 +377,38 @@ function RecommendationHero({
 
   const isChecking = models.isLoading || Object.keys(models.checking).length > 0;
 
+  /**
+   * Why there is no pick — "not checked" is not "too big".
+   *
+   * Counted over the curated catalog rather than the browse list, because the
+   * hero only ever recommends from the catalog. A check that failed reports GREY
+   * with an error; without splitting the two the page told anyone whose checks
+   * had errored that their machine could not run a thing.
+   */
+  const { catalog, support: supportByKey, verdictFor } = models;
+  const checks = useMemo(
+    () =>
+      countChecks(
+        catalog.map((entry) => ({
+          verdict: verdictFor(entry.repo, entry.filename),
+          error: supportByKey[variantKey(entry.repo, entry.filename)]?.error ?? null,
+        })),
+      ),
+    [catalog, supportByKey, verdictFor],
+  );
+
   if (recommendation === null) {
+    const empty = heroEmptyCopy(
+      {
+        catalogCount: models.catalog.length,
+        isMachineDetected: models.system !== null,
+        tooBig: checks.tooBig,
+        checkFailed: checks.checkFailed,
+        unchecked: checks.unchecked,
+      },
+      platform,
+    );
+
     return (
       <Card padding={4}>
         {isChecking ? (
@@ -340,20 +418,8 @@ function RecommendationHero({
           </HStack>
         ) : (
           <EmptyState
-            title={
-              models.catalog.length === 0
-                ? 'The curated list could not be read'
-                : models.system === null
-                  ? `We could not measure this ${machine}`
-                  : `Nothing in the curated list fits this ${machine}`
-            }
-            description={
-              models.catalog.length === 0
-                ? 'Restart the app and try again. You can still search below and download by name.'
-                : models.system === null
-                  ? `Press Re-check above. Until memory can be measured, nothing can be recommended — but you can still browse and download below.`
-                  : 'Search below for something smaller — "1.5b" or "3b" is a good place to start.'
-            }
+            title={empty.title}
+            description={empty.description}
             headingLevel={2}
             isCompact
           />
@@ -417,6 +483,14 @@ function RecommendationHero({
               </Text>
             </VStack>
 
+            {catalogMetadata(entry.description) ? (
+              <Text type="supporting" display="block">
+                {catalogMetadata(entry.description)}
+              </Text>
+            ) : null}
+
+            <FitBreakdown id={`hero-${key}`} support={support} />
+
             {transfer.isDownloading ? (
               <TransferProgress
                 label={displayName}
@@ -466,13 +540,16 @@ function RecommendationHero({
             />
           ) : (
             <Button
-              label={transfer.isPaused ? 'Resume download' : 'Download & use'}
+              label={transfer.isPaused ? 'Resume & use' : 'Download & use'}
               variant="primary"
               icon={<Icon icon="arrowDown" size="sm" />}
               isLoading={isBusy}
               onClick={() => {
-                onDownload(variant, verdict);
+                // The second half of the label: loads the model once the
+                // transfer reports ready, and nothing at all if it does not.
+                onDownload(variant, verdict, true);
               }}
+              tooltip="Downloads it and makes it the model the assistant uses"
             />
           )}
           {eta !== null && !transfer.isReady ? <Text type="supporting">{eta}</Text> : null}
@@ -789,7 +866,7 @@ function BrowseRowView({
     <VStack
       gap={2}
       paddingBlock={2}
-      style={{ borderBlockStart: '1px solid var(--color-border)' }}
+      style={{ borderBlockStart: 'var(--border-width) solid var(--color-border)' }}
     >
       <HStack gap={3} align="start" wrap="wrap">
         <FamilyTile name={row.displayName} size={26} />
@@ -822,6 +899,14 @@ function BrowseRowView({
               </Text>
               <FitHelp label={row.displayName} title={tooltip.title} body={tooltip.body} />
             </HStack>
+
+            {row.source === 'catalog' && catalogMetadata(row.description) ? (
+              <Text type="supporting" display="block">
+                {catalogMetadata(row.description)}
+              </Text>
+            ) : null}
+
+            <FitBreakdown id={`row-${row.key}`} support={support} />
 
             {transfer.isDownloading ? (
               <TransferProgress label={row.displayName} transfer={transfer} progress={progress} />
@@ -902,6 +987,55 @@ function BrowseRowView({
         </HStack>
       </HStack>
     </VStack>
+  );
+}
+
+/**
+ * The per-model arithmetic, one disclosure below the plain-English sentence.
+ *
+ * 1a demotes detail below the decision; it does not delete it. The old page put
+ * these numbers in the row itself, which is what made it unreadable — but a
+ * rounded tooltip is not a substitute for them, and main's own `reason` string
+ * exists nowhere else in the UI. Closed by default, so the default surface is
+ * still the sentence.
+ *
+ * Renders nothing when no check has come back: there would be no numbers behind
+ * the disclosure, and an empty one reads as a missing answer rather than an
+ * absent question.
+ */
+function FitBreakdown({
+  id,
+  support,
+}: {
+  /** Unique per disclosure on the page — the hero and its browse row are two. */
+  readonly id: string;
+  readonly support: VariantSupportView | null;
+}): React.JSX.Element | null {
+  const facts = supportFacts(support);
+  if (facts.length === 0) return null;
+  const reason = supportReason(support);
+
+  return (
+    <Collapsible
+      value={`fit-${id}`}
+      defaultIsOpen={false}
+      trigger={<Text type="supporting">The numbers behind this</Text>}
+    >
+      <VStack gap={2} padding={2}>
+        <MetadataList columns="multi">
+          {facts.map((fact) => (
+            <MetadataListItem key={fact.label} label={fact.label}>
+              {fact.value}
+            </MetadataListItem>
+          ))}
+        </MetadataList>
+        {reason ? (
+          <Text type="supporting" display="block">
+            {reason}
+          </Text>
+        ) : null}
+      </VStack>
+    </Collapsible>
   );
 }
 
@@ -1073,7 +1207,7 @@ function InstalledRow({
   ];
 
   return (
-    <VStack gap={2} paddingBlock={2} style={{ borderBlockStart: '1px solid var(--color-border)' }}>
+    <VStack gap={2} paddingBlock={2} style={{ borderBlockStart: 'var(--border-width) solid var(--color-border)' }}>
       <HStack gap={3} align="start" wrap="wrap">
         <FamilyTile name={displayName} size={26} />
 

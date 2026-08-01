@@ -68,21 +68,37 @@ function verdictRank(verdict: SupportVerdict): number {
   }
 }
 
+/** One deduplicated file, before a verdict is attached to it. */
+export interface MergedVariant {
+  readonly key: string;
+  readonly repo: string;
+  readonly filename: string;
+  readonly quant: string | null;
+  readonly sizeBytes: number | null;
+  readonly description: string | null;
+  readonly source: BrowseSource;
+}
+
+/** Everything the merge needs; the verdict lookup is deliberately not part of it. */
+export type MergeInput = Omit<BrowseInput, 'verdictOf'>;
+
 /**
- * Merge the three sources into one list.
+ * Merge the three sources into one deduplicated list.
  *
  * A pasted repo is consulted first because it is the most explicit request the
  * user can make, then the curated catalog, then the sweep. Duplicates keep the
- * first row seen, but the `source` flag is decided by catalog membership rather
- * than by arrival, so a curated model that also came back from a search does not
- * wear the `Hugging Face` pill.
+ * first row seen — but a key that is in the catalog takes the **catalog's**
+ * metadata whichever source reached it first, because arrival order is an
+ * accident and the curated `description`, `quant` and `sizeBytes` are the ones a
+ * person checked. Labelling a row `catalog` while it carried a lookup's fields
+ * was the bug: the pill said curated and the text was not.
  */
-export function buildBrowseRows(input: BrowseInput): BrowseRow[] {
-  const catalogKeys = new Set(
-    input.catalog.map((entry) => variantKey(entry.repo, entry.filename)),
+export function mergeBrowseVariants(input: MergeInput): MergedVariant[] {
+  const catalogByKey = new Map(
+    input.catalog.map((entry) => [variantKey(entry.repo, entry.filename), entry] as const),
   );
 
-  const rows: BrowseRow[] = [];
+  const variants: MergedVariant[] = [];
   const seen = new Set<string>();
 
   const push = (
@@ -96,18 +112,20 @@ export function buildBrowseRows(input: BrowseInput): BrowseRow[] {
     const key = variantKey(repo, filename);
     if (seen.has(key)) return;
     seen.add(key);
-    rows.push({
-      key,
-      repo,
-      filename,
-      quant,
-      sizeBytes,
-      description,
-      verdict: input.verdictOf(repo, filename),
-      source: catalogKeys.has(key) ? 'catalog' : source,
-      format: modelFormat(repo, filename),
-      displayName: modelDisplayName(repo, filename),
-    });
+    const curated = catalogByKey.get(key);
+    variants.push(
+      curated
+        ? {
+            key,
+            repo: curated.repo,
+            filename: curated.filename,
+            quant: curated.quant,
+            sizeBytes: curated.sizeBytes,
+            description: curated.description,
+            source: 'catalog',
+          }
+        : { key, repo, filename, quant, sizeBytes, description, source },
+    );
   };
 
   if (input.hfRepo) {
@@ -132,6 +150,41 @@ export function buildBrowseRows(input: BrowseInput): BrowseRow[] {
       push(model.repo, model.filename, model.quant, model.sizeBytes, model.reason, 'search');
     }
   }
+
+  return variants;
+}
+
+/** What one variant needs to be re-checked against a fresh machine reading. */
+export interface SupportTarget {
+  readonly repo: string;
+  readonly filename: string;
+  readonly sizeBytes: number | null;
+}
+
+/**
+ * Every variant currently on the page, which is exactly what `Re-check` has to
+ * ask about again after it throws the cached verdicts away.
+ *
+ * The catalog alone would not do it: a pasted repo and a Hub sweep both put rows
+ * on screen, and a row whose verdict was invalidated but never recomputed would
+ * sit at `GREY` forever with no way back short of a reload.
+ */
+export function recheckTargets(input: MergeInput): SupportTarget[] {
+  return mergeBrowseVariants(input).map((variant) => ({
+    repo: variant.repo,
+    filename: variant.filename,
+    sizeBytes: variant.sizeBytes,
+  }));
+}
+
+/** Attach a verdict to every merged variant and order the list best fit first. */
+export function buildBrowseRows(input: BrowseInput): BrowseRow[] {
+  const rows: BrowseRow[] = mergeBrowseVariants(input).map((variant) => ({
+    ...variant,
+    verdict: input.verdictOf(variant.repo, variant.filename),
+    format: modelFormat(variant.repo, variant.filename),
+    displayName: modelDisplayName(variant.repo, variant.filename),
+  }));
 
   // Stable: Array.prototype.sort has been required to be stable since ES2019,
   // so equal-verdict rows keep the source order above.

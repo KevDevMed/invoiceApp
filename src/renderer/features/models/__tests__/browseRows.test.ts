@@ -4,6 +4,7 @@ import {
   browseFooterSentence,
   buildBrowseRows,
   parseModelQuery,
+  recheckTargets,
   visibleBrowseRows,
   type BrowseRow,
 } from '../browseRows';
@@ -126,6 +127,55 @@ describe('buildBrowseRows', () => {
     expect(rows[0]!.source).toBe('catalog');
   });
 
+  it('keeps the curated metadata when a pasted repo shadows a curated entry', () => {
+    const rows = buildBrowseRows({
+      catalog: [entry()],
+      // Pushed first, and carrying none of the curated fields.
+      hfRepo: hfRepo({
+        repo: 'Qwen/Qwen3-8B-GGUF',
+        variants: [
+          {
+            filename: 'Qwen3-8B-Q4_K_M.gguf',
+            quant: 'lookup-quant',
+            sizeBytes: 42,
+            downloadUrl: 'https://huggingface.co/x',
+            isSplit: false,
+          },
+        ],
+      }),
+      discovery: null,
+      verdictOf: verdicts({ 'Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf': 'GREEN' }),
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.source).toBe('catalog');
+    expect(rows[0]!.description).toBe(
+      'Apache-2.0 · 32K context · 5.03 GB · The most capable option here.',
+    );
+    expect(rows[0]!.quant).toBe('Q4_K_M');
+    expect(rows[0]!.sizeBytes).toBe(5_027_783_488);
+  });
+
+  it('keeps the curated metadata when a search shadows a curated entry', () => {
+    const rows = buildBrowseRows({
+      catalog: [entry()],
+      hfRepo: null,
+      discovery: discovery([
+        discovered({
+          repo: 'Qwen/Qwen3-8B-GGUF',
+          filename: 'Qwen3-8B-Q4_K_M.gguf',
+          quant: 'search-quant',
+          sizeBytes: 7,
+          reason: 'main ranked it',
+        }),
+      ]),
+      verdictOf: verdicts({ 'Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf': 'GREEN' }),
+    });
+
+    expect(rows[0]!.description).toContain('The most capable option here.');
+    expect(rows[0]!.quant).toBe('Q4_K_M');
+  });
+
   it('orders best fit first, keeping unchecked rows above a known bad one', () => {
     const rows = buildBrowseRows({
       catalog: [
@@ -180,6 +230,52 @@ describe('buildBrowseRows', () => {
     expect(
       buildBrowseRows({ catalog: [], hfRepo: null, discovery: null, verdictOf: verdicts({}) }),
     ).toEqual([]);
+  });
+});
+
+describe('recheckTargets', () => {
+  it('names every variant on screen, not just the curated ones', () => {
+    const targets = recheckTargets({
+      catalog: [entry()],
+      hfRepo: hfRepo(),
+      discovery: discovery([discovered()]),
+    });
+
+    expect(targets).toEqual([
+      { repo: 'someone/Pasted-GGUF', filename: 'Pasted-Q4_K_M.gguf', sizeBytes: 2_000 },
+      {
+        repo: 'Qwen/Qwen3-8B-GGUF',
+        filename: 'Qwen3-8B-Q4_K_M.gguf',
+        sizeBytes: 5_027_783_488,
+      },
+      { repo: 'bartowski/Foo-GGUF', filename: 'Foo-Q4_K_M.gguf', sizeBytes: 1_000 },
+    ]);
+  });
+
+  it('asks about a shadowed row once, with the curated size', () => {
+    const targets = recheckTargets({
+      catalog: [entry()],
+      hfRepo: null,
+      discovery: discovery([
+        discovered({
+          repo: 'Qwen/Qwen3-8B-GGUF',
+          filename: 'Qwen3-8B-Q4_K_M.gguf',
+          sizeBytes: 7,
+        }),
+      ]),
+    });
+
+    expect(targets).toEqual([
+      {
+        repo: 'Qwen/Qwen3-8B-GGUF',
+        filename: 'Qwen3-8B-Q4_K_M.gguf',
+        sizeBytes: 5_027_783_488,
+      },
+    ]);
+  });
+
+  it('has nothing to ask about when the page is empty', () => {
+    expect(recheckTargets({ catalog: [], hfRepo: null, discovery: null })).toEqual([]);
   });
 });
 

@@ -15,8 +15,13 @@
  *     "18 GB", and a second decimal place on an estimate is a false promise.
  */
 
-import type { SupportBreakdownView, SupportVerdict, SystemInfoView } from './llmExtra';
-import { formatBytes } from './useModels';
+import type {
+  SupportBreakdownView,
+  SupportVerdict,
+  SystemInfoView,
+  VariantSupportView,
+} from './llmExtra';
+import { formatBytes, formatGiB } from './useModels';
 
 /** Which runtime a build targets. Decides the badge and breaks recommendation ties. */
 export type ModelFormat = 'MLX' | 'GGUF';
@@ -73,6 +78,25 @@ export function catalogGoodFor(description: string | null): string | null {
   const parts = description.split('·').map((part) => part.trim());
   const note = (parts.length > 1 ? parts[parts.length - 1] : parts[0]) ?? '';
   return note.length > 0 ? note : null;
+}
+
+/**
+ * The other half of `catalogGoodFor`: the licence, context and size main packed
+ * in front of the note.
+ *
+ * 1a demotes this below the decision — it does not throw it away. `Apache-2.0 ·
+ * 32K context · 5.03 GB` is the only place the licence of a curated build is
+ * stated anywhere in the app, and a page that silently dropped it would be
+ * telling someone to download weights without saying what they may do with them.
+ */
+export function catalogMetadata(description: string | null): string | null {
+  if (description === null) return null;
+  const parts = description
+    .split('·')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (parts.length < 2) return null;
+  return parts.slice(0, -1).join(' · ');
 }
 
 /** A memory figure as a whole number of GiB, or null when nothing was measured. */
@@ -189,6 +213,145 @@ export function fitTooltip(
       return {
         title: 'Not checked yet:',
         body: `Nothing has read this model's header, so how much memory it needs on this ${machine} is unknown.`,
+      };
+  }
+}
+
+export interface SupportFact {
+  readonly label: string;
+  readonly value: string;
+}
+
+/**
+ * The real arithmetic behind one verdict, restored.
+ *
+ * The plain-English sentence and the tooltip stay the default surface; this is
+ * what a reader who does not believe them can open. Every figure is main's own —
+ * nothing here is rounded to "about", because the point of the disclosure is the
+ * numbers the estimate was actually made from.
+ */
+export function supportFacts(support: VariantSupportView | null): SupportFact[] {
+  if (support === null) return [];
+  const { breakdown } = support;
+  const architecture = support.architecture ?? breakdown.kvCache?.architecture ?? null;
+  const maxContext = support.maxContextLength ?? breakdown.kvCache?.maxContextLength ?? null;
+
+  return [
+    { label: 'Weights', value: formatGiB(breakdown.modelSizeBytes) },
+    {
+      label: 'KV cache',
+      value: `${formatGiB(breakdown.kvCacheBytes)} at ${breakdown.contextSize.toLocaleString('en-US')} tokens`,
+    },
+    { label: 'Total needed', value: formatGiB(breakdown.totalRequiredBytes) },
+    {
+      label: 'Usable memory',
+      value: `${formatGiB(breakdown.usableTotalMemoryBytes)} of ${formatGiB(breakdown.totalSystemMemoryBytes)}, ${formatGiB(breakdown.reserveBytes)} held back`,
+    },
+    {
+      label: 'VRAM',
+      value:
+        breakdown.totalVramBytes > 0
+          ? `${formatGiB(breakdown.usableVramBytes)} usable of ${formatGiB(breakdown.totalVramBytes)}`
+          : 'none detected',
+    },
+    { label: 'Architecture', value: architecture ?? 'unknown' },
+    {
+      label: 'Max context',
+      value: maxContext === null ? 'unknown' : `${maxContext.toLocaleString('en-US')} tokens`,
+    },
+    { label: 'Download size', value: formatBytes(support.sizeBytes) },
+  ];
+}
+
+/** Main's own one-line justification for the verdict, or null when it gave none. */
+export function supportReason(support: VariantSupportView | null): string | null {
+  const reason = support?.breakdown.reason.trim();
+  return reason && reason.length > 0 ? reason : null;
+}
+
+/**
+ * Why the hero has nothing to offer. Five causes, five different remedies.
+ *
+ * `recommendModel` returns null for all of them, so the distinction has to be
+ * made here. Collapsing them was the bug: "not checked" rendered as "too big",
+ * which told someone with a perfectly capable machine that nothing fits it.
+ */
+export type HeroEmptyReason =
+  | 'catalog-unreadable'
+  | 'machine-unknown'
+  | 'unchecked'
+  | 'checks-failed'
+  | 'none-fit';
+
+export interface HeroEmptyInput {
+  readonly catalogCount: number;
+  readonly isMachineDetected: boolean;
+  /** Curated builds whose check came back RED. */
+  readonly tooBig: number;
+  /** Curated builds whose check came back with an error. */
+  readonly checkFailed: number;
+  /** Curated builds nothing has read a header for. */
+  readonly unchecked: number;
+}
+
+/**
+ * Precedence, worst-founded first: no catalog beats no machine reading, which
+ * beats a missing check, which beats a failed one. `none-fit` is last because it
+ * is the only claim that needs *every* other possibility ruled out — saying
+ * "nothing fits" while a single check is outstanding would be a guess.
+ */
+export function heroEmptyReason(input: HeroEmptyInput): HeroEmptyReason {
+  if (input.catalogCount === 0) return 'catalog-unreadable';
+  if (!input.isMachineDetected) return 'machine-unknown';
+  if (input.unchecked > 0) return 'unchecked';
+  if (input.checkFailed > 0) return 'checks-failed';
+  if (input.tooBig > 0) return 'none-fit';
+  return 'unchecked';
+}
+
+export interface HeroEmptyCopy {
+  readonly reason: HeroEmptyReason;
+  readonly title: string;
+  readonly description: string;
+}
+
+export function heroEmptyCopy(input: HeroEmptyInput, platform: string | null): HeroEmptyCopy {
+  const machine = machineWord(platform);
+  const reason = heroEmptyReason(input);
+
+  switch (reason) {
+    case 'catalog-unreadable':
+      return {
+        reason,
+        title: 'The curated list could not be read',
+        description:
+          'Restart the app and try again. You can still search below and download by name.',
+      };
+    case 'machine-unknown':
+      return {
+        reason,
+        title: `We could not measure this ${machine}`,
+        description: `Press Re-check above. Until memory can be measured, nothing can be recommended — but you can still browse and download below.`,
+      };
+    case 'unchecked':
+      return {
+        reason,
+        title: 'Nothing has been checked yet',
+        description: `Nothing has read these models' headers, so how much memory each needs on this ${machine} is still unknown. Press Re-check above, or check one row at a time below.`,
+      };
+    case 'checks-failed':
+      return {
+        reason,
+        title: `We could not check these against this ${machine}`,
+        description:
+          'Every compatibility check failed, so nothing can be recommended yet — this is not a verdict that they are too big. Press Re-check above; each row below says what went wrong.',
+      };
+    case 'none-fit':
+      return {
+        reason,
+        title: `Nothing in the curated list fits this ${machine}`,
+        description:
+          `Every curated build needs more memory than this ${machine} has usable. Search below for something smaller — "1.5b" or "3b" is a good place to start.`,
       };
   }
 }

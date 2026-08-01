@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
+import type { SupportTarget } from './browseRows';
 import {
   checkSupport as checkSupportCall,
   discoverModels as discoverModelsCall,
@@ -97,6 +98,11 @@ export interface ModelsState {
 
   refresh(): Promise<void>;
   refreshSystem(): Promise<void>;
+  /**
+   * Throw every cached verdict away, measure the machine again, and re-check the
+   * variants passed in. What `Re-check` does, and what its tooltip promises.
+   */
+  recheck(targets: readonly SupportTarget[]): Promise<void>;
   ensureSupport(entry: { repo: string; filename: string; sizeBytes: number | null }, refresh?: boolean): Promise<void>;
   verdictFor(repo: string, filename: string): SupportVerdict;
   lookupRepo(input: string): Promise<void>;
@@ -105,6 +111,14 @@ export interface ModelsState {
   discover(query: string): Promise<void>;
   clearDiscovery(): void;
   download(entry: { repo: string; filename: string; quant?: string | null }): Promise<void>;
+  /**
+   * Download, then load the model the moment the transfer reports `ready`.
+   *
+   * A failed, cancelled or paused transfer loads nothing. `llm:download` returns
+   * as soon as the transfer *starts*, so the second half is armed here and fired
+   * from the progress stream.
+   */
+  downloadAndUse(entry: { repo: string; filename: string; quant?: string | null }): Promise<void>;
   /** Stop the transfer, keeping the partial file so it can be resumed. */
   pause(modelId: string): Promise<void>;
   /** Stop the transfer and throw the partial file away. */
@@ -150,6 +164,10 @@ export function useModels(): ModelsState {
   const samples = useRef<Map<string, Sample>>(new Map());
   /** Keys with a check already requested, so a re-render cannot fire a second one. */
   const requested = useRef<Set<string>>(new Set());
+  /** Model ids whose download was started by `downloadAndUse` and must be loaded. */
+  const pendingUse = useRef<Set<string>>(new Set());
+  /** Latest `load`, so the progress subscription can call it without depending on it. */
+  const loadRef = useRef<((modelId: string) => Promise<void>) | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -220,7 +238,14 @@ export function useModels(): ModelsState {
 
       if (event.status !== 'downloading') {
         samples.current.delete(event.modelId);
-        void refresh();
+        // `Download & use` promised two things. Only a transfer that actually
+        // finished earns the second one — error, cancelled and paused disarm it.
+        const wasArmed = pendingUse.current.delete(event.modelId);
+        if (wasArmed && event.status === 'ready' && loadRef.current) {
+          void loadRef.current(event.modelId); // refreshes on its way out
+        } else {
+          void refresh();
+        }
       }
     });
 
@@ -281,6 +306,26 @@ export function useModels(): ModelsState {
       }
     },
     [],
+  );
+
+  /**
+   * `Re-check`: invalidate, re-measure, re-check.
+   *
+   * The verdict cache has to be emptied *before* the probe, not after. A verdict
+   * is a statement about a machine reading, so the moment that reading is thrown
+   * away the verdicts computed from it are unfounded — and one of them is the
+   * only thing standing between a RED model and a download with no confirmation.
+   * `requested` goes with it, or `ensureSupport` would refuse to look again.
+   */
+  const recheck = useCallback(
+    async (targets: readonly SupportTarget[]) => {
+      requested.current.clear();
+      setSupport({});
+      await refreshSystem();
+      // Rows read LOADING while these are in flight, which every surface handles.
+      await Promise.all(targets.map((target) => ensureSupport(target, true)));
+    },
+    [refreshSystem, ensureSupport],
   );
 
   const verdictFor = useCallback(
@@ -361,6 +406,28 @@ export function useModels(): ModelsState {
     [run],
   );
 
+  const downloadAndUse = useCallback(
+    async (entry: { repo: string; filename: string; quant?: string | null }) => {
+      const key = variantKey(entry.repo, entry.filename);
+      setBusyId(key);
+      setError(null);
+      try {
+        const { modelId } = await window.api.invoke('llm:download', {
+          repo: entry.repo,
+          filename: entry.filename,
+          quant: entry.quant ?? undefined,
+        });
+        pendingUse.current.add(modelId);
+        await refresh();
+      } catch (caught) {
+        setError(message(caught));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [refresh],
+  );
+
   const pause = useCallback(
     async (modelId: string) => {
       await run(modelId, () => window.api.invoke('llm:cancelDownload', { modelId }));
@@ -392,6 +459,10 @@ export function useModels(): ModelsState {
     },
     [run],
   );
+
+  useEffect(() => {
+    loadRef.current = load;
+  }, [load]);
 
   const unload = useCallback(async () => {
     await run('__unload__', () => window.api.invoke('llm:unload', undefined));
@@ -444,6 +515,7 @@ export function useModels(): ModelsState {
       lastSmokeTest,
       refresh,
       refreshSystem,
+      recheck,
       ensureSupport,
       verdictFor,
       lookupRepo,
@@ -451,6 +523,7 @@ export function useModels(): ModelsState {
       discover,
       clearDiscovery,
       download,
+      downloadAndUse,
       pause,
       cancel,
       remove,
@@ -483,6 +556,7 @@ export function useModels(): ModelsState {
       lastSmokeTest,
       refresh,
       refreshSystem,
+      recheck,
       ensureSupport,
       verdictFor,
       lookupRepo,
@@ -490,6 +564,7 @@ export function useModels(): ModelsState {
       discover,
       clearDiscovery,
       download,
+      downloadAndUse,
       pause,
       cancel,
       remove,

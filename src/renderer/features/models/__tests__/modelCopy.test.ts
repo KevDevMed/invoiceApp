@@ -1,17 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
-import type { SupportBreakdownView, SystemInfoView } from '../llmExtra';
+import type { SupportBreakdownView, SystemInfoView, VariantSupportView } from '../llmExtra';
 import {
   approxDuration,
   approxGigabytes,
   browseSummary,
   catalogGoodFor,
+  catalogMetadata,
   downloadEtaSentence,
   familyInitial,
   fitFootnote,
   fitSentence,
   fitTooltip,
   formatBadgeLabel,
+  heroEmptyCopy,
+  heroEmptyReason,
   heroSentence,
   installedRowSubtitle,
   installedSummary,
@@ -19,6 +22,8 @@ import {
   machineWord,
   modelDisplayName,
   modelFormat,
+  supportFacts,
+  supportReason,
 } from '../modelCopy';
 
 const GIB = 1_073_741_824;
@@ -230,6 +235,143 @@ describe('fitTooltip', () => {
       expect(tooltip.body).not.toMatch(/about \d/);
       expect(tooltip.title.length).toBeGreaterThan(0);
     }
+  });
+});
+
+function support(overrides: Partial<VariantSupportView> = {}): VariantSupportView {
+  return {
+    repo: 'Qwen/Qwen3-8B-GGUF',
+    filename: 'Qwen3-8B-Q4_K_M.gguf',
+    sizeBytes: 5_027_783_488,
+    contextSize: 8192,
+    breakdown: breakdown(),
+    architecture: 'qwen3',
+    maxContextLength: 32_768,
+    checkedAt: '2026-01-01T00:00:00.000Z',
+    error: null,
+    ...overrides,
+  };
+}
+
+describe('supportFacts', () => {
+  it('restores the exact numbers the verdict was computed from', () => {
+    const facts = supportFacts(support());
+    const byLabel = Object.fromEntries(facts.map((fact) => [fact.label, fact.value]));
+
+    expect(byLabel['Weights']).toBe('4.00 GiB');
+    expect(byLabel['KV cache']).toBe('2.00 GiB at 8,192 tokens');
+    expect(byLabel['Total needed']).toBe('6.00 GiB');
+    expect(byLabel['Usable memory']).toBe('18.00 GiB of 18.00 GiB, 2.00 GiB held back');
+    expect(byLabel['VRAM']).toBe('16.00 GiB usable of 18.00 GiB');
+    expect(byLabel['Architecture']).toBe('qwen3');
+    expect(byLabel['Max context']).toBe('32,768 tokens');
+    expect(byLabel['Download size']).toBe('5.03 GB');
+  });
+
+  it('says unknown rather than inventing an architecture or a ceiling', () => {
+    const facts = supportFacts(support({ architecture: null, maxContextLength: null }));
+    const byLabel = Object.fromEntries(facts.map((fact) => [fact.label, fact.value]));
+
+    expect(byLabel['Architecture']).toBe('unknown');
+    expect(byLabel['Max context']).toBe('unknown');
+  });
+
+  it('reports no GPU rather than 0.00 GiB of VRAM', () => {
+    const facts = supportFacts(
+      support({ breakdown: breakdown({ totalVramBytes: 0, usableVramBytes: 0 }) }),
+    );
+    expect(facts.find((fact) => fact.label === 'VRAM')?.value).toBe('none detected');
+  });
+
+  it('has nothing to show when no check has come back', () => {
+    expect(supportFacts(null)).toEqual([]);
+  });
+});
+
+describe('supportReason', () => {
+  it("surfaces main's own justification, and nothing when it gave none", () => {
+    expect(supportReason(support())).toBe('main says so');
+    expect(supportReason(support({ breakdown: breakdown({ reason: '   ' }) }))).toBeNull();
+    expect(supportReason(null)).toBeNull();
+  });
+});
+
+describe('catalogMetadata', () => {
+  it('keeps the licence and context main packed in front of the note', () => {
+    expect(catalogMetadata('Apache-2.0 · 32K context · 1.11 GB · The recommended default.')).toBe(
+      'Apache-2.0 · 32K context · 1.11 GB',
+    );
+  });
+
+  it('has nothing to add when the description is only a note', () => {
+    expect(catalogMetadata('Good at drafting notes')).toBeNull();
+    expect(catalogMetadata(null)).toBeNull();
+    expect(catalogMetadata('')).toBeNull();
+  });
+
+  it('is the exact complement of catalogGoodFor', () => {
+    const description = 'MIT · 8K context · 2.00 GB · Fast and small.';
+    expect(catalogMetadata(description)).toBe('MIT · 8K context · 2.00 GB');
+    expect(catalogGoodFor(description)).toBe('Fast and small.');
+  });
+});
+
+describe('heroEmptyReason', () => {
+  const base = { catalogCount: 6, isMachineDetected: true, tooBig: 0, checkFailed: 0, unchecked: 0 };
+
+  it('never calls an unchecked catalog too big', () => {
+    expect(heroEmptyReason({ ...base, unchecked: 6 })).toBe('unchecked');
+    expect(heroEmptyReason({ ...base, unchecked: 1, tooBig: 5 })).toBe('unchecked');
+  });
+
+  it('separates a failed check from a model that genuinely does not fit', () => {
+    expect(heroEmptyReason({ ...base, checkFailed: 6 })).toBe('checks-failed');
+    expect(heroEmptyReason({ ...base, checkFailed: 1, tooBig: 5 })).toBe('checks-failed');
+    expect(heroEmptyReason({ ...base, tooBig: 6 })).toBe('none-fit');
+  });
+
+  it('puts an unreadable catalog and an unmeasured machine first', () => {
+    expect(heroEmptyReason({ ...base, catalogCount: 0, tooBig: 6 })).toBe('catalog-unreadable');
+    expect(heroEmptyReason({ ...base, isMachineDetected: false, tooBig: 6 })).toBe(
+      'machine-unknown',
+    );
+  });
+
+  it('falls back to unchecked when it knows nothing at all', () => {
+    expect(heroEmptyReason(base)).toBe('unchecked');
+  });
+});
+
+describe('heroEmptyCopy', () => {
+  const base = { catalogCount: 6, isMachineDetected: true, tooBig: 0, checkFailed: 0, unchecked: 0 };
+
+  it('gives the three no-verdict cases three different sentences', () => {
+    const unchecked = heroEmptyCopy({ ...base, unchecked: 6 }, 'darwin');
+    const failed = heroEmptyCopy({ ...base, checkFailed: 6 }, 'darwin');
+    const tooBig = heroEmptyCopy({ ...base, tooBig: 6 }, 'darwin');
+
+    expect(new Set([unchecked.title, failed.title, tooBig.title]).size).toBe(3);
+    expect(unchecked.title).toBe('Nothing has been checked yet');
+    expect(failed.title).toBe('We could not check these against this Mac');
+    expect(tooBig.title).toBe('Nothing in the curated list fits this Mac');
+  });
+
+  it('claims nothing fits only when every check actually came back too big', () => {
+    for (const input of [
+      { ...base, unchecked: 6 },
+      { ...base, checkFailed: 6 },
+      { ...base, unchecked: 3, checkFailed: 3 },
+    ]) {
+      const copy = heroEmptyCopy(input, 'darwin');
+      expect(copy.title).not.toContain('fits');
+      expect(copy.description).not.toContain('more memory than');
+    }
+  });
+
+  it('says machine rather than Mac off darwin', () => {
+    expect(heroEmptyCopy({ ...base, tooBig: 6 }, 'linux').title).toBe(
+      'Nothing in the curated list fits this machine',
+    );
   });
 });
 
