@@ -86,6 +86,8 @@ import {
   matchesSegment,
   rowStateOf,
   segmentShowing,
+  summariseTotals,
+  sumByCurrency,
 } from './listGrouping';
 import type { ListSegment } from './listGrouping';
 import { columnDef, listLayoutAt } from './listColumns';
@@ -557,14 +559,16 @@ export function InvoiceList(): React.JSX.Element {
   /**
    * The Outstanding tile's currency split. Built from the open receivables the
    * tile's own figure covers, so the bar and the figure are about one set.
+   *
+   * The lead currency goes in because the pager leaves it out — the tile's
+   * headline already prints that currency's total, and the pager repeating it
+   * was the same money twice in one box. It is derived the same way the tile's
+   * figure is, from the same bucket, so the two cannot disagree.
    */
-  const breakdown = useMemo(
-    () =>
-      buildCurrencyBreakdown(
-        matching.filter((invoice) => isOpenState(rowStateOf(invoice, today))),
-      ),
-    [matching, today],
-  );
+  const breakdown = useMemo(() => {
+    const open = matching.filter((invoice) => isOpenState(rowStateOf(invoice, today)));
+    return buildCurrencyBreakdown(open, summariseTotals(sumByCurrency(open)).leadCurrency);
+  }, [matching, today]);
 
   const rows = useMemo(() => {
     const inSegment = matching.filter((invoice) =>
@@ -1131,11 +1135,12 @@ const BAR_MIN_SEGMENT = '10px';
  * - The header count and the proportion bar are text and decoration; they let
  *   the click through (`pointerEvents: 'none'`) so the region under them still
  *   filters. `tileSlotTakesClicks` is the one place that decision is written.
- * - The sub-line and the extra-currency line are unpositioned, so the overlay
- *   already covers them.
+ * - The sub-line is unpositioned, so the overlay already covers it.
  *
- * A tile with more than one currency behind it says how many rather than
- * converting: this app has no exchange rate.
+ * No tile counts the currencies behind its figure. This app has no exchange
+ * rate, so a figure is one currency's total — but `+3 currencies` under it was
+ * a footnote with nothing to open, on three tiles that offer no breakdown at
+ * all. The Outstanding tile shows the split instead of counting it.
  */
 function MoneyTiles({
   tiles,
@@ -1166,7 +1171,6 @@ function MoneyTiles({
     >
       {tiles.map((tile) => {
         const tone = tile.tone === 'error' ? toneColours('error') : null;
-        const extra = extraCurrencyLabel(tile.extraCurrencies);
         const isLead = tile.key === 'outstanding' || tile.key === 'overdue';
         const showsBreakdown = tile.key === 'outstanding' && breakdown.hasBreakdown;
         return (
@@ -1280,12 +1284,6 @@ function MoneyTiles({
                 {tile.detail}
               </Text>
             )}
-
-            {extra === null || showsBreakdown ? null : (
-              <Text type="supporting" hasTabularNumbers maxLines={1}>
-                {extra}
-              </Text>
-            )}
           </VStack>
         );
       })}
@@ -1302,10 +1300,18 @@ function MoneyTiles({
  * code. It sits beside the tile's filter button rather than inside it, so
  * paging cannot fire click-to-filter and there is nothing to stop propagating.
  *
+ * The bar draws every currency; the pager lists `pagerEntries`, which is every
+ * currency *except* the one the tile's headline figure is already in.
+ *
  * The bar and the pager sit on opposite sides of the tile's stretched hit area
  * (see `MoneyTiles`): the bar is decoration and waives its clicks so the region
  * still filters, the pager is a control and is lifted above the overlay so its
- * two arrows answer first.
+ * arrows answer first.
+ *
+ * The arrows are only rendered when there is a second page. Two permanently
+ * disabled icon buttons are furniture, not an affordance, and the entries read
+ * better across the full width; the strip under them goes back to being filter
+ * surface, which is what the rest of the card is anyway.
  */
 function CurrencyBar({
   breakdown,
@@ -1316,7 +1322,10 @@ function CurrencyBar({
   readonly index: number;
   readonly onIndex: (next: number) => void;
 }): React.JSX.Element {
-  const page = currencyPageAt(breakdown.segments, index);
+  const entries = breakdown.pagerEntries;
+  const page = currencyPageAt(entries, index);
+  // Exactly the "more than one page" test: both flags are false on a lone page.
+  const hasPages = page.canPrevious || page.canNext;
   return (
     <VStack gap={1.5}>
       <HStack
@@ -1346,20 +1355,28 @@ function CurrencyBar({
         gap={2}
         align="center"
         role="group"
-        aria-label="Outstanding by currency"
-        style={{ position: 'relative', zIndex: 1 }}
+        aria-label="Outstanding in other currencies"
+        // Lifted above the tile's overlay so the arrows answer first, but the
+        // row itself waives its clicks: everything on it that is not an arrow
+        // is text, and text that swallowed the click would leave a dead patch
+        // in a card the reader was told is pressable. The arrows take theirs
+        // back explicitly.
+        style={{ position: 'relative', zIndex: 1, pointerEvents: 'none' }}
       >
-        <Button
-          label="Previous currencies"
-          variant="ghost"
-          size="sm"
-          isIconOnly
-          icon={<PagerChevronIcon isBack />}
-          isDisabled={!page.canPrevious}
-          onClick={() => {
-            onIndex(stepCurrencyPage(breakdown.segments, index, -1));
-          }}
-        />
+        {hasPages ? (
+          <Button
+            label="Previous currencies"
+            variant="ghost"
+            size="sm"
+            isIconOnly
+            icon={<PagerChevronIcon isBack />}
+            isDisabled={!page.canPrevious}
+            style={{ pointerEvents: 'auto' }}
+            onClick={() => {
+              onIndex(stepCurrencyPage(entries, index, -1));
+            }}
+          />
+        ) : null}
         <StackItem size="fill">
           <HStack gap={3} align="center" style={{ overflow: 'hidden' }}>
             {page.entries.map((segment) => (
@@ -1376,17 +1393,20 @@ function CurrencyBar({
             ))}
           </HStack>
         </StackItem>
-        <Button
-          label="More currencies"
-          variant="ghost"
-          size="sm"
-          isIconOnly
-          icon={<PagerChevronIcon isBack={false} />}
-          isDisabled={!page.canNext}
-          onClick={() => {
-            onIndex(stepCurrencyPage(breakdown.segments, index, 1));
-          }}
-        />
+        {hasPages ? (
+          <Button
+            label="More currencies"
+            variant="ghost"
+            size="sm"
+            isIconOnly
+            icon={<PagerChevronIcon isBack={false} />}
+            isDisabled={!page.canNext}
+            style={{ pointerEvents: 'auto' }}
+            onClick={() => {
+              onIndex(stepCurrencyPage(entries, index, 1));
+            }}
+          />
+        ) : null}
       </HStack>
     </VStack>
   );

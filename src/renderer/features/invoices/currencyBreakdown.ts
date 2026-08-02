@@ -14,6 +14,12 @@
  *   - **The pager lists each currency's own total in its own currency.** Never
  *     a converted number, and never a sum of two currencies.
  *
+ * The bar and the pager do not list the same set. The bar keeps every currency,
+ * because a proportion picture with a slice missing is not a proportion. The
+ * pager drops the tile's *lead* currency: the tile already prints that money as
+ * its headline figure, and `£124,333` above `GBP 124,333` is the same number
+ * twice in one box. `pagerEntries` is that list; `segments` is the bar's.
+ *
  * Segments are ordered by count descending, because the opacity ramp
  * (`max(0.5, 1 - i*0.07)`) fades down the list and only reads as a ranking if
  * the thing it fades is the thing the widths show. Ties break on the currency
@@ -47,7 +53,18 @@ export interface CurrencySegment {
 }
 
 export interface CurrencyBreakdown {
+  /** Every currency, count-descending. What the bar draws. */
   readonly segments: readonly CurrencySegment[];
+  /**
+   * `segments` minus the lead currency, same order — what the pager lists. The
+   * headline figure is already the lead's own total, so repeating it here would
+   * print one currency twice in one tile.
+   *
+   * Falls back to the whole of `segments` when no lead was given or the lead is
+   * not in the bucket: an empty pager under a bar with several slices would be
+   * a worse lie than a repeated figure.
+   */
+  readonly pagerEntries: readonly CurrencySegment[];
   readonly currencyCount: number;
   /**
    * Whether there is anything to break down. A single-currency workspace draws
@@ -79,8 +96,15 @@ function formatUnits(cents: number): string {
  * open receivable.
  *
  * An empty bucket gives an empty breakdown rather than a zero-width bar.
+ *
+ * `leadCurrency` is the currency the tile's headline figure is printed in —
+ * `summariseTotals(sumByCurrency(bucket)).leadCurrency`, the largest by cents.
+ * It is dropped from `pagerEntries` and kept in `segments`.
  */
-export function buildCurrencyBreakdown(invoices: readonly Invoice[]): CurrencyBreakdown {
+export function buildCurrencyBreakdown(
+  invoices: readonly Invoice[],
+  leadCurrency: string | null = null,
+): CurrencyBreakdown {
   const byCurrency = new Map<string, { cents: number; count: number }>();
   for (const invoice of invoices) {
     const entry = byCurrency.get(invoice.currency) ?? { cents: 0, count: 0 };
@@ -102,22 +126,40 @@ export function buildCurrencyBreakdown(invoices: readonly Invoice[]): CurrencyBr
       amount: formatUnits(entry.cents),
     }));
 
+  const rest = segments.filter((segment) => segment.currency !== leadCurrency);
+
   return {
     segments,
+    pagerEntries: rest.length === 0 ? segments : rest,
     currencyCount: segments.length,
     hasBreakdown: segments.length > 1,
   };
 }
 
-/** The highest first-index a window of `CURRENCY_PAGE_SIZE` can start at. */
+/**
+ * The first index of the last page.
+ *
+ * Pages tile the list — starts are multiples of `CURRENCY_PAGE_SIZE` — so the
+ * last one is allowed to be short. Backing the window up to keep it full, which
+ * `length - CURRENCY_PAGE_SIZE` did, re-showed entries the previous page had
+ * already shown.
+ */
 export function maxPageIndex(length: number): number {
-  return Math.max(0, length - CURRENCY_PAGE_SIZE);
+  if (length <= 0) return 0;
+  return Math.floor((length - 1) / CURRENCY_PAGE_SIZE) * CURRENCY_PAGE_SIZE;
 }
 
-/** `index` clamped into `[0, length - per]`, as the design's `ci` is. */
+/**
+ * `index` snapped down onto a page start and clamped into range.
+ *
+ * The index is React state that outlives a filter change, so it can arrive both
+ * out of range and off a page boundary; an off-boundary window is exactly the
+ * overlap this module now refuses.
+ */
 export function clampPageIndex(length: number, index: number): number {
   if (!Number.isFinite(index)) return 0;
-  return Math.min(Math.max(Math.trunc(index), 0), maxPageIndex(length));
+  const bounded = Math.min(Math.max(Math.trunc(index), 0), maxPageIndex(length));
+  return Math.floor(bounded / CURRENCY_PAGE_SIZE) * CURRENCY_PAGE_SIZE;
 }
 
 export interface CurrencyPage {
@@ -128,17 +170,21 @@ export interface CurrencyPage {
   readonly canNext: boolean;
 }
 
-/** The three-up window at `index`, clamped, with both edge flags. */
+/**
+ * The up-to-three-up window at `index`, snapped to a page start, with both edge
+ * flags. `entries` is short on the last page rather than overlapping the one
+ * before it.
+ */
 export function currencyPageAt(
-  segments: readonly CurrencySegment[],
+  entries: readonly CurrencySegment[],
   index: number,
 ): CurrencyPage {
-  const clamped = clampPageIndex(segments.length, index);
+  const clamped = clampPageIndex(entries.length, index);
   return {
     index: clamped,
-    entries: segments.slice(clamped, clamped + CURRENCY_PAGE_SIZE),
+    entries: entries.slice(clamped, clamped + CURRENCY_PAGE_SIZE),
     canPrevious: clamped > 0,
-    canNext: clamped < maxPageIndex(segments.length),
+    canNext: clamped + CURRENCY_PAGE_SIZE < entries.length,
   };
 }
 
@@ -147,10 +193,10 @@ export function currencyPageAt(
  * a whole page, not one entry — the design's `step(-per)` / `step(+per)`.
  */
 export function stepCurrencyPage(
-  segments: readonly CurrencySegment[],
+  entries: readonly CurrencySegment[],
   index: number,
   direction: number,
 ): number {
-  const from = clampPageIndex(segments.length, index);
-  return clampPageIndex(segments.length, from + direction * CURRENCY_PAGE_SIZE);
+  const from = clampPageIndex(entries.length, index);
+  return clampPageIndex(entries.length, from + direction * CURRENCY_PAGE_SIZE);
 }

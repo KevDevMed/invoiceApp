@@ -9,9 +9,12 @@
  *
  * Money stays integer cents and stays per currency. This app holds no exchange
  * rate (see the Currency note in the 3a spec and the header of ./listGrouping),
- * so a tile leads with its largest currency and carries a count of the others
- * rather than inventing a converted total. `extraCurrencies` is what the view
- * turns into an affordance; `full` is what that affordance reveals.
+ * so a tile leads with its largest currency rather than inventing a converted
+ * total, and `full` carries every currency for a caller that wants the rest.
+ * The tiles no longer print a `+N currencies` line under the figure: the one
+ * tile that breaks its currencies out does it properly, with the bar and the
+ * pager in ./currencyBreakdown, and a bare count on the other three was a note
+ * about something the reader had no way to open.
  *
  * Pure module — no React, no `window.api`. Everything here is asserted by the
  * node-only vitest project.
@@ -43,8 +46,6 @@ export interface MoneyTile {
   readonly detail: string;
   /** The count as the header row prints it: `31 invoices`, or a bare `4`. */
   readonly headerCount: string;
-  /** How many currencies `figure` is standing in front of. */
-  readonly extraCurrencies: number;
   /** Every currency joined — what the disclosure shows. */
   readonly full: string;
   /** How many invoices the figure covers. */
@@ -223,7 +224,6 @@ export function buildMoneyTiles(
     figure: summary.lead === '' ? NO_FIGURE : summary.lead,
     detail,
     headerCount,
-    extraCurrencies: summary.extraCurrencies,
     full: summary.full,
     count: bucket.length,
     tone,

@@ -56,7 +56,7 @@ describe('buildMoneyTiles', () => {
     for (const tile of tiles) {
       expect(tile.figure).toBe('—');
       expect(tile.count).toBe(0);
-      expect(tile.extraCurrencies).toBe(0);
+      expect(tile.full).toBe('');
     }
     expect(tiles.map((tile) => tile.detail)).toEqual([
       'Nothing outstanding',
@@ -157,7 +157,9 @@ describe('buildMoneyTiles', () => {
     );
     const outstanding = byKey(tiles, 'outstanding');
     expect(outstanding.figure).toBe('£5,000');
-    expect(outstanding.extraCurrencies).toBe(2);
+    // The tile no longer counts the others under the figure — `full` is what a
+    // caller shows instead, and the Outstanding tile's bar and pager show it.
+    expect(outstanding.full).toContain('£5,000');
     expect(outstanding.full).toContain('€2,000');
     expect(outstanding.full).toContain('$1,000');
     expect(outstanding.count).toBe(3);
@@ -178,7 +180,7 @@ describe('buildMoneyTiles', () => {
     // USD is the larger overdue pile, but GBP leads so the two can be read
     // against each other.
     expect(byKey(tiles, 'overdue').figure).toBe('£1,000');
-    expect(byKey(tiles, 'overdue').extraCurrencies).toBe(1);
+    expect(byKey(tiles, 'overdue').full).toBe('$8,000 · £1,000');
   });
 
   it('keeps money in integer cents — no floats reach the figure', () => {

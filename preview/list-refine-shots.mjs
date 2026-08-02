@@ -182,19 +182,10 @@ check(
 }
 await shot(page, '16-whole-card-hit-area');
 
-// And the three real controls on those cards are NOT covered: they are above
-// the overlay and receive their own clicks first.
+// And the real controls on those cards are NOT covered: they are above the
+// overlay and receive their own clicks first. The pager's arrows are checked in
+// the pager section below, because they only exist when there is a second page.
 check('Chase all N receives its own clicks', await topmostButtonAt(chase), await chase.innerText());
-check(
-  'the back arrow receives its own clicks',
-  await topmostButtonAt(page.getByRole('button', { name: 'Previous currencies' })),
-  'Previous currencies',
-);
-check(
-  'the forward arrow receives its own clicks',
-  await topmostButtonAt(page.getByRole('button', { name: 'More currencies' })),
-  'More currencies',
-);
 
 const overdueTile = tileCard('Overdue');
 const overdueLines = (await overdueTile.innerText()).split('\n').map((line) => line.trim());
@@ -210,36 +201,99 @@ for (const label of ['Due in 7 days', 'Drafts']) {
 }
 
 // --- currency pager -------------------------------------------------------
-const pager = page.getByRole('group', { name: 'Outstanding by currency' });
+// The pager lists the currencies the tile's headline figure is *not* in, three
+// at a time. Two rules are under test here:
+//   - the headline currency never appears in it — `£124,333` above
+//     `GBP 124,333` is the same money twice in one box;
+//   - pages tile the list. No code appears on two pages, and the last page is
+//     allowed to be short. Backing the window up to keep it full was the bug.
+const pager = page.getByRole('group', { name: 'Outstanding in other currencies' });
 assert('Outstanding carries the currency pager', (await pager.count()) === 1);
 const codes = async () => (await pager.innerText()).trim().split(/\s+/).filter((part) => /^[A-Z]{3}$/.test(part));
 const prev = pager.getByRole('button', { name: 'Previous currencies' });
 const next = pager.getByRole('button', { name: 'More currencies' });
 
-check('pager shows three codes', (await codes()).length, 3);
+// The headline, as a code. The figure carries a symbol, the pager carries the
+// code, so one has to be mapped onto the other to compare them at all.
+const SYMBOL_CODES = { '£': 'GBP', '€': 'EUR', 'CA$': 'CAD', 'A$': 'AUD', '$': 'USD', '¥': 'JPY' };
+const outstandingFigure = (await cardRegion('Outstanding', 0).innerText())
+  .split('\n')
+  .map((line) => line.trim())
+  .find((line) => /[\d,]{3,}/.test(line)) ?? '';
+const leadSymbol = outstandingFigure.replace(/[\d.,\s].*$/, '');
+const leadCode = SYMBOL_CODES[leadSymbol] ?? '?';
+console.log(`outstanding figure: ${outstandingFigure} -> lead ${leadSymbol} = ${leadCode}`);
+
 const page1 = await codes();
 console.log(`pager page 1: ${page1.join(' ')}`);
-check('prev is disabled at the left edge', await prev.isDisabled(), true);
-await next.click();
-const page2 = await codes();
-console.log(`pager page 2: ${page2.join(' ')}`);
-// The seed carries four currencies, so a whole-page step of 3 from index 0
-// clamps to index 1 — the window stays full rather than showing one entry.
-assert('next moves the window', page2.join(' ') !== page1.join(' '), `${page1} -> ${page2}`);
-check('the window stays full after stepping', page2.length, 3);
-check('prev is live once moved', await prev.isDisabled(), false);
-// Walk to the end and confirm it clamps.
-for (let i = 0; i < 8; i += 1) if (!(await next.isDisabled())) await next.click();
-const last = await codes();
-console.log(`pager last page: ${last.join(' ')}`);
-check('next is disabled at the right edge', await next.isDisabled(), true);
-check('the window stays full at the end', last.length, 3);
-await shot(page, '02-pager-end');
+assert('pager shows at most a full window', page1.length > 0 && page1.length <= 3, `${page1.length}`);
+
+// The arrows only exist when there is a second page — two permanently disabled
+// icon buttons are furniture. The seed's four currencies minus the headline's
+// leave three, which is one page, so on the seed there are none.
+const arrowCount = (await prev.count()) + (await next.count());
+console.log(`pager arrows present: ${arrowCount}`);
+check('both arrows appear together, or neither does', arrowCount === 0 || arrowCount === 2, true);
+
+// The entries themselves are text and must hand their click to the tile's
+// filter, or the strip they sit on is a dead patch in the middle of a card the
+// reader was told is pressable — most of the row, once the arrows are gone.
+const entryText = pager.getByText(/^[A-Z]{3}\s/).first();
+check(
+  'the pager entries are covered by the Outstanding filter button',
+  await topmostButtonAt(entryText),
+  'Filter by Outstanding',
+);
+
+if (arrowCount === 0) {
+  // The bar keeps every currency; the pager drops exactly the headline's one.
+  const barSegments = await cardRegion('Outstanding', 2).locator('> *').nth(0).locator('> *').count();
+  console.log(`bar segments: ${barSegments}, pager entries: ${page1.length}`);
+  check('the pager lists every currency but the headline\'s', page1.length, barSegments - 1);
+  assert('a single page cannot repeat the headline currency', !page1.includes(leadCode), `${leadCode} in ${page1}`);
+  await shot(page, '02-pager-end');
+} else {
+  check('prev is disabled at the left edge', await prev.isDisabled(), true);
+  // Walk forward to the end, collecting every page.
+  const pages = [page1];
+  for (let i = 0; i < 12 && !(await next.isDisabled()); i += 1) {
+    await next.click();
+    pages.push(await codes());
+  }
+  console.log(`pager pages: ${pages.map((codesOnPage) => codesOnPage.join(' ')).join(' | ')}`);
+  check('next is disabled at the right edge', await next.isDisabled(), true);
+  check('prev is live once moved', await prev.isDisabled(), false);
+  const seen = pages.flat();
+  assert('no code appears on two pages', new Set(seen).size === seen.length, seen.join(' '));
+  // The last page is short when the list does not divide by three. That is
+  // correct; padding it by backing the window up is what repeated entries.
+  assert(
+    'every page but the last is full, and the last is not empty',
+    pages.slice(0, -1).every((codesOnPage) => codesOnPage.length === 3) &&
+      pages[pages.length - 1].length > 0 &&
+      pages[pages.length - 1].length <= 3,
+    pages.map((codesOnPage) => codesOnPage.length).join(','),
+  );
+  await shot(page, '02-pager-end');
+  // Walking back must show the same entries, each exactly once, in reverse.
+  const backwards = [await codes()];
+  for (let i = 0; i < 12 && !(await prev.isDisabled()); i += 1) {
+    await prev.click();
+    backwards.push(await codes());
+  }
+  check('prev clamps at zero', await prev.isDisabled(), true);
+  check('and the first window is back', (await codes()).join(' '), page1.join(' '));
+  const seenBack = backwards.flat();
+  assert('walking back repeats nothing either', new Set(seenBack).size === seenBack.length, seenBack.join(' '));
+  assert(
+    'walking back covers exactly what walking forward did',
+    new Set(seenBack).size === new Set(seen).size,
+    `${seenBack.join(' ')} vs ${seen.join(' ')}`,
+  );
+  assert('the headline currency is on no page', !seen.includes(leadCode), `${leadCode} in ${seen.join(' ')}`);
+}
 // A pager click must not have applied the tile's own filter.
 check('paging did not apply the tile filter', await page.getByRole('group', { name: 'Active column filters' }).count(), 0);
-for (let i = 0; i < 8; i += 1) if (!(await prev.isDisabled())) await prev.click();
-check('prev clamps at zero', await prev.isDisabled(), true);
-check('and the first window is back', (await codes()).join(' '), page1.join(' '));
 
 // --- every column menu ----------------------------------------------------
 const HEADERS = ['CLIENT', 'INVOICE', 'STATUS & DUE', 'ISSUED', 'TOTAL'];
