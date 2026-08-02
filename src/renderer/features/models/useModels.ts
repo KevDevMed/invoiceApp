@@ -523,16 +523,16 @@ export function useModels(): ModelsState {
       setIsDiscovering(true);
       setDiscoveryError(null);
       try {
-        // INV-4: `refresh` because main's per-variant verdict cache carries no
-        // reference to the hardware profile its entries were computed against.
-        // A check that was in flight across a `Re-check` still writes its stale
-        // answer into that cache, and a sweep asking politely is served it —
-        // whereupon a model that does not fit folds in as non-RED and downloads
-        // without the confirmation. The renderer cannot fence another process's
-        // cache, so it declines to accept anything that cache might have served.
-        // The durable fix is versioning main's cache against the profile, filed
-        // as INV-4; when that lands, drop this flag and the header reads it costs.
-        const result = await discoverModelsCall({ query, refresh: true });
+        // Asking politely is safe again. This used to force `refresh` because
+        // main's verdict cache carried no reference to the machine reading its
+        // entries were computed against, so a check in flight across a
+        // `Re-check` wrote a stale answer there and a sweep was served it — a
+        // model that does not fit folding in as non-RED and downloading with no
+        // confirmation. INV-4 stamps every entry in that cache with its reading
+        // and treats a superseded stamp as absent, so a sweep can only ever be
+        // served verdicts about the current machine. Dropping the flag is what
+        // gives back the 4 MB header read per already-known file per search.
+        const result = await discoverModelsCall({ query });
         // A newer search, or a `Clear results`, has spoken since. Its rows are
         // what the user is looking at; these are a stale answer to a stale query.
         if (!isCurrent()) return;
@@ -541,9 +541,11 @@ export function useModels(): ModelsState {
           setDiscovery(result);
           for (const model of result.models) {
             if (model.support === null) continue;
-            // `forceRefresh`, because main caches per variant too: asking
-            // politely hands back the very verdict the generation bump
-            // discarded, computed against the reading nobody believes.
+            // `forceRefresh` because a `Re-check` ran while this sweep was out,
+            // and `Re-check` promises a fresh look at every row on screen.
+            // Main's stamps already guarantee no verdict from the superseded
+            // reading comes back; this is about honouring the click, not about
+            // distrusting that cache.
             void ensureSupport(
               {
                 repo: model.repo,

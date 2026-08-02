@@ -8,6 +8,17 @@
  * A failure — no network, a gated repo, a header we cannot parse — comes back as
  * a GREY verdict carrying the reason, never as a colour. The UI is expected to
  * say "could not check" and let the user download anyway if they insist.
+ *
+ * Every cached verdict is stamped with the machine reading it was computed
+ * against, and an entry whose stamp is not the current reading is treated as
+ * absent. A verdict is a statement about *this machine*, so the moment the
+ * machine is re-measured every answer founded on the old measurement is
+ * unfounded — including the ones still in flight, which land after the
+ * re-measurement and would otherwise be cached as if they were current. The
+ * renderer fences its own copy by generation (`features/models/supportCache.ts`)
+ * but cannot reach into this process, so the fence has to exist on both sides:
+ * a stale non-RED verdict served from here is the download confirmation not
+ * appearing for a model that does not fit.
  */
 
 import {
@@ -88,27 +99,91 @@ function greyFor(request: CheckRequest, contextSize: number, reason: string, siz
   };
 }
 
+/**
+ * The identity of a machine reading, as far as a verdict is concerned.
+ *
+ * `checkModelSupport` sees the machine only through `toCompatibilityHardware`,
+ * so two profiles with the same projection produce the same verdict for the same
+ * file and there is nothing to invalidate between them. Fingerprinting the
+ * projection rather than counting probes is what lets `Re-check` on an unchanged
+ * machine keep its cache instead of paying for every header again.
+ *
+ * `freeRamBytes` is deliberately not in here: it moves constantly, is not part of
+ * the projection, and stamping it would expire the whole cache every few seconds.
+ */
+export function profileStamp(profile: HardwareProfile): string {
+  const hardware = toCompatibilityHardware(profile);
+  return JSON.stringify({
+    totalRamBytes: hardware.totalRamBytes,
+    gpus: hardware.gpus.map((gpu) => [gpu.name, gpu.totalMemoryBytes]),
+  });
+}
+
+/** A probe that has been accepted as the current reading. */
+interface AdoptedProfile {
+  /** Issue order, not completion order. */
+  readonly id: number;
+  readonly profile: HardwareProfile;
+  readonly stamp: string;
+}
+
+interface CacheEntry {
+  /** The reading this verdict was computed against. */
+  readonly stamp: string;
+  readonly value: VariantSupport;
+}
+
 export class SupportService {
-  private hardware: HardwareProfile | null = null;
-  private hardwarePromise: Promise<HardwareProfile> | null = null;
-  private readonly cache = new Map<string, VariantSupport>();
+  private adopted: AdoptedProfile | null = null;
+  private pending: Promise<AdoptedProfile> | null = null;
+  private probes = 0;
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(private readonly deps: SupportServiceDeps = {}) {}
 
   /**
    * The detected machine. Cached for the life of the process — RAM and GPUs do
    * not change while the app runs, and the llama probe is expensive.
+   *
+   * `refresh` re-probes. Overlapping probes are ordered by when they were
+   * *issued*: a probe that started earlier and finished later describes the older
+   * machine, so it is not adopted, and its caller is handed the newer reading
+   * rather than the one it happens to be holding.
    */
   async systemInfo(refresh = false): Promise<HardwareProfile> {
-    if (refresh) {
-      this.hardware = null;
-      this.hardwarePromise = null;
-      this.cache.clear();
+    // Dropping the cache eagerly is not what makes the fence safe — the stamps
+    // are — but there is no point keeping verdicts about a reading being
+    // replaced, and it keeps `all()` honest for the renderer's next paint.
+    if (refresh) this.cache.clear();
+    return (await this.profile(refresh)).profile;
+  }
+
+  private async profile(refresh: boolean): Promise<AdoptedProfile> {
+    // A probe already out is by definition no older than this call, so a
+    // non-refresh caller joins it rather than settling for the previous reading.
+    if (!refresh) {
+      if (this.pending) return this.pending;
+      if (this.adopted) return this.adopted;
     }
-    if (this.hardware) return this.hardware;
-    this.hardwarePromise ??= (this.deps.detectHardware ?? detectHardware)();
-    this.hardware = await this.hardwarePromise;
-    return this.hardware;
+
+    const id = (this.probes += 1);
+    const detect = this.deps.detectHardware ?? detectHardware;
+    const run = (async (): Promise<AdoptedProfile> => {
+      const detected = await detect();
+      if (this.adopted === null || this.adopted.id < id) {
+        this.adopted = { id, profile: detected, stamp: profileStamp(detected) };
+      }
+      // Late or not, the answer is the reading the app currently believes.
+      return this.adopted;
+    })();
+
+    this.pending = run;
+    try {
+      return await run;
+    } finally {
+      // A failed or superseded probe must not clear a newer one's slot.
+      if (this.pending === run) this.pending = null;
+    }
   }
 
   cacheKey(repo: string, filename: string, contextSize: number): string {
@@ -116,12 +191,23 @@ export class SupportService {
   }
 
   cached(repo: string, filename: string, contextSize: number): VariantSupport | null {
-    return this.cache.get(this.cacheKey(repo, filename, contextSize)) ?? null;
+    return this.entryFor(this.cacheKey(repo, filename, contextSize))?.value ?? null;
   }
 
-  /** Every verdict computed so far, for the renderer's initial paint. */
+  /** A cached entry, or nothing at all when it belongs to a superseded reading. */
+  private entryFor(key: string): CacheEntry | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    // Nothing has been measured yet, so nothing can be current.
+    if (this.adopted === null || entry.stamp !== this.adopted.stamp) return null;
+    return entry;
+  }
+
+  /** Every verdict computed against the current reading, for the initial paint. */
   all(): VariantSupport[] {
-    return [...this.cache.values()];
+    const stamp = this.adopted?.stamp ?? null;
+    if (stamp === null) return [];
+    return [...this.cache.values()].filter((entry) => entry.stamp === stamp).map((entry) => entry.value);
   }
 
   /** Drop cached verdicts, e.g. after the hardware panel is refreshed. */
@@ -185,19 +271,35 @@ export class SupportService {
     const contextSize = request.ctxSize ?? DEFAULT_VERDICT_CONTEXT_SIZE;
     const key = this.cacheKey(request.repo, request.filename, contextSize);
 
+    // The reading is settled before the cache is consulted, because both the
+    // hit test and the stamp on whatever is written next are about *this*
+    // reading and they have to be the same one.
+    const reading = await this.profile(false);
+
     if (!request.refresh) {
-      const hit = this.cache.get(key);
+      const hit = this.entryFor(key);
       // A previous failure is worth retrying; a previous answer is not worth
       // three megabytes of range requests.
-      if (hit && hit.error === null) return hit;
+      if (hit && hit.value.error === null) return hit.value;
     }
 
-    const result = await this.compute(request, contextSize);
-    this.cache.set(key, result);
+    const result = await this.compute(request, contextSize, reading.profile);
+
+    // The machine was re-measured while this check was out: the answer is about
+    // a reading nobody believes any more, so it is returned to its caller (who
+    // fences it) but never cached. This is the INV-4 hole — main used to write
+    // it, and a later polite ask was served a verdict from the old machine.
+    if (this.adopted === null || this.adopted.stamp === reading.stamp) {
+      this.cache.set(key, { stamp: reading.stamp, value: result });
+    }
     return result;
   }
 
-  private async compute(request: CheckRequest, contextSize: number): Promise<VariantSupport> {
+  private async compute(
+    request: CheckRequest,
+    contextSize: number,
+    profile: HardwareProfile,
+  ): Promise<VariantSupport> {
     let url: string;
     try {
       url = downloadUrl(request.repo, request.filename);
@@ -207,8 +309,6 @@ export class SupportService {
 
     const token = this.deps.token?.() ?? null;
     const headers = token ? { authorization: `Bearer ${token}` } : undefined;
-
-    const profile = await this.systemInfo();
 
     let sizeBytes = request.sizeBytes ?? null;
     let header: GgufHeader;

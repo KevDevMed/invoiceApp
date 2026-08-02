@@ -193,6 +193,158 @@ describe('SupportService', () => {
   });
 });
 
+/**
+ * INV-4: a verdict is a statement about one machine reading, and the cache has
+ * to say which. Everything here is about the window in which a check issued
+ * against the old reading lands after the new one has been adopted.
+ */
+describe('the machine reading a cached verdict belongs to', () => {
+  /** A machine too small for the 8 GB file below, so its verdict is RED. */
+  const TINY_4GB: HardwareProfile = {
+    ...APPLE_16GB,
+    cpuModel: 'Apple M1',
+    totalRamBytes: 4_294_967_296,
+    gpus: [{ name: 'Apple M1', totalMemoryBytes: 4_294_967_296 }],
+    totalVramBytes: 4_294_967_296,
+  };
+
+  const BIG_FILE = 8_000_000_000;
+
+  /** Let every pending microtask chain settle before poking the service again. */
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A header read that only resolves when the test says so. */
+  function gatedHeader() {
+    const gates: Array<() => void> = [];
+    const readHeader = vi.fn(async () => {
+      await new Promise<void>((resolve) => gates.push(resolve));
+      return HEADER;
+    });
+    return {
+      readHeader,
+      /** Settle first, so a read that has not reached its gate yet is caught too. */
+      release: async (): Promise<void> => {
+        await flush();
+        gates.splice(0).forEach((open) => open());
+        await flush();
+      },
+      /** Newest read first, so an older one is the last to write. */
+      releaseNewestFirst: async (): Promise<void> => {
+        await flush();
+        for (const open of gates.splice(0).reverse()) {
+          open();
+          await flush();
+        }
+      },
+    };
+  }
+
+  it('does not serve a verdict computed against a superseded reading', async () => {
+    const { readHeader, release } = gatedHeader();
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockResolvedValue(TINY_4GB);
+    const instance = new SupportService({ detectHardware: detect, readHeader, headSize: async () => BIG_FILE });
+
+    // A: issued against the 16 GB reading, still reading the header.
+    const inFlight = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    await instance.systemInfo(true); // the machine is now the 4 GB one
+    await release();
+    expect((await inFlight).breakdown.verdict).toBe('GREEN');
+
+    // A's answer was about a machine that no longer applies, so it is not in
+    // the cache to be served and the next polite ask pays for a real check.
+    expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)).toBeNull();
+    expect(instance.all()).toHaveLength(0);
+
+    const fresh = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    await release();
+    expect((await fresh).breakdown.verdict).toBe('RED');
+    expect(readHeader).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a verdict that lands after a re-probe of the same machine', async () => {
+    const { readHeader, release } = gatedHeader();
+    // Same machine, re-measured: `freeRamBytes` moved, nothing the verdict reads did.
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockResolvedValue({ ...APPLE_16GB, freeRamBytes: 1_000_000_000 });
+    const instance = new SupportService({ detectHardware: detect, readHeader, headSize: async () => 1 });
+
+    const inFlight = instance.check({ ...REQUEST, sizeBytes: 1 });
+    await instance.systemInfo(true);
+    await release();
+    await inFlight;
+
+    // The stamp is what the verdict was computed from, not a probe counter, so
+    // a re-measurement that changed nothing relevant does not throw the answer
+    // away — which is the difference between `Re-check` costing one header read
+    // per row and costing none.
+    expect(instance.all()).toHaveLength(1);
+    await instance.check({ ...REQUEST, sizeBytes: 1 });
+    expect(readHeader).toHaveBeenCalledOnce();
+  });
+
+  it('does not let an older probe overwrite a newer machine reading', async () => {
+    let slow: (() => void) | null = null;
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      // Probe 1: issued first, resolves last.
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          slow = resolve;
+        });
+        return APPLE_16GB;
+      })
+      // Probe 2: issued second, resolves immediately.
+      .mockResolvedValue(TINY_4GB);
+    const instance = new SupportService({ detectHardware: detect, readHeader: async () => HEADER, headSize: async () => 1 });
+
+    const first = instance.systemInfo(true);
+    const second = instance.systemInfo(true);
+    expect(await second).toMatchObject({ totalRamBytes: TINY_4GB.totalRamBytes });
+
+    slow!();
+    // The late probe describes the older machine, so it is neither adopted nor
+    // handed back: its caller gets the reading the app actually believes.
+    expect(await first).toMatchObject({ totalRamBytes: TINY_4GB.totalRamBytes });
+    expect(await instance.systemInfo()).toMatchObject({ totalRamBytes: TINY_4GB.totalRamBytes });
+  });
+
+  it('cannot serve the stale non-RED verdict from the reproduction sequence', async () => {
+    const { readHeader, release, releaseNewestFirst } = gatedHeader();
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockResolvedValue(TINY_4GB);
+    const instance = new SupportService({ detectHardware: detect, readHeader, headSize: async () => BIG_FILE });
+
+    // 1. Check A starts against H0, its header read still in flight.
+    const checkA = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    // 2. `Re-check`: probe gives H1, and check B returns RED against it.
+    await instance.systemInfo(true);
+    const checkB = instance.check({ ...REQUEST, sizeBytes: BIG_FILE, refresh: true });
+    // 3. Both complete, A last — the whole point of the sequence. The renderer
+    //    discards A on its generation guard; main must not keep it either.
+    await releaseNewestFirst();
+    expect((await checkB).breakdown.verdict).toBe('RED');
+    expect((await checkA).breakdown.verdict).toBe('GREEN');
+
+    // 4. The discovery sweep asks politely — no `refresh`.
+    const sweep = instance.checkMany([{ ...REQUEST, sizeBytes: BIG_FILE }]);
+    await release();
+    const [served] = await sweep;
+
+    // 5. RED, so `startDownload` raises the confirmation.
+    expect(served!.breakdown.verdict).toBe('RED');
+    // B's answer was current, so the sweep was served it rather than paying for
+    // a fourth header read: A's stale entry is absent, not merely outvoted.
+    expect(readHeader).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('checkMany', () => {
   it('runs at most `concurrency` range reads at once', async () => {
     let inFlight = 0;
