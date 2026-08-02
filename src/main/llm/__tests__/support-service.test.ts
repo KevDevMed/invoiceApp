@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { GgufError, type GgufHeader } from '../gguf';
 import type { HardwareProfile } from '../hardware';
-import { SupportService } from '../support-service';
+import { SupportService, type VariantSupport } from '../support-service';
 
 const METADATA = {
   'general.architecture': 'llama',
@@ -490,6 +490,143 @@ describe('the machine reading a cached verdict belongs to', () => {
 
     probe.open();
     await reProbe;
+  });
+
+  /**
+   * A probe that can never be adopted must not be able to hold the app up.
+   *
+   * These assert with a deadline rather than a plain `await`, because the
+   * failure being guarded against is a hang: without the timeout a regression
+   * stops the whole suite instead of failing one test.
+   */
+  describe('a probe the app has already moved past', () => {
+    /** Resolves to `TIMEOUT` rather than hanging, so a stuck call fails the test. */
+    function withDeadline<T>(promise: Promise<T>, ms = 250): Promise<T | 'TIMEOUT'> {
+      return Promise.race([
+        promise,
+        new Promise<'TIMEOUT'>((resolve) => setTimeout(() => resolve('TIMEOUT'), ms)),
+      ]);
+    }
+
+    /** A probe that is issued, counted, and never answers. */
+    function neverSettles(): () => Promise<HardwareProfile> {
+      return () => new Promise<HardwareProfile>(() => {});
+    }
+
+    it('does not park later callers behind a probe a newer one has overtaken', async () => {
+      const detect = vi
+        .fn<() => Promise<HardwareProfile>>()
+        .mockImplementationOnce(neverSettles()) // probe 1, out for good
+        .mockResolvedValue(TINY_4GB); // probe 2, adopted
+      const instance = new SupportService({
+        detectHardware: detect,
+        readHeader: async () => HEADER,
+        headSize: async () => BIG_FILE,
+      });
+
+      void instance.systemInfo(true).catch(() => null);
+      await flush();
+      await instance.systemInfo(true); // 4 GB is now the reading
+
+      // Probe 1 is the only thing left in flight and can never be adopted
+      // (`adopted.id < id` is false for it), so joining it is waiting for an
+      // answer that is already destined to be thrown away.
+      expect(await withDeadline(instance.systemInfo())).toMatchObject({
+        totalRamBytes: TINY_4GB.totalRamBytes,
+      });
+      const verdict = await withDeadline(instance.check({ ...REQUEST, sizeBytes: BIG_FILE }));
+      expect(verdict).not.toBe('TIMEOUT');
+      expect((verdict as VariantSupport).breakdown.verdict).toBe('RED');
+      expect(await withDeadline(instance.budget())).not.toBe('TIMEOUT');
+      // Nothing was re-probed: the reading is settled, it was just unreachable.
+      expect(detect).toHaveBeenCalledTimes(2);
+    });
+
+    it('releases a caller already joined to a probe once a newer one is adopted', async () => {
+      const detect = vi
+        .fn<() => Promise<HardwareProfile>>()
+        .mockResolvedValueOnce(APPLE_16GB) // probe 1, adopted
+        .mockImplementationOnce(neverSettles()) // probe 2, joined and then overtaken
+        .mockResolvedValue(TINY_4GB); // probe 3, adopted
+      const instance = new SupportService({
+        detectHardware: detect,
+        readHeader: async () => HEADER,
+        headSize: async () => BIG_FILE,
+      });
+
+      await instance.systemInfo();
+      void instance.systemInfo(true).catch(() => null); // probe 2 out
+      await flush();
+      // Joins probe 2: at this moment it is the newest thing out and could
+      // still replace the 16 GB reading.
+      const joined = instance.systemInfo();
+      await flush();
+      await instance.systemInfo(true); // probe 3 lands 4 GB over the top of it
+
+      // Waiting on one probe's own promise would strand this caller for as long
+      // as probe 2 is out — which is for ever. What it is actually waiting for
+      // is the best reading obtainable, and that arrived with probe 3.
+      expect(await withDeadline(joined)).toMatchObject({
+        totalRamBytes: TINY_4GB.totalRamBytes,
+      });
+    });
+
+    it('does not shut the cache for as long as such a probe is out', async () => {
+      const readHeader = vi.fn(async () => HEADER);
+      const detect = vi
+        .fn<() => Promise<HardwareProfile>>()
+        .mockImplementationOnce(neverSettles())
+        .mockResolvedValue(TINY_4GB);
+      const instance = new SupportService({
+        detectHardware: detect,
+        readHeader,
+        headSize: async () => BIG_FILE,
+      });
+
+      void instance.systemInfo(true).catch(() => null);
+      await flush();
+      await instance.systemInfo(true);
+      await instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+
+      // The stuck probe is a refresh, but not one that can replace the adopted
+      // reading, so it is not a refresh window. Counting it as one left the
+      // Models screen with an empty grid and no way back.
+      expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)?.breakdown.verdict).toBe('RED');
+      expect(instance.all()).toHaveLength(1);
+      // And the synchronous readers agree with `check`, which is the half of
+      // this the ungated `check` used to get wrong in the other direction.
+      const again = await withDeadline(instance.check({ ...REQUEST, sizeBytes: BIG_FILE }));
+      expect((again as VariantSupport).breakdown.verdict).toBe('RED');
+      expect(readHeader).toHaveBeenCalledOnce();
+    });
+
+    it('serves no cached verdict to a check issued inside a real refresh window', async () => {
+      const readHeader = vi.fn(async () => HEADER);
+      const probe = gate(TINY_4GB);
+      const detect = vi
+        .fn<() => Promise<HardwareProfile>>()
+        .mockResolvedValueOnce(APPLE_16GB)
+        .mockImplementationOnce(probe.run);
+      const instance = new SupportService({
+        detectHardware: detect,
+        readHeader,
+        headSize: async () => BIG_FILE,
+      });
+
+      await instance.check({ ...REQUEST, sizeBytes: BIG_FILE }); // GREEN against 16 GB
+      const reProbe = instance.systemInfo(true); // a probe that *can* be adopted
+      await flush();
+      expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)).toBeNull();
+
+      const during = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+      probe.open();
+      await reProbe;
+
+      // Served from the window's cache this is GREEN, and `startDownload` never
+      // raises the confirmation for a model this machine cannot hold.
+      expect((await during).breakdown.verdict).toBe('RED');
+      expect(readHeader).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('does not surface a grey answer written mid-refresh by a check that threw', async () => {
