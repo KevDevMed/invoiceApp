@@ -275,6 +275,49 @@ export function matchesSegment(state: RowState, segment: ListSegment): boolean {
 }
 
 /**
+ * The tab that is *about* a state, as opposed to one that merely tolerates it.
+ *
+ * `matchesSegment` is a containment test and `all` contains everything, so
+ * searching `LIST_SEGMENTS` for the first segment that matches a state always
+ * answers `all` — which is true and useless. This is the other relation: the
+ * one segment whose subject is this state. `void` has no tab of its own and is
+ * only reachable through `all` and the filter vocabulary, so `all` is its
+ * honest answer rather than a fallback.
+ */
+const SEGMENT_ABOUT: Record<RowState, ListSegment> = {
+  overdue: 'overdue',
+  'due-soon': 'sent',
+  later: 'sent',
+  draft: 'drafts',
+  paid: 'paid',
+  void: 'all',
+};
+
+/**
+ * The tab an action targeting `state` has to land on. The answer does not
+ * depend on where the reader started, which is the whole point.
+ *
+ * `Chase all N` selects the overdue invoices and applies the Overdue chip, but
+ * it used to leave the segment alone. On `Sent`, `Drafts` or `Paid` — none of
+ * which admit an overdue row — the row set went empty, the selection was
+ * narrowed to what is visible and therefore to nothing, and the button did
+ * nothing at all with no error and no change on screen.
+ *
+ * The first repair kept a segment that already showed the state, and `all`
+ * shows everything, so Chase from `All` left `All` pressed and `Overdue`
+ * reporting `aria-pressed="false"` — one button with two behaviours depending
+ * on the tab it was pressed from. The destination is now unconditional.
+ *
+ * The move is by *identity*, never by predicate search: `LIST_SEGMENTS` leads
+ * with the universal `all`, so `find(matchesSegment)` reached `all` first and
+ * Chase from `Sent` landed on `All` — the right 17 rows and the right chip
+ * under a tab that was not the one the action is about.
+ */
+export function segmentShowing(state: RowState): ListSegment {
+  return SEGMENT_ABOUT[state];
+}
+
+/**
  * The counts printed inside the segmented control. Computed over the set the
  * search and the filter tokens already narrowed, so the numbers describe what
  * clicking a segment would actually show.

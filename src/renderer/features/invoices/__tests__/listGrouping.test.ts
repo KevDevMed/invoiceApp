@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Invoice } from '../../../../shared/types';
 import { INVOICE_STATUSES } from '../../../../shared/types';
 import {
+  LIST_SEGMENTS,
   adjacentRowId,
   countOpenInvoices,
   countSegments,
@@ -15,6 +16,7 @@ import {
   overdueTotals,
   rowPosition,
   rowStateOf,
+  segmentShowing,
   shortDate,
   sumByCurrency,
   summariseTotals,
@@ -182,6 +184,44 @@ describe('matchesSegment / countSegments', () => {
       TODAY,
     );
     expect(counts).toEqual({ all: 5, overdue: 1, sent: 2, drafts: 1, paid: 1 });
+  });
+});
+
+describe('segmentShowing', () => {
+  it('sends an overdue action to Overdue, including from All', () => {
+    // `All` is the one starting segment that was never covered, and the one
+    // the previous repair got wrong: it spared any tab that already showed the
+    // state, and `all` shows everything, so Chase from `All` left `All`
+    // pressed and `Overdue` reporting `aria-pressed="false"`. One button, two
+    // behaviours. The destination is unconditional.
+    expect(segmentShowing('overdue')).toBe('overdue');
+  });
+
+  it('lands on the tab the state is ABOUT, not the first one that tolerates it', () => {
+    // The earlier regression: `LIST_SEGMENTS.find(matchesSegment)` reached the
+    // universal `all` before it ever reached `overdue`, so Chase from Sent,
+    // Drafts or Paid selected the right 17 rows under the wrong tab.
+    expect(segmentShowing('draft')).toBe('drafts');
+    expect(segmentShowing('paid')).toBe('paid');
+    expect(segmentShowing('due-soon')).toBe('sent');
+    expect(segmentShowing('later')).toBe('sent');
+  });
+
+  it('lands on a tab that really shows the state, for every state', () => {
+    for (const state of ROW_STATES) {
+      expect(matchesSegment(state, segmentShowing(state)), state).toBe(true);
+    }
+  });
+
+  it('sends `void` to All, which is the only tab that shows it', () => {
+    // `void` has no tab of its own by design. `all` is the answer, not a
+    // fallback — and it is the only segment that matches, so the invariant
+    // above cannot distinguish the two readings.
+    expect(segmentShowing('void')).toBe('all');
+    for (const { key } of LIST_SEGMENTS) {
+      if (key === 'all') continue;
+      expect(matchesSegment('void', key), key).toBe(false);
+    }
   });
 });
 
