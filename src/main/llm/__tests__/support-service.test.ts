@@ -208,10 +208,34 @@ describe('the machine reading a cached verdict belongs to', () => {
     totalVramBytes: 4_294_967_296,
   };
 
+  /** A third distinct reading, so a sequence can move 16 GB -> 12 GB -> 4 GB. */
+  const MID_12GB: HardwareProfile = {
+    ...APPLE_16GB,
+    cpuModel: 'Apple M1 Pro',
+    totalRamBytes: 12_884_901_888,
+    gpus: [{ name: 'Apple M1 Pro', totalMemoryBytes: 12_884_901_888 }],
+    totalVramBytes: 12_884_901_888,
+  };
+
   const BIG_FILE = 8_000_000_000;
 
   /** Let every pending microtask chain settle before poking the service again. */
   const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A value that only becomes available when the test opens the gate. */
+  function gate<T>(value: T) {
+    let open!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return {
+      open,
+      run: async (): Promise<T> => {
+        await arrived;
+        return value;
+      },
+    };
+  }
 
   /** A header read that only resolves when the test says so. */
   function gatedHeader() {
@@ -342,6 +366,162 @@ describe('the machine reading a cached verdict belongs to', () => {
     // B's answer was current, so the sweep was served it rather than paying for
     // a fourth header read: A's stale entry is absent, not merely outvoted.
     expect(readHeader).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * A probe that fails does not make the machine settled. Everything below is
+   * about the window a failed or superseded probe opens over an older probe that
+   * is still out — the case a single `pending` slot could not represent.
+   */
+  it('joins an older probe still in flight after a newer probe threw', async () => {
+    const slow = gate(TINY_4GB);
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockImplementationOnce(slow.run)
+      .mockImplementationOnce(async () => {
+        throw new Error('llama probe crashed');
+      });
+    const instance = new SupportService({
+      detectHardware: detect,
+      readHeader: async () => HEADER,
+      headSize: async () => BIG_FILE,
+    });
+
+    await instance.systemInfo(); // the app believes the 16 GB machine
+    const reProbe = instance.systemInfo(true); // out, and about to say 4 GB
+    // A second `Re-check` whose probe blows up. `useModels.refreshSystem`
+    // swallows this and carries straight on to the checks, so a stale answer
+    // here is an accepted stale answer, not a visible failure.
+    await instance.systemInfo(true).catch(() => null);
+    await flush();
+
+    const verdict = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    slow.open();
+    await reProbe;
+
+    // Against 16 GB this file is GREEN and `startDownload` would not confirm.
+    expect((await verdict).breakdown.verdict).toBe('RED');
+  });
+
+  it('does not open a duplicate probe when a failed one empties the slot', async () => {
+    const slow = gate(APPLE_16GB);
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockImplementationOnce(slow.run)
+      .mockImplementationOnce(async () => {
+        throw new Error('llama probe crashed');
+      })
+      .mockResolvedValue(TINY_4GB);
+    const instance = new SupportService({
+      detectHardware: detect,
+      readHeader: async () => HEADER,
+      headSize: async () => BIG_FILE,
+    });
+
+    const first = instance.check({ ...REQUEST, sizeBytes: BIG_FILE }); // opens probe 1
+    await instance.systemInfo(true).catch(() => null); // probe 2 throws
+    await flush();
+    const second = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    slow.open();
+    await Promise.all([first, second]);
+
+    // Probe 1 was still out, so there was nothing to detect a third time.
+    expect(detect).toHaveBeenCalledTimes(2);
+  });
+
+  it('carries a check across three readings without founding it on the first', async () => {
+    const slow = gate(MID_12GB);
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockImplementationOnce(slow.run)
+      .mockImplementationOnce(async () => {
+        throw new Error('llama probe crashed');
+      })
+      .mockResolvedValue(TINY_4GB);
+    const instance = new SupportService({
+      detectHardware: detect,
+      readHeader: async () => HEADER,
+      headSize: async () => BIG_FILE,
+    });
+
+    await instance.check({ ...REQUEST, sizeBytes: BIG_FILE }); // 16 GB, cached
+    const toMid = instance.systemInfo(true);
+    await instance.systemInfo(true).catch(() => null); // throws over the top of it
+    await flush();
+
+    const pending = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    slow.open();
+    await toMid;
+    const landed = await pending;
+
+    // Identify the reading by the number the verdict was computed from, not by
+    // its colour: only the 12 GB probe was ever going to be adopted here.
+    expect(landed.breakdown.totalVramBytes).toBe(MID_12GB.totalVramBytes);
+
+    await instance.systemInfo(true); // third reading: 4 GB
+    expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)).toBeNull();
+    expect(instance.all()).toHaveLength(0);
+  });
+
+  it('serves nothing from `cached` or `all` while a re-probe is out', async () => {
+    const header = gate(HEADER);
+    const probe = gate(TINY_4GB);
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockImplementationOnce(probe.run);
+    const instance = new SupportService({
+      detectHardware: detect,
+      readHeader: header.run,
+      headSize: async () => BIG_FILE,
+    });
+
+    const inFlight = instance.check({ ...REQUEST, sizeBytes: BIG_FILE }); // against 16 GB
+    await flush();
+    const reProbe = instance.systemInfo(true); // drops the cache; 16 GB still adopted
+    await flush();
+    header.open();
+    await inFlight; // re-populates a 16 GB-stamped entry inside that window
+
+    expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)).toBeNull();
+    expect(instance.all()).toHaveLength(0);
+
+    probe.open();
+    await reProbe;
+  });
+
+  it('does not surface a grey answer written mid-refresh by a check that threw', async () => {
+    const header = gate(null);
+    const probe = gate(TINY_4GB);
+    const detect = vi
+      .fn<() => Promise<HardwareProfile>>()
+      .mockResolvedValueOnce(APPLE_16GB)
+      .mockImplementationOnce(probe.run);
+    const instance = new SupportService({
+      detectHardware: detect,
+      readHeader: async () => {
+        await header.run();
+        throw new Error('connection reset');
+      },
+      headSize: async () => BIG_FILE,
+    });
+
+    const inFlight = instance.check({ ...REQUEST, sizeBytes: BIG_FILE });
+    await flush();
+    const reProbe = instance.systemInfo(true);
+    await flush();
+    header.open();
+    expect((await inFlight).breakdown.verdict).toBe('GREY');
+
+    // A GREY entry is still an entry, and it is stamped with the reading being
+    // replaced — the renderer's initial paint must not be handed it.
+    expect(instance.cached(REQUEST.repo, REQUEST.filename, 8192)).toBeNull();
+    expect(instance.all()).toHaveLength(0);
+
+    probe.open();
+    await reProbe;
   });
 });
 

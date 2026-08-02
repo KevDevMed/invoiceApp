@@ -135,7 +135,18 @@ interface CacheEntry {
 
 export class SupportService {
   private adopted: AdoptedProfile | null = null;
-  private pending: Promise<AdoptedProfile> | null = null;
+  /**
+   * Every probe issued and not yet settled, keyed by issue order.
+   *
+   * A single `pending` slot is not enough: probes overlap, and one settling —
+   * especially one *failing* — used to empty the slot while an older probe was
+   * still out, so the next caller was handed the previous reading instead of
+   * joining the probe that was about to replace it. Insertion order is issue
+   * order, so the last entry is always the newest probe in flight.
+   */
+  private readonly inFlight = new Map<number, Promise<AdoptedProfile>>();
+  /** Refresh probes issued and not yet settled. */
+  private refreshing = 0;
   private probes = 0;
   private readonly cache = new Map<string, CacheEntry>();
 
@@ -159,10 +170,15 @@ export class SupportService {
   }
 
   private async profile(refresh: boolean): Promise<AdoptedProfile> {
-    // A probe already out is by definition no older than this call, so a
+    // Any probe already out is by definition no older than this call, so a
     // non-refresh caller joins it rather than settling for the previous reading.
+    // It has to be *any* probe, not the most recently issued one: a probe that
+    // throws or is superseded still leaves an older one running, and a caller
+    // handed `adopted` while that one is out gets a verdict computed against a
+    // reading the app is in the middle of replacing.
     if (!refresh) {
-      if (this.pending) return this.pending;
+      const joined = this.newestInFlight();
+      if (joined) return joined;
       if (this.adopted) return this.adopted;
     }
 
@@ -177,13 +193,22 @@ export class SupportService {
       return this.adopted;
     })();
 
-    this.pending = run;
+    this.inFlight.set(id, run);
+    if (refresh) this.refreshing += 1;
     try {
       return await run;
     } finally {
-      // A failed or superseded probe must not clear a newer one's slot.
-      if (this.pending === run) this.pending = null;
+      this.inFlight.delete(id);
+      if (refresh) this.refreshing -= 1;
     }
+  }
+
+  /** The newest probe still out, or nothing when the reading is settled. */
+  private newestInFlight(): Promise<AdoptedProfile> | null {
+    let newest: Promise<AdoptedProfile> | null = null;
+    // Insertion order is issue order, so the last one wins.
+    for (const run of this.inFlight.values()) newest = run;
+    return newest;
   }
 
   cacheKey(repo: string, filename: string, contextSize: number): string {
@@ -191,10 +216,18 @@ export class SupportService {
   }
 
   cached(repo: string, filename: string, contextSize: number): VariantSupport | null {
+    if (this.refreshing > 0) return null;
     return this.entryFor(this.cacheKey(repo, filename, contextSize))?.value ?? null;
   }
 
-  /** A cached entry, or nothing at all when it belongs to a superseded reading. */
+  /**
+   * A cached entry, or nothing at all when it belongs to a superseded reading.
+   *
+   * Only the stamp is checked here, because `check` calls this *after* settling
+   * its own reading and stamps whatever it writes with the same one. The
+   * synchronous readers below need the extra refresh-window guard that `check`
+   * gets for free by having waited.
+   */
   private entryFor(key: string): CacheEntry | null {
     const entry = this.cache.get(key);
     if (!entry) return null;
@@ -203,8 +236,19 @@ export class SupportService {
     return entry;
   }
 
-  /** Every verdict computed against the current reading, for the initial paint. */
+  /**
+   * Every verdict computed against the current reading, for the initial paint.
+   *
+   * Empty while a re-probe is out: `systemInfo(true)` has already dropped the
+   * cache, but `adopted` is still the reading being replaced, so a check issued
+   * before the refresh can land in that window and re-populate an entry whose
+   * stamp matches the reading nobody is going to believe a moment later. An
+   * asynchronous caller never sees this — it joins the probe first — but these
+   * two are synchronous, and the invariant is that the cache cannot hand out a
+   * verdict founded on a reading under replacement.
+   */
   all(): VariantSupport[] {
+    if (this.refreshing > 0) return [];
     const stamp = this.adopted?.stamp ?? null;
     if (stamp === null) return [];
     return [...this.cache.values()].filter((entry) => entry.stamp === stamp).map((entry) => entry.value);
