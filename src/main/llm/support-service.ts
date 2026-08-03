@@ -8,6 +8,17 @@
  * A failure — no network, a gated repo, a header we cannot parse — comes back as
  * a GREY verdict carrying the reason, never as a colour. The UI is expected to
  * say "could not check" and let the user download anyway if they insist.
+ *
+ * Every cached verdict is stamped with the machine reading it was computed
+ * against, and an entry whose stamp is not the current reading is treated as
+ * absent. A verdict is a statement about *this machine*, so the moment the
+ * machine is re-measured every answer founded on the old measurement is
+ * unfounded — including the ones still in flight, which land after the
+ * re-measurement and would otherwise be cached as if they were current. The
+ * renderer fences its own copy by generation (`features/models/supportCache.ts`)
+ * but cannot reach into this process, so the fence has to exist on both sides:
+ * a stale non-RED verdict served from here is the download confirmation not
+ * appearing for a model that does not fit.
  */
 
 import {
@@ -88,27 +99,173 @@ function greyFor(request: CheckRequest, contextSize: number, reason: string, siz
   };
 }
 
+/**
+ * The identity of a machine reading, as far as a verdict is concerned.
+ *
+ * `checkModelSupport` sees the machine only through `toCompatibilityHardware`,
+ * so two profiles with the same projection produce the same verdict for the same
+ * file and there is nothing to invalidate between them. Fingerprinting the
+ * projection rather than counting probes is what lets `Re-check` on an unchanged
+ * machine keep its cache instead of paying for every header again.
+ *
+ * `freeRamBytes` is deliberately not in here: it moves constantly, is not part of
+ * the projection, and stamping it would expire the whole cache every few seconds.
+ */
+export function profileStamp(profile: HardwareProfile): string {
+  const hardware = toCompatibilityHardware(profile);
+  return JSON.stringify({
+    totalRamBytes: hardware.totalRamBytes,
+    gpus: hardware.gpus.map((gpu) => [gpu.name, gpu.totalMemoryBytes]),
+  });
+}
+
+/** A probe that has been accepted as the current reading. */
+interface AdoptedProfile {
+  /** Issue order, not completion order. */
+  readonly id: number;
+  readonly profile: HardwareProfile;
+  readonly stamp: string;
+}
+
+interface CacheEntry {
+  /** The reading this verdict was computed against. */
+  readonly stamp: string;
+  readonly value: VariantSupport;
+}
+
+interface InFlightProbe {
+  /** Issued by `systemInfo(true)`, so it opens a refresh window. */
+  readonly refresh: boolean;
+  readonly run: Promise<AdoptedProfile>;
+}
+
 export class SupportService {
-  private hardware: HardwareProfile | null = null;
-  private hardwarePromise: Promise<HardwareProfile> | null = null;
-  private readonly cache = new Map<string, VariantSupport>();
+  private adopted: AdoptedProfile | null = null;
+  /**
+   * Every probe issued and not yet settled, keyed by issue order.
+   *
+   * A single `pending` slot is not enough: probes overlap, and one settling —
+   * especially one *failing* — used to empty the slot while an older probe was
+   * still out, so the next caller was handed the previous reading instead of
+   * joining the probe that was about to replace it.
+   *
+   * Being in here is not the same as mattering: see `supersedable`.
+   */
+  private readonly inFlight = new Map<number, InFlightProbe>();
+  /** Woken once per probe settling, whether it adopted, was rejected, or threw. */
+  private settleWaiters: Array<() => void> = [];
+  private probes = 0;
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(private readonly deps: SupportServiceDeps = {}) {}
 
   /**
    * The detected machine. Cached for the life of the process — RAM and GPUs do
    * not change while the app runs, and the llama probe is expensive.
+   *
+   * `refresh` re-probes. Overlapping probes are ordered by when they were
+   * *issued*: a probe that started earlier and finished later describes the older
+   * machine, so it is not adopted, and its caller is handed the newer reading
+   * rather than the one it happens to be holding.
    */
   async systemInfo(refresh = false): Promise<HardwareProfile> {
-    if (refresh) {
-      this.hardware = null;
-      this.hardwarePromise = null;
-      this.cache.clear();
+    // Dropping the cache eagerly is not what makes the fence safe — the stamps
+    // are — but there is no point keeping verdicts about a reading being
+    // replaced, and it keeps `all()` honest for the renderer's next paint.
+    if (refresh) this.cache.clear();
+    return (await this.profile(refresh)).profile;
+  }
+
+  private async profile(refresh: boolean): Promise<AdoptedProfile> {
+    // Nothing is awaited before a probe is issued: the decision and the issuing
+    // have to happen in one tick, or a caller running later in the *same* tick
+    // sees no probe in flight and opens a second one — and this probe ends up
+    // ordered after a refresh that was issued after it.
+    if (!refresh) {
+      if (this.supersedable().length === 0) {
+        if (this.adopted) return this.adopted;
+      } else {
+        const joined = await this.joinSupersedable();
+        // Nothing to join and nothing adopted: every probe out died without
+        // ever setting a reading, so this caller has to measure it itself.
+        if (joined) return joined;
+      }
     }
-    if (this.hardware) return this.hardware;
-    this.hardwarePromise ??= (this.deps.detectHardware ?? detectHardware)();
-    this.hardware = await this.hardwarePromise;
-    return this.hardware;
+
+    const id = (this.probes += 1);
+    const detect = this.deps.detectHardware ?? detectHardware;
+    const run = (async (): Promise<AdoptedProfile> => {
+      const detected = await detect();
+      if (this.adopted === null || this.adopted.id < id) {
+        this.adopted = { id, profile: detected, stamp: profileStamp(detected) };
+      }
+      // Late or not, the answer is the reading the app currently believes.
+      return this.adopted;
+    })();
+
+    this.inFlight.set(id, { refresh, run });
+    try {
+      return await run;
+    } finally {
+      this.inFlight.delete(id);
+      this.wakeJoiners();
+    }
+  }
+
+  /**
+   * Wait until the reading is the best one obtainable, or `null` to go probe.
+   *
+   * The invariant a non-refresh caller wants is: **use the adopted reading
+   * unless a probe still out could replace it.** Only a probe issued *after*
+   * the adopted reading can — adoption is `this.adopted.id < id`, so one issued
+   * before it is discarded when it lands, by definition. Waiting on such a probe
+   * is not caution, it is a wait for an answer already known to be thrown away,
+   * and if it never settles neither does the caller: that is how `systemInfo`,
+   * `check`, `budget`, `checkMany` and context clamping could all freeze behind
+   * a probe the app had already moved past.
+   *
+   * The condition is re-tested after *any* probe settles rather than by awaiting
+   * one probe's own promise, which is what makes it hang-free in the other
+   * direction too: a probe that stalls stops mattering the moment a newer one is
+   * adopted over it, and a probe that throws frees its joiners instead of
+   * failing them. Every wake-up shrinks the set unless a fresh probe was issued
+   * in the meantime, and a fresh probe is a newer reading on its way.
+   */
+  private async joinSupersedable(): Promise<AdoptedProfile | null> {
+    for (;;) {
+      // Registered before anything can settle: no await stands between the test
+      // and the wait, so a wake-up cannot be missed.
+      await new Promise<void>((resolve) => this.settleWaiters.push(resolve));
+      if (this.supersedable().length === 0) return this.adopted;
+    }
+  }
+
+  /**
+   * Probes still out that could replace the adopted reading.
+   *
+   * Empty means the reading is settled; any refresh in here means a refresh
+   * window is open. A probe older than `adopted` is in neither set: it cannot be
+   * adopted, so it is neither worth waiting for nor a reason to distrust the
+   * cache. Both of the round-2 findings are one question — *can this probe still
+   * change the answer?* — asked in two places, so they are answered here once.
+   */
+  private supersedable(): InFlightProbe[] {
+    const floor = this.adopted?.id ?? 0;
+    const out: InFlightProbe[] = [];
+    // Insertion order is issue order, so this comes back oldest-first.
+    for (const [id, probe] of this.inFlight) if (id > floor) out.push(probe);
+    return out;
+  }
+
+  /** A refresh is out that could still replace the reading the cache is stamped with. */
+  private get refreshing(): boolean {
+    return this.supersedable().some((probe) => probe.refresh);
+  }
+
+  private wakeJoiners(): void {
+    const waiters = this.settleWaiters;
+    this.settleWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   cacheKey(repo: string, filename: string, contextSize: number): string {
@@ -116,12 +273,54 @@ export class SupportService {
   }
 
   cached(repo: string, filename: string, contextSize: number): VariantSupport | null {
-    return this.cache.get(this.cacheKey(repo, filename, contextSize)) ?? null;
+    return this.entryFor(this.cacheKey(repo, filename, contextSize))?.value ?? null;
   }
 
-  /** Every verdict computed so far, for the renderer's initial paint. */
+  /**
+   * A cached entry, or nothing when it belongs to a reading nobody should act on.
+   *
+   * The invariant, in one line: **an entry is servable only when its stamp is
+   * the adopted reading and no refresh that could replace that reading is out.**
+   * Both halves, to every reader, with no exceptions — `check` used to be the
+   * exception, on the argument that it settles its own reading first and so
+   * cannot be inside a window. That is still true (`profile` returns only
+   * when nothing supersedable is out, and nothing is awaited between there and
+   * here), but it was an argument about call order defending a rule about data,
+   * and it is the second finding this window has produced. The rule is now
+   * stated where the data is read.
+   *
+   * The cost is a header read for a check issued mid-refresh; the alternative —
+   * refusing to *write* an entry computed across a window — would also throw
+   * away the entries a same-machine `Re-check` exists to keep, which is a real
+   * behaviour rather than a hypothetical one.
+   *
+   * A probe older than `adopted` is not a window: it cannot be adopted, so it
+   * cannot make this entry wrong, and treating it as one shut the cache for as
+   * long as it hung.
+   */
+  private entryFor(key: string): CacheEntry | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    // Nothing has been measured yet, so nothing can be current.
+    if (this.adopted === null || entry.stamp !== this.adopted.stamp) return null;
+    if (this.refreshing) return null;
+    return entry;
+  }
+
+  /**
+   * Every verdict computed against the current reading, for the initial paint.
+   *
+   * Empty while a re-probe is out: `systemInfo(true)` has already dropped the
+   * cache, but `adopted` is still the reading being replaced, so a check issued
+   * before the refresh can land in that window and re-populate an entry whose
+   * stamp matches the reading nobody is going to believe a moment later. That is
+   * `entryFor`'s rule, applied per key; this is the same rule over every key.
+   */
   all(): VariantSupport[] {
-    return [...this.cache.values()];
+    if (this.refreshing) return [];
+    const stamp = this.adopted?.stamp ?? null;
+    if (stamp === null) return [];
+    return [...this.cache.values()].filter((entry) => entry.stamp === stamp).map((entry) => entry.value);
   }
 
   /** Drop cached verdicts, e.g. after the hardware panel is refreshed. */
@@ -185,19 +384,35 @@ export class SupportService {
     const contextSize = request.ctxSize ?? DEFAULT_VERDICT_CONTEXT_SIZE;
     const key = this.cacheKey(request.repo, request.filename, contextSize);
 
+    // The reading is settled before the cache is consulted, because both the
+    // hit test and the stamp on whatever is written next are about *this*
+    // reading and they have to be the same one.
+    const reading = await this.profile(false);
+
     if (!request.refresh) {
-      const hit = this.cache.get(key);
+      const hit = this.entryFor(key);
       // A previous failure is worth retrying; a previous answer is not worth
       // three megabytes of range requests.
-      if (hit && hit.error === null) return hit;
+      if (hit && hit.value.error === null) return hit.value;
     }
 
-    const result = await this.compute(request, contextSize);
-    this.cache.set(key, result);
+    const result = await this.compute(request, contextSize, reading.profile);
+
+    // The machine was re-measured while this check was out: the answer is about
+    // a reading nobody believes any more, so it is returned to its caller (who
+    // fences it) but never cached. This is the INV-4 hole — main used to write
+    // it, and a later polite ask was served a verdict from the old machine.
+    if (this.adopted === null || this.adopted.stamp === reading.stamp) {
+      this.cache.set(key, { stamp: reading.stamp, value: result });
+    }
     return result;
   }
 
-  private async compute(request: CheckRequest, contextSize: number): Promise<VariantSupport> {
+  private async compute(
+    request: CheckRequest,
+    contextSize: number,
+    profile: HardwareProfile,
+  ): Promise<VariantSupport> {
     let url: string;
     try {
       url = downloadUrl(request.repo, request.filename);
@@ -207,8 +422,6 @@ export class SupportService {
 
     const token = this.deps.token?.() ?? null;
     const headers = token ? { authorization: `Bearer ${token}` } : undefined;
-
-    const profile = await this.systemInfo();
 
     let sizeBytes = request.sizeBytes ?? null;
     let header: GgufHeader;
