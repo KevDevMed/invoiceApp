@@ -1,6 +1,6 @@
 {
   "name": "invoiceapp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Offline-first invoicing desktop app (Electron + React + SQLite)",
   "main": "./out/main/index.cjs",
   "author": "InvoiceApp",
