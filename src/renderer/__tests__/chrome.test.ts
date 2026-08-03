@@ -8,7 +8,6 @@ import {
   BREADCRUMB_BAND_HEIGHT,
   COLLAPSED_RAIL_PX,
   COLLAPSED_RAIL_WIDTH,
-  hasPlaceholderWindowControls,
   isSectionSelected,
   NAV_GROUP_CAPTION_HEIGHT,
   NAV_GROUP_CAPTION_PX,
@@ -122,30 +121,11 @@ describe('readDesktopInfo', () => {
 const APPROVED_OVERLAY_INSET = 'var(--spacing-10)';
 const APPROVED_NO_INSET = 'var(--spacing-0)';
 
-describe('hasPlaceholderWindowControls', () => {
-  it('paints fake lights in the browser preview and nowhere else', () => {
-    expect(hasPlaceholderWindowControls(WEB_DESKTOP_INFO)).toBe(true);
-    expect(hasPlaceholderWindowControls(DARWIN)).toBe(false);
-    // The bug this pins: gating on `!hasOverlayWindowControls` instead of on the
-    // platform. win32 and linux also have no overlay controls — they have a real
-    // OS title bar — so they would get three macOS dots under a Windows frame.
-    expect(hasPlaceholderWindowControls(WIN32)).toBe(false);
-    expect(hasPlaceholderWindowControls(LINUX)).toBe(false);
-  });
-
-  it('paints them even when the web info claims overlay controls', () => {
-    // Only the platform decides. `hasOverlayWindowControls` is about who paints
-    // the *real* lights, and in a browser nobody does.
-    expect(hasPlaceholderWindowControls({ platform: 'web', hasOverlayWindowControls: true })).toBe(
-      true,
-    );
-  });
-});
-
 describe('reservesTrafficLightBand', () => {
-  it('is true wherever a cluster is painted, by macOS or by us', () => {
+  it('is true only where macOS paints a real cluster over the renderer', () => {
     expect(reservesTrafficLightBand(DARWIN)).toBe(true);
-    expect(reservesTrafficLightBand(WEB_DESKTOP_INFO)).toBe(true);
+    // No fake lights: the browser preview reserves nothing and draws nothing.
+    expect(reservesTrafficLightBand(WEB_DESKTOP_INFO)).toBe(false);
   });
 
   it('is false where the OS draws its own title bar', () => {
@@ -158,11 +138,9 @@ describe('titleBarInset', () => {
     expect(titleBarInset(DARWIN)).toBe(APPROVED_OVERLAY_INSET);
   });
 
-  // The band is where the lights go, and on web *we* put lights there. Reserving
-  // nothing would paint 12px dots into a 0px band.
-  it('reserves the same band on web, so the preview mirrors macOS', () => {
-    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(APPROVED_OVERLAY_INSET);
-    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(titleBarInset(DARWIN));
+  // No fake lights in the preview, so nothing to reserve for.
+  it('reserves nothing on web', () => {
+    expect(titleBarInset(WEB_DESKTOP_INFO)).toBe(APPROVED_NO_INSET);
   });
 
   it('reserves nothing on Windows and Linux, which have a real title bar', () => {
@@ -497,45 +475,28 @@ describe('sideNavPanelGeometry', () => {
 });
 
 describe('sideNavControlRowHeight', () => {
-  it('is the reserved light band while the sidebar is expanded', () => {
-    expect(sideNavControlRowHeight(DARWIN, false)).toBe(titleBarInset(DARWIN));
-    expect(resolvePx(sideNavControlRowHeight(DARWIN, false))).toBe(40);
+  // Reserved in both sidebar states: with no unified title bar the OS paints
+  // the lights over this corner whether the rail is collapsed or not.
+  it('is the reserved light band wherever there is a cluster to clear', () => {
+    expect(sideNavControlRowHeight(DARWIN)).toBe(titleBarInset(DARWIN));
+    expect(resolvePx(sideNavControlRowHeight(DARWIN))).toBe(40);
   });
 
-  // The geometry the preview has to agree with darwin on: a 12px cluster in a
-  // 36px band is not the 40px band that ships.
-  it('gives web the same band as macOS', () => {
-    expect(sideNavControlRowHeight(WEB_DESKTOP_INFO, false)).toBe(
-      sideNavControlRowHeight(DARWIN, false),
-    );
-  });
-
-  // The bug this pins: keeping the band while collapsed. The lights are in the
-  // unified title bar then, and a rail that still reserved 40px for them would
-  // open with a dead gap above its first glyph.
-  it('reserves nothing once the sidebar is collapsed', () => {
-    for (const info of [DARWIN, WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
-      expect(sideNavControlRowHeight(info, true)).toBe(NO_TITLE_BAR_INSET);
-    }
-  });
-
-  // Nothing interactive lives in this band any more — the collapse toggle is in
-  // the brand row below it and the utility glyphs are in the footer — so a
-  // zero-height band on win32/linux hides nothing.
-  it('reserves nothing where the OS draws its own title bar', () => {
-    for (const info of REAL_TITLE_BAR) {
-      expect(sideNavControlRowHeight(info, false)).toBe(NO_TITLE_BAR_INSET);
+  // Nothing interactive lives in this band — the collapse toggle and the
+  // utility glyphs are elsewhere — so a zero-height band where there is no
+  // cluster hides nothing. Web included: the preview draws no fake lights.
+  it('reserves nothing where there is no real cluster', () => {
+    for (const info of [WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
+      expect(sideNavControlRowHeight(info)).toBe(NO_TITLE_BAR_INSET);
     }
   });
 });
 
 describe('tabStripBandHeight', () => {
   it('is a full band wherever there is a cluster to clear, tabs or not', () => {
-    for (const info of [DARWIN, WEB_DESKTOP_INFO] as const) {
-      for (const hasTabs of [false, true]) {
-        expect(tabStripBandHeight(info, hasTabs)).toBe(TAB_STRIP_BAND_HEIGHT);
-        expect(resolvePx(tabStripBandHeight(info, hasTabs))).toBe(40);
-      }
+    for (const hasTabs of [false, true]) {
+      expect(tabStripBandHeight(DARWIN, hasTabs)).toBe(TAB_STRIP_BAND_HEIGHT);
+      expect(resolvePx(tabStripBandHeight(DARWIN, hasTabs))).toBe(40);
     }
   });
 
@@ -611,23 +572,9 @@ describe('AppShell consumes the chrome helpers', () => {
     expect(source).toMatch(/\.\.\.sideNavPanelGeometry\(/);
   });
 
-  it('sizes the sidebar light band from its own helper, collapse included', () => {
-    // The bug: calling it without the collapse flag, which leaves the rail
-    // reserving 40px for lights that are in the title bar above it.
-    expect(source).toMatch(/sideNavControlRowHeight\(desktop, isCollapsed\)/);
-    expect(source).toMatch(/height=\{controlRowHeight\}/);
-  });
-
   it('keeps the toggle name fixed and moves its state to aria-expanded', () => {
     expect(source).toMatch(/SIDE_NAV_TOGGLE_LABEL = 'Toggle sidebar'/);
     expect(source).toMatch(/aria-expanded=\{!isCollapsed\}/);
-  });
-
-  it('gates the traffic-light placeholders on the platform predicate', () => {
-    // The bug: rendering them unconditionally, or on `!hasOverlayWindowControls`
-    // — which would paint macOS dots under a real Windows title bar.
-    expect(source).toMatch(/hasPlaceholderWindowControls\(desktop\)/);
-    expect(source).not.toMatch(/!\s*desktop\.hasOverlayWindowControls/);
   });
 
   it('renders the update control unconditionally', () => {
@@ -648,18 +595,16 @@ describe('AppShell consumes the chrome helpers', () => {
     expect(footer).toMatch(/<ThemeToggleButton \/>/);
   });
 
-  it('gives the collapsed frame a unified title bar above both columns', () => {
-    // AppShell's `banner` is the slot that spans both columns without the
-    // remount `topNav` causes. The bug: rendering it always, or never.
-    expect(source).toMatch(/banner=\{\s*isCollapsed \? \(/);
-    expect(source).toMatch(/<UnifiedTitleBar/);
-    expect(source).toMatch(/title=\{windowTitle\(pathname\)\}/);
-  });
-
-  it('drops the sidebar header entirely while collapsed', () => {
-    // Both of its bands moved into the title bar; an empty header still costs
-    // SideNav's 8px of sticky-top padding on either side.
-    expect(source).toMatch(/header=\{\s*isCollapsed \? undefined :/);
+  it('keeps the light band in the collapsed header, gated on the platform', () => {
+    // Collapsed, the header holds only the traffic-light band — macOS paints
+    // the cluster over this corner in both states. Where there is no real
+    // cluster the header is omitted: an empty one still costs SideNav's
+    // sticky-top padding.
+    expect(source).toMatch(
+      /header=\{\s*isCollapsed \? \(\s*reservesTrafficLightBand\(desktop\) \? \(/,
+    );
+    expect(source).toMatch(/sideNavControlRowHeight\(desktop\)/);
+    expect(source).toMatch(/height=\{controlRowHeight\}/);
   });
 
   it('keeps every nav row at its Y across the collapse toggle', () => {

@@ -23,13 +23,9 @@ export type { DesktopInfo, DesktopPlatform };
  * What we assume when `window.desktop` is missing or malformed: a plain browser
  * with real OS window controls, so no reserved space and no drag surface.
  * `window.desktop` is installed by the Electron preload and by the preview
- * shim; unit tests and any pre-integration build see nothing at all.
- *
- * The fallback platform is `'web'`, which now also means "paint traffic-light
- * placeholders" (see `hasPlaceholderWindowControls`). That is deliberate: the
- * fallback's whole claim is "this is a plain browser", and a plain browser is
- * exactly where the placeholders belong. Electron always installs the global,
- * so nothing that ships in the desktop app can reach this value.
+ * shim; unit tests and any pre-integration build see nothing at all. Electron
+ * always installs the global, so nothing that ships in the desktop app can
+ * reach this value.
  */
 export const WEB_DESKTOP_INFO: DesktopInfo = {
   platform: 'web',
@@ -60,34 +56,17 @@ export function readDesktopInfo(scope: unknown = globalThis): DesktopInfo {
 }
 
 /**
- * Does this build draw *fake* macOS traffic lights?
+ * Does the top-left corner of this window hold a *real* traffic-light cluster?
  *
- * Only the browser preview does. Gated on the platform being exactly `'web'`
- * rather than on `!hasOverlayWindowControls`, because win32 and linux also have
- * no overlay controls — they get a real OS title bar
- * (`src/main/window.ts`, `titleBarStyle: 'default'`), and three macOS dots
- * under a Windows title bar would be a lie about the window they sit in.
- *
- * The preview exists so the design can be judged in a browser, and the layout
- * being judged has to be the layout that ships: on macOS the lights are real
- * and the shell reserves space for them, so on web the same space is reserved
- * and the same three dots are painted into it.
- */
-export function hasPlaceholderWindowControls(info: DesktopInfo): boolean {
-  return info.platform === 'web';
-}
-
-/**
- * Does the top-left corner of this window hold a traffic-light cluster at all —
- * painted by macOS, or by us?
- *
- * The single predicate every piece of geometry keys off, so the preview cannot
- * drift from darwin: a 12px dot cluster reserved a 36px band on a 48px rail
- * would make the reference worthless. Everything below that used to read
- * `hasOverlayWindowControls` directly now reads this instead.
+ * Only macOS under `titleBarStyle: 'hiddenInset'` does — the OS paints the
+ * lights over the renderer there, and the shell has to reserve space so its
+ * own controls do not sit underneath them. Everywhere else the band is zero:
+ * win32/linux get a real OS title bar, and the browser preview draws no fake
+ * cluster at all — there is no window to control, and placeholder dots were a
+ * lie about the surface they sat on.
  */
 export function reservesTrafficLightBand(info: DesktopInfo): boolean {
-  return info.hasOverlayWindowControls || hasPlaceholderWindowControls(info);
+  return info.hasOverlayWindowControls;
 }
 
 /**
@@ -532,15 +511,13 @@ export function unifiedTitleBarContentStartPx(): number {
  * nothing. They now live in the sidebar footer, and the collapse toggle in the
  * brand row below.
  *
- * Zero while collapsed: the lights are not in the sidebar then, they are in the
- * unified title bar above both columns, and a rail that still reserved 40px for
- * them would open with a dead gap over its first glyph. Zero on win32/linux for
- * the older reason — the OS paints a real title bar there and there is no
- * cluster to clear. Neither case can hide a control any more, because this band
- * no longer holds one.
+ * Reserved in both sidebar states: with no unified title bar, the OS paints the
+ * lights over the top-left corner whether the rail is collapsed or not, so the
+ * rail must clear them or its first control sits underneath the cluster. Zero
+ * on win32/linux — the OS paints a real title bar there and there is no cluster
+ * to clear.
  */
-export function sideNavControlRowHeight(info: DesktopInfo, isCollapsed: boolean): string {
-  if (isCollapsed) return NO_TITLE_BAR_INSET;
+export function sideNavControlRowHeight(info: DesktopInfo): string {
   return titleBarInset(info);
 }
 

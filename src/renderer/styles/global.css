@@ -26,48 +26,25 @@ body {
 /*
  * Window drag surfaces. `titleBarStyle: 'hiddenInset'` removes the macOS title
  * bar, so the app has to supply something to grab the window by: the traffic
- * light band and the brand row at the top of the sidebar, the tab strip at the
- * top of the content column, and — while the sidebar is collapsed — the unified
- * title bar spanning both. `-webkit-app-region` is an Electron/Chromium property
- * with no design-system equivalent, which is the only reason these rules exist
- * here.
- *
- * `.app-unified-title-bar` is a second name for the same behaviour rather than
- * another `.app-drag-region`, because that class is also how
- * `preview/screenshots.mjs` finds the content column's band: it takes the first
- * one outside the sidebar, and a full-width bar above both columns would answer
- * that query instead.
+ * light band and the brand row at the top of the sidebar, and the tab strip at
+ * the top of the content column. `-webkit-app-region` is an Electron/Chromium
+ * property with no design-system equivalent, which is the only reason these
+ * rules exist here.
  *
  * Everything interactive inside a drag region must opt back out — a control in
  * a drag region stops receiving clicks entirely. The :where() list has zero
  * specificity, so component styles are unaffected. The resize handle is a
  * sibling that floats over the sidebar's reserved band, so it is named too.
  */
-.app-drag-region,
-.app-unified-title-bar {
+.app-drag-region {
   -webkit-app-region: drag;
 }
 
 .app-drag-region
   :where(a, button, input, select, textarea, [role='button'], [role='link'], [role='radio'],
     [role='radiogroup'], [role='tab'], [tabindex]),
-.app-unified-title-bar
-  :where(a, button, input, select, textarea, [role='button'], [role='link'], [role='radio'],
-    [role='radiogroup'], [role='tab'], [tabindex]),
 [data-testid='astryx-sidenav-resize-handle'] {
   -webkit-app-region: no-drag;
-}
-
-/*
- * The unified title bar's own surface: the one band that belongs to the window
- * rather than to either column, so it is the one band that says so by being a
- * shade lighter than the flat body colour with a hairline under it. Both values
- * are semantic tokens, so the lift holds in light mode (where `surface` is
- * white on a grey body) as well as dark.
- */
-.app-unified-title-bar {
-  background-color: var(--color-background-surface);
-  border-block-end: var(--border-width) solid var(--color-border);
 }
 
 /*
@@ -307,40 +284,6 @@ body {
 .app-invoice-tab-close:hover {
   background-color: var(--color-overlay-hover);
   color: var(--color-invoice-tab-ink-active);
-}
-
-/*
- * Traffic-light placeholders — the browser preview only (see
- * `chrome.ts`, `hasPlaceholderWindowControls`).
- *
- * Here rather than in a component because the design system has no primitive
- * for a fixed-size disc in an arbitrary colour: StatusDot is the closest, and
- * its colour comes from a five-value semantic variant (success/warning/error/
- * accent/neutral). Painting the macOS palette through it would either misuse
- * three status meanings or need a theme override that recolours every StatusDot
- * in the app. Every value below is a token: --spacing-3 is 12px, and the three
- * colours are declared once in `theme/appTheme.ts`.
- *
- * `flex: none` because the cluster is a flex row: without it the discs would
- * shrink under the row's own width pressure and stop being circles.
- */
-.app-window-control-dot {
-  inline-size: var(--spacing-3);
-  block-size: var(--spacing-3);
-  border-radius: var(--radius-full);
-  flex: none;
-}
-
-.app-window-control-dot-close {
-  background-color: var(--color-window-control-close);
-}
-
-.app-window-control-dot-minimize {
-  background-color: var(--color-window-control-minimize);
-}
-
-.app-window-control-dot-zoom {
-  background-color: var(--color-window-control-zoom);
 }
 
 /*
