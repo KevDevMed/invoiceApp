@@ -8,6 +8,8 @@ import {
   BREADCRUMB_BAND_HEIGHT,
   COLLAPSED_RAIL_PX,
   COLLAPSED_RAIL_WIDTH,
+  COLLAPSED_RAIL_WITH_LIGHTS_PX,
+  COLLAPSED_RAIL_WITH_LIGHTS_WIDTH,
   isSectionSelected,
   NAV_GROUP_CAPTION_HEIGHT,
   NAV_GROUP_CAPTION_PX,
@@ -340,17 +342,21 @@ describe('COLLAPSED_RAIL_WIDTH', () => {
     expect(COLLAPSED_RAIL_WIDTH).toMatch(/^calc\(var\(--spacing-[\d-]+\) \+ var\(--spacing-[\d-]+\)\)$/);
   });
 
-  // The regression this guards: the rail used to be 88px *because* the traffic
-  // lights lived in it. They do not any more, and a rail wide enough to hold
-  // them is a rail that has quietly gone back to the old frame.
-  it('is too narrow to hold the traffic lights, which is why they moved out', () => {
-    expect(PANEL_INSET_PX + COLLAPSED_RAIL_PX).toBeLessThan(TRAFFIC_LIGHT_ZONE_END_PX);
+  // Where macOS paints a real cluster the rail must contain it, not be cut
+  // through by it: the pinned cluster ends around x 78 and the 88px rail's
+  // panel edge is at 8 + 88 = 96.
+  it('widens to hold the pinned traffic lights on macOS', () => {
+    expect(resolvePx(COLLAPSED_RAIL_WITH_LIGHTS_WIDTH)).toBe(COLLAPSED_RAIL_WITH_LIGHTS_PX);
+    expect(COLLAPSED_RAIL_WITH_LIGHTS_PX).toBe(88);
+    expect(PANEL_INSET_PX + COLLAPSED_RAIL_WITH_LIGHTS_PX).toBeGreaterThan(
+      TRAFFIC_LIGHT_ZONE_END_PX,
+    );
+    expect(sideNavPanelGeometry(DARWIN).minInlineSize).toBe(COLLAPSED_RAIL_WITH_LIGHTS_WIDTH);
   });
 
-  it('is the same width on every platform', () => {
-    for (const info of [DARWIN, WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
-      expect(sideNavPanelGeometry().minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
-      expect(reservesTrafficLightBand(info)).toBe(reservesTrafficLightBand(info));
+  it('stays narrow where there is no cluster to clear', () => {
+    for (const info of [WEB_DESKTOP_INFO, ...REAL_TITLE_BAR]) {
+      expect(sideNavPanelGeometry(info).minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
     }
   });
 });
@@ -437,7 +443,7 @@ const APPROVED_PANEL_INSET = 'var(--spacing-2)';
 
 describe('sideNavPanelGeometry', () => {
   it('insets the panel equally on all four edges', () => {
-    const geometry = sideNavPanelGeometry();
+    const geometry = sideNavPanelGeometry(WEB_DESKTOP_INFO);
     expect(geometry.marginBlock).toBe(APPROVED_PANEL_INSET);
     expect(geometry.marginInline).toBe(APPROVED_PANEL_INSET);
     expect(PANEL_INSET).toBe(APPROVED_PANEL_INSET);
@@ -448,17 +454,17 @@ describe('sideNavPanelGeometry', () => {
   it('subtracts exactly both block insets from the panel height', () => {
     expect(PANEL_INSET_TOTAL_PX).toBe(PANEL_INSET_PX * 2);
     expect(resolvePx(PANEL_INSET_TOTAL)).toBe(resolvePx(PANEL_INSET) * 2);
-    expect(sideNavPanelGeometry().blockSize).toBe(`calc(100% - ${PANEL_INSET_TOTAL})`);
+    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).blockSize).toBe(`calc(100% - ${PANEL_INSET_TOTAL})`);
   });
 
   it('keeps the collapsed-rail floor as the only width lever', () => {
-    expect(sideNavPanelGeometry().minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
+    expect(sideNavPanelGeometry(WEB_DESKTOP_INFO).minInlineSize).toBe(COLLAPSED_RAIL_WIDTH);
   });
 
   // Radius, background, shadow and border belong to the theme. An inline style
   // beats a theme rule, so a stray one here silently overrides the theme.
   it('carries no appearance properties', () => {
-    expect(Object.keys(sideNavPanelGeometry()).sort()).toEqual([
+    expect(Object.keys(sideNavPanelGeometry(DARWIN)).sort()).toEqual([
       'blockSize',
       'marginBlock',
       'marginInline',
@@ -467,7 +473,7 @@ describe('sideNavPanelGeometry', () => {
   });
 
   it('is built from spacing tokens, never raw pixels', () => {
-    const geometry = sideNavPanelGeometry();
+    const geometry = sideNavPanelGeometry(DARWIN);
     expect(geometry.marginBlock).toMatch(/^var\(--spacing-[\d-]+\)$/);
     expect(geometry.marginInline).toMatch(/^var\(--spacing-[\d-]+\)$/);
     expect(geometry.blockSize).toMatch(/^calc\(100% - var\(--spacing-[\d-]+\)\)$/);

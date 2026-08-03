@@ -90,6 +90,15 @@ export function createMainWindow(): BrowserWindow {
     title: 'InvoiceApp',
     backgroundColor: '#111112',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    /*
+      Pin the traffic lights inside the sidebar's reserved light band instead
+      of the OS default (~13,12): the sidebar panel is inset 8px from the
+      window edge and its band spans y 16-56, so 24/22 centres the ~12px-tall
+      cluster in the band and aligns its left edge with the panel's content
+      inset. The renderer reserves the band on darwin only — see
+      `src/renderer/chrome.ts`, `reservesTrafficLightBand`.
+    */
+    trafficLightPosition: { x: 24, y: 22 },
     webPreferences: {
       // The preload is emitted as CommonJS precisely so it can run sandboxed.
       preload: path.join(__dirname, '../preload/index.cjs'),

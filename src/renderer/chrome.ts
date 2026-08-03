@@ -331,11 +331,8 @@ export function windowTitle(pathname: string): string {
  * Width of the collapsed icon rail, as a CSS length.
  *
  * 56px: a 40px rail item centred in the 8px of inline padding SideNav puts on
- * either side of its scroll region. It used to be 88px, and the extra 32px were
- * there for one reason only — the traffic lights lived in the rail and a 48px
- * rail cut the cluster in half. They do not any more: collapsing moves them to
- * the unified title bar, which is what frees the rail to be as narrow as the
- * glyphs in it.
+ * either side of its scroll region. Only where there is no traffic-light
+ * cluster to clear — see `COLLAPSED_RAIL_WITH_LIGHTS_WIDTH`.
  *
  * Applied as `min-inline-size`, not `width`: SideNav owns its collapsed width
  * and its expanded (resizable) width, and a floor is the one thing that widens
@@ -345,6 +342,20 @@ export const COLLAPSED_RAIL_WIDTH = 'calc(var(--spacing-12) + var(--spacing-2))'
 
 /** --spacing-12 + --spacing-2, in px. Paired with the token so the two cannot drift. */
 export const COLLAPSED_RAIL_PX = 56;
+
+/**
+ * The collapsed rail where macOS paints real traffic lights over the corner.
+ *
+ * The cluster is pinned at window x 24 and is ~54px wide (`trafficLightPosition`
+ * in `src/main/window.ts`), so it ends around x 78. The panel starts at x 8; a
+ * 56px rail ends at 64 and cuts the cluster in half. 88px puts the panel edge
+ * at 96 — the cluster sits inside the rail's own light band with 18px to spare,
+ * which is the 88px the rail measured before the band ever left it.
+ */
+export const COLLAPSED_RAIL_WITH_LIGHTS_WIDTH = 'calc(var(--spacing-10) + var(--spacing-12))';
+
+/** --spacing-10 + --spacing-12, in px. Paired with the token so the two cannot drift. */
+export const COLLAPSED_RAIL_WITH_LIGHTS_PX = 88;
 
 /**
  * Height of a group caption, and so of the blank that stands in for one on the
@@ -403,14 +414,19 @@ export interface SideNavPanelGeometry {
  * Radius, background, shadow and border are deliberately absent: those are the
  * theme's, and a value set here would win over the theme by virtue of being an
  * inline style. `minInlineSize` is the one width property this may set — see
- * `collapsedRailWidth` for why a floor, rather than a width, is the right lever.
+ * `COLLAPSED_RAIL_WIDTH` for why a floor, rather than a width, is the right
+ * lever. The floor is wider where macOS paints a real cluster over the corner,
+ * so the collapsed rail contains the lights instead of being cut through by
+ * them.
  */
-export function sideNavPanelGeometry(): SideNavPanelGeometry {
+export function sideNavPanelGeometry(info: DesktopInfo): SideNavPanelGeometry {
   return {
     marginBlock: PANEL_INSET,
     marginInline: PANEL_INSET,
     blockSize: `calc(100% - ${PANEL_INSET_TOTAL})`,
-    minInlineSize: COLLAPSED_RAIL_WIDTH,
+    minInlineSize: reservesTrafficLightBand(info)
+      ? COLLAPSED_RAIL_WITH_LIGHTS_WIDTH
+      : COLLAPSED_RAIL_WIDTH,
   };
 }
 

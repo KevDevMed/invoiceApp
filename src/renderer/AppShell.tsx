@@ -493,7 +493,7 @@ export function AppShell(): React.JSX.Element {
   */
   const sideNavPanel: React.CSSProperties = {
     boxSizing: 'border-box',
-    ...sideNavPanelGeometry(),
+    ...sideNavPanelGeometry(desktop),
   };
 
   /*
